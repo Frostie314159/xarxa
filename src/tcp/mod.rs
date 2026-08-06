@@ -1137,8 +1137,6 @@ impl<'d> TcpSocketState<'d> {
                     // the checks done above imply this.
                     debug_assert!(overlap_start <= overlap_end);
 
-                    self.local_rx_last_seq = Some(repr.seq_number);
-
                     (
                         &repr.payload[overlap_start - segment_start..overlap_end - segment_start],
                         overlap_start - window_start,
@@ -1510,6 +1508,9 @@ impl<'d> TcpSocketState<'d> {
             );
             return None;
         };
+
+        // assembler accepted segment, track sequence number for SACK generation
+        self.local_rx_last_seq = Some(repr.seq_number);
 
         // Place payload octets into the buffer.
         trace!(
