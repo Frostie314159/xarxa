@@ -1,10 +1,9 @@
 use byteorder::{ByteOrder, NetworkEndian};
-use core::fmt;
 
 use super::{Error, Result};
 use crate::wire::ip::checksum;
 
-enum_with_unknown! {
+open_enum! {
     /// Internet protocol control message type.
     pub enum Message(u8) {
         /// Echo reply
@@ -30,25 +29,7 @@ enum_with_unknown! {
     }
 }
 
-impl fmt::Display for Message {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Message::EchoReply => write!(f, "echo reply"),
-            Message::DstUnreachable => write!(f, "destination unreachable"),
-            Message::Redirect => write!(f, "message redirect"),
-            Message::EchoRequest => write!(f, "echo request"),
-            Message::RouterAdvert => write!(f, "router advertisement"),
-            Message::RouterSolicit => write!(f, "router solicitation"),
-            Message::TimeExceeded => write!(f, "time exceeded"),
-            Message::ParamProblem => write!(f, "parameter problem"),
-            Message::Timestamp => write!(f, "timestamp"),
-            Message::TimestampReply => write!(f, "timestamp reply"),
-            Message::Unknown(id) => write!(f, "{id}"),
-        }
-    }
-}
-
-enum_with_unknown! {
+open_enum! {
     /// Internet protocol control message subtype for type "Destination Unreachable".
     pub enum DstUnreachable(u8) {
         /// Destination network unreachable
@@ -86,33 +67,7 @@ enum_with_unknown! {
     }
 }
 
-impl fmt::Display for DstUnreachable {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            DstUnreachable::NetUnreachable => write!(f, "destination network unreachable"),
-            DstUnreachable::HostUnreachable => write!(f, "destination host unreachable"),
-            DstUnreachable::ProtoUnreachable => write!(f, "destination protocol unreachable"),
-            DstUnreachable::PortUnreachable => write!(f, "destination port unreachable"),
-            DstUnreachable::FragRequired => write!(f, "fragmentation required, and DF flag set"),
-            DstUnreachable::SrcRouteFailed => write!(f, "source route failed"),
-            DstUnreachable::DstNetUnknown => write!(f, "destination network unknown"),
-            DstUnreachable::DstHostUnknown => write!(f, "destination host unknown"),
-            DstUnreachable::SrcHostIsolated => write!(f, "source host isolated"),
-            DstUnreachable::NetProhibited => write!(f, "network administratively prohibited"),
-            DstUnreachable::HostProhibited => write!(f, "host administratively prohibited"),
-            DstUnreachable::NetUnreachToS => write!(f, "network unreachable for ToS"),
-            DstUnreachable::HostUnreachToS => write!(f, "host unreachable for ToS"),
-            DstUnreachable::CommProhibited => {
-                write!(f, "communication administratively prohibited")
-            }
-            DstUnreachable::HostPrecedViol => write!(f, "host precedence violation"),
-            DstUnreachable::PrecedCutoff => write!(f, "precedence cutoff in effect"),
-            DstUnreachable::Unknown(id) => write!(f, "{id}"),
-        }
-    }
-}
-
-enum_with_unknown! {
+open_enum! {
     /// Internet protocol control message subtype for type "Redirect Message".
     pub enum Redirect(u8) {
         /// Redirect Datagram for the Network
@@ -126,7 +81,7 @@ enum_with_unknown! {
     }
 }
 
-enum_with_unknown! {
+open_enum! {
     /// Internet protocol control message subtype for type "Time Exceeded".
     pub enum TimeExceeded(u8) {
         /// TTL expired in transit
@@ -136,17 +91,7 @@ enum_with_unknown! {
     }
 }
 
-impl fmt::Display for TimeExceeded {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            TimeExceeded::TtlExpired => write!(f, "time-to-live exceeded in transit"),
-            TimeExceeded::FragExpired => write!(f, "fragment reassembly time exceeded"),
-            TimeExceeded::Unknown(id) => write!(f, "{id}"),
-        }
-    }
-}
-
-enum_with_unknown! {
+open_enum! {
     /// Internet protocol control message subtype for type "Parameter Problem".
     pub enum ParamProblem(u8) {
         /// Pointer indicates the error

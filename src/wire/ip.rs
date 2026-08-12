@@ -35,7 +35,7 @@ impl fmt::Display for Version {
     }
 }
 
-enum_with_unknown! {
+open_enum! {
     /// IP datagram encapsulated protocol.
     pub enum Protocol(u8) {
         HopByHop  = 0x00,
@@ -50,26 +50,6 @@ enum_with_unknown! {
         Icmpv6    = 0x3a,
         Ipv6NoNxt = 0x3b,
         Ipv6Opts  = 0x3c
-    }
-}
-
-impl fmt::Display for Protocol {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Protocol::HopByHop => write!(f, "Hop-by-Hop"),
-            Protocol::Icmp => write!(f, "ICMP"),
-            Protocol::Igmp => write!(f, "IGMP"),
-            Protocol::Tcp => write!(f, "TCP"),
-            Protocol::Udp => write!(f, "UDP"),
-            Protocol::Ipv6Route => write!(f, "IPv6-Route"),
-            Protocol::Ipv6Frag => write!(f, "IPv6-Frag"),
-            Protocol::IpSecEsp => write!(f, "IPsec-ESP"),
-            Protocol::IpSecAh => write!(f, "IPsec-AH"),
-            Protocol::Icmpv6 => write!(f, "ICMPv6"),
-            Protocol::Ipv6NoNxt => write!(f, "IPv6-NoNxt"),
-            Protocol::Ipv6Opts => write!(f, "IPv6-Opts"),
-            Protocol::Unknown(id) => write!(f, "0x{id:02x}"),
-        }
     }
 }
 

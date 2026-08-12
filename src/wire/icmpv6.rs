@@ -1,11 +1,10 @@
 use byteorder::{ByteOrder, NetworkEndian};
-use core::fmt;
 
 use super::{Error, Result};
 use crate::wire::ip::checksum;
 use crate::wire::{IpProtocol, Ipv6Address};
 
-enum_with_unknown! {
+open_enum! {
     /// Internet protocol control message type.
     pub enum Message(u8) {
         /// Destination Unreachable.
@@ -76,29 +75,7 @@ impl Message {
     }
 }
 
-impl fmt::Display for Message {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            Message::DstUnreachable => write!(f, "destination unreachable"),
-            Message::PktTooBig => write!(f, "packet too big"),
-            Message::TimeExceeded => write!(f, "time exceeded"),
-            Message::ParamProblem => write!(f, "parameter problem"),
-            Message::EchoReply => write!(f, "echo reply"),
-            Message::EchoRequest => write!(f, "echo request"),
-            Message::RouterSolicit => write!(f, "router solicitation"),
-            Message::RouterAdvert => write!(f, "router advertisement"),
-            Message::NeighborSolicit => write!(f, "neighbor solicitation"),
-            Message::NeighborAdvert => write!(f, "neighbor advert"),
-            Message::Redirect => write!(f, "redirect"),
-            Message::MldQuery => write!(f, "multicast listener query"),
-            Message::MldReport => write!(f, "multicast listener report"),
-            Message::RplControl => write!(f, "RPL control message"),
-            Message::Unknown(id) => write!(f, "{id}"),
-        }
-    }
-}
-
-enum_with_unknown! {
+open_enum! {
     /// Internet protocol control message subtype for type "Destination Unreachable".
     pub enum DstUnreachable(u8) {
         /// No Route to destination.
@@ -118,24 +95,7 @@ enum_with_unknown! {
     }
 }
 
-impl fmt::Display for DstUnreachable {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            DstUnreachable::NoRoute => write!(f, "no route to destination"),
-            DstUnreachable::AdminProhibit => write!(f, "communication with destination administratively prohibited"),
-            DstUnreachable::BeyondScope => write!(f, "beyond scope of source address"),
-            DstUnreachable::AddrUnreachable => write!(f, "address unreachable"),
-            DstUnreachable::PortUnreachable => write!(f, "port unreachable"),
-            DstUnreachable::FailedPolicy => {
-                write!(f, "source address failed ingress/egress policy")
-            }
-            DstUnreachable::RejectRoute => write!(f, "reject route to destination"),
-            DstUnreachable::Unknown(id) => write!(f, "{id}"),
-        }
-    }
-}
-
-enum_with_unknown! {
+open_enum! {
     /// Internet protocol control message subtype for the type "Parameter Problem".
     pub enum ParamProblem(u8) {
         /// Erroneous header field encountered.
@@ -147,34 +107,13 @@ enum_with_unknown! {
     }
 }
 
-impl fmt::Display for ParamProblem {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            ParamProblem::ErroneousHdrField => write!(f, "erroneous header field."),
-            ParamProblem::UnrecognizedNxtHdr => write!(f, "unrecognized next header type."),
-            ParamProblem::UnrecognizedOption => write!(f, "unrecognized IPv6 option."),
-            ParamProblem::Unknown(id) => write!(f, "{id}"),
-        }
-    }
-}
-
-enum_with_unknown! {
+open_enum! {
     /// Internet protocol control message subtype for the type "Time Exceeded".
     pub enum TimeExceeded(u8) {
         /// Hop limit exceeded in transit.
         HopLimitExceeded    = 0,
         /// Fragment reassembly time exceeded.
         FragReassemExceeded = 1
-    }
-}
-
-impl fmt::Display for TimeExceeded {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            TimeExceeded::HopLimitExceeded => write!(f, "hop limit exceeded in transit"),
-            TimeExceeded::FragReassemExceeded => write!(f, "fragment reassembly time exceeded"),
-            TimeExceeded::Unknown(id) => write!(f, "{id}"),
-        }
     }
 }
 
@@ -288,7 +227,7 @@ impl<'a> Packet<'a> {
                 }
             }
             Message::RplControl => return Err(Error),
-            Message::Unknown(_) => return Err(Error),
+            _ => return Err(Error),
         }
 
         Ok(())

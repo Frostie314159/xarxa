@@ -139,7 +139,7 @@ impl StackInner {
         }
 
         // Only process REQUEST and RESPONSE.
-        if let ArpOperation::Unknown(_) = operation {
+        if !matches!(operation, ArpOperation::Request | ArpOperation::Reply) {
             net_debug!("arp: unknown operation code");
             return;
         }

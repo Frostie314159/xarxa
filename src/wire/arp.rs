@@ -4,14 +4,14 @@ use super::{Error, Result};
 
 pub use super::EthernetProtocol as Protocol;
 
-enum_with_unknown! {
+open_enum! {
     /// ARP hardware type.
     pub enum Hardware(u16) {
         Ethernet = 1
     }
 }
 
-enum_with_unknown! {
+open_enum! {
     /// ARP operation type.
     pub enum Operation(u16) {
         Request = 1,

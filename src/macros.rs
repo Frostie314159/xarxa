@@ -22,7 +22,7 @@ macro_rules! net_debug {
     ($($arg:expr),*) => (net_log!(debug, $($arg),*));
 }
 
-macro_rules! enum_with_unknown {
+macro_rules! open_enum {
     (
         $( #[$enum_attr:meta] )*
         pub enum $name:ident($ty:ty) {
@@ -32,31 +32,42 @@ macro_rules! enum_with_unknown {
             ),+ $(,)?
         }
     ) => {
-        #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
         $( #[$enum_attr] )*
-        pub enum $name {
+        #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash)]
+        pub struct $name(pub $ty);
+
+        #[allow(non_upper_case_globals)]
+        impl $name {
             $(
               $( #[$variant_attr] )*
-              $variant
-            ),*,
-            Unknown($ty)
+              pub const $variant: Self = Self($value);
+            )*
+        }
+
+        impl ::core::fmt::Debug for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                match *self {
+                    $( Self::$variant => f.write_str(stringify!($variant)), )*
+                    Self(other) => write!(f, "0x{:01$x}", other, ::core::mem::size_of::<$ty>() * 2),
+                }
+            }
+        }
+
+        impl ::core::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                ::core::fmt::Debug::fmt(self, f)
+            }
         }
 
         impl ::core::convert::From<$ty> for $name {
             fn from(value: $ty) -> Self {
-                match value {
-                    $( $value => $name::$variant ),*,
-                    other => $name::Unknown(other)
-                }
+                Self(value)
             }
         }
 
         impl ::core::convert::From<$name> for $ty {
             fn from(value: $name) -> Self {
-                match value {
-                    $( $name::$variant => $value ),*,
-                    $name::Unknown(other) => other
-                }
+                value.0
             }
         }
     }

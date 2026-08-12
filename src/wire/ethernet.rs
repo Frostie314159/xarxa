@@ -3,23 +3,12 @@ use core::fmt;
 
 use super::{Error, Result};
 
-enum_with_unknown! {
+open_enum! {
     /// Ethernet protocol type.
     pub enum EtherType(u16) {
         Ipv4 = 0x0800,
         Arp  = 0x0806,
         Ipv6 = 0x86DD
-    }
-}
-
-impl fmt::Display for EtherType {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match *self {
-            EtherType::Ipv4 => write!(f, "IPv4"),
-            EtherType::Ipv6 => write!(f, "IPv6"),
-            EtherType::Arp => write!(f, "ARP"),
-            EtherType::Unknown(id) => write!(f, "0x{id:04x}"),
-        }
     }
 }
 

@@ -1,13 +1,12 @@
 use bitflags::bitflags;
 use byteorder::{ByteOrder, NetworkEndian};
-use core::fmt;
 
 use super::{Error, Result};
 use crate::wire::{Ipv6Address, MAX_HARDWARE_ADDRESS_LEN};
 
 use crate::wire::RawHardwareAddress;
 
-enum_with_unknown! {
+open_enum! {
     /// NDISC Option Type
     pub enum Type(u8) {
         /// Source Link-layer Address
@@ -20,19 +19,6 @@ enum_with_unknown! {
         RedirectedHeader    = 0x4,
         /// MTU
         Mtu                 = 0x5
-    }
-}
-
-impl fmt::Display for Type {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Type::SourceLinkLayerAddr => write!(f, "source link-layer address"),
-            Type::TargetLinkLayerAddr => write!(f, "target link-layer address"),
-            Type::PrefixInformation => write!(f, "prefix information"),
-            Type::RedirectedHeader => write!(f, "redirected header"),
-            Type::Mtu => write!(f, "mtu"),
-            Type::Unknown(id) => write!(f, "{id}"),
-        }
     }
 }
 
@@ -179,8 +165,8 @@ impl<'a> NdiscOption<'a> {
                     Type::SourceLinkLayerAddr | Type::TargetLinkLayerAddr | Type::Mtu => Ok(()),
                     Type::PrefixInformation if data_range.end >= field::PREFIX.end => Ok(()),
                     Type::RedirectedHeader if data_range.end >= field::REDIR_MIN_SZ => Ok(()),
-                    Type::Unknown(_) => Ok(()),
-                    _ => Err(Error),
+                    Type::PrefixInformation | Type::RedirectedHeader => Err(Error),
+                    _ => Ok(()),
                 }
             }
         }
