@@ -19,7 +19,7 @@
 
 use std::os::unix::io::AsRawFd;
 
-use xarxa::phy::{Medium, TunTapInterface, wait};
+use xarxa::iface::{Medium, TunTapInterface, wait};
 use xarxa::stack::{Config, Stack};
 use xarxa::wire::{EthernetAddress, IpAddress, IpCidr};
 
@@ -48,7 +48,7 @@ fn main() {
     };
 
     let mut stack = Stack::new(config);
-    stack.add_phy(Box::new(device));
+    stack.add_iface(Box::new(device));
 
     loop {
         stack.poll();

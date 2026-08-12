@@ -1,7 +1,7 @@
 //! The network stack.
 
 use crate::buf::PacketBuf;
-use crate::phy::{Medium, Phy};
+use crate::iface::{Interface, Medium};
 use crate::wire::*;
 
 macro_rules! check {
@@ -20,7 +20,7 @@ macro_rules! check {
 pub struct Config {
     /// Hardware (MAC) address of the stack.
     ///
-    /// Used on [`Medium::Ethernet`] phys, ignored on [`Medium::Ip`] phys.
+    /// Used on [`Medium::Ethernet`] interfaces, ignored on [`Medium::Ip`] interfaces.
     pub hardware_addr: EthernetAddress,
 
     /// IP addresses of the stack.
@@ -30,12 +30,12 @@ pub struct Config {
 /// A network stack.
 pub struct Stack {
     inner: StackInner,
-    phys: Vec<Box<dyn Phy>>,
+    ifaces: Vec<Box<dyn Interface>>,
 }
 
 /// The device-independent part of the stack.
 ///
-/// Separate from `Stack` so that its methods can borrow a phy from `Stack::phys`
+/// Separate from `Stack` so that its methods can borrow an interface from `Stack::ifaces`
 /// while taking `&mut self`.
 struct StackInner {
     hardware_addr: EthernetAddress,
@@ -43,31 +43,31 @@ struct StackInner {
 }
 
 impl Stack {
-    /// Create a network stack with the given configuration and no phys.
+    /// Create a network stack with the given configuration and no ifaces.
     pub fn new(config: Config) -> Self {
         Self {
             inner: StackInner {
                 hardware_addr: config.hardware_addr,
                 ip_addrs: config.ip_addrs,
             },
-            phys: Vec::new(),
+            ifaces: Vec::new(),
         }
     }
 
-    /// Add a phy to the stack.
-    pub fn add_phy(&mut self, phy: Box<dyn Phy>) {
-        self.phys.push(phy);
+    /// Add an interface to the stack.
+    pub fn add_iface(&mut self, iface: Box<dyn Interface>) {
+        self.ifaces.push(iface);
     }
 
-    /// Process all pending ingress packets on all phys.
+    /// Process all pending ingress packets on all ifaces.
     ///
     /// Returns `true` if any packets were processed.
     pub fn poll(&mut self) -> bool {
         let mut processed = false;
-        for phy in self.phys.iter_mut() {
-            while let Some(buf) = phy.receive() {
+        for iface in self.ifaces.iter_mut() {
+            while let Some(buf) = iface.receive() {
                 processed = true;
-                self.inner.process(&mut **phy, buf);
+                self.inner.process(&mut **iface, buf);
             }
         }
         processed
@@ -75,14 +75,14 @@ impl Stack {
 }
 
 impl StackInner {
-    fn process(&mut self, phy: &mut dyn Phy, buf: PacketBuf) {
-        match phy.capabilities().medium {
-            Medium::Ethernet => self.process_ethernet(phy, buf),
-            Medium::Ip => self.process_ip(phy, buf),
+    fn process(&mut self, iface: &mut dyn Interface, buf: PacketBuf) {
+        match iface.capabilities().medium {
+            Medium::Ethernet => self.process_ethernet(iface, buf),
+            Medium::Ip => self.process_ip(iface, buf),
         }
     }
 
-    fn process_ethernet(&mut self, phy: &mut dyn Phy, mut buf: PacketBuf) {
+    fn process_ethernet(&mut self, iface: &mut dyn Interface, mut buf: PacketBuf) {
         let eth_frame = check!(EthernetFrame::new_checked(buf.payload_mut()));
 
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
@@ -98,26 +98,26 @@ impl StackInner {
         buf.pull_front(ETHERNET_HEADER_LEN);
 
         match ethertype {
-            EthernetProtocol::Arp => self.process_arp(phy, buf),
-            EthernetProtocol::Ipv4 => self.process_ipv4(phy, Some(src_addr), buf),
-            EthernetProtocol::Ipv6 => self.process_ipv6(phy, Some(src_addr), buf),
+            EthernetProtocol::Arp => self.process_arp(iface, buf),
+            EthernetProtocol::Ipv4 => self.process_ipv4(iface, Some(src_addr), buf),
+            EthernetProtocol::Ipv6 => self.process_ipv6(iface, Some(src_addr), buf),
             // Drop all other traffic.
             _ => {}
         }
     }
 
-    fn process_ip(&mut self, phy: &mut dyn Phy, buf: PacketBuf) {
+    fn process_ip(&mut self, iface: &mut dyn Interface, buf: PacketBuf) {
         if buf.is_empty() {
             return;
         }
         match IpVersion::of_packet(buf.payload()) {
-            Ok(IpVersion::Ipv4) => self.process_ipv4(phy, None, buf),
-            Ok(IpVersion::Ipv6) => self.process_ipv6(phy, None, buf),
+            Ok(IpVersion::Ipv4) => self.process_ipv4(iface, None, buf),
+            Ok(IpVersion::Ipv6) => self.process_ipv6(iface, None, buf),
             Err(_) => {}
         }
     }
 
-    fn process_arp(&mut self, phy: &mut dyn Phy, mut buf: PacketBuf) {
+    fn process_arp(&mut self, iface: &mut dyn Interface, mut buf: PacketBuf) {
         let arp_packet = check!(ArpPacket::new_checked(buf.payload_mut()));
 
         if arp_packet.hardware_type() != ArpHardware::Ethernet
@@ -171,11 +171,11 @@ impl StackInner {
                 arp_reply.set_target_hardware_addr(source_hardware_addr.as_bytes());
                 arp_reply.set_target_protocol_addr(&source_protocol_addr.octets());
             }
-            self.transmit_frame(phy, Some(source_hardware_addr), reply, EthernetProtocol::Arp);
+            self.transmit_frame(iface, Some(source_hardware_addr), reply, EthernetProtocol::Arp);
         }
     }
 
-    fn process_ipv4(&mut self, phy: &mut dyn Phy, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
+    fn process_ipv4(&mut self, iface: &mut dyn Interface, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
         let ipv4_packet = check!(Ipv4Packet::new_checked(buf.payload_mut()));
 
         if ipv4_packet.version() != 4 {
@@ -213,7 +213,7 @@ impl StackInner {
         buf.pull_front(header_len);
 
         match next_header {
-            IpProtocol::Icmp => self.process_icmpv4(phy, eth_src, src_addr, dst_addr, buf),
+            IpProtocol::Icmp => self.process_icmpv4(iface, eth_src, src_addr, dst_addr, buf),
             _ => {
                 net_trace!("ipv4: protocol {} not supported", next_header);
             }
@@ -222,7 +222,7 @@ impl StackInner {
 
     fn process_icmpv4(
         &mut self,
-        phy: &mut dyn Phy,
+        iface: &mut dyn Interface,
         eth_src: Option<EthernetAddress>,
         src_addr: Ipv4Address,
         dst_addr: Ipv4Address,
@@ -266,7 +266,7 @@ impl StackInner {
                     reply_icmp.data_mut().copy_from_slice(icmp_packet.data());
                     reply_icmp.fill_checksum();
                 }
-                self.transmit_ipv4(phy, eth_src, reply, reply_src, src_addr, IpProtocol::Icmp, 64);
+                self.transmit_ipv4(iface, eth_src, reply, reply_src, src_addr, IpProtocol::Icmp, 64);
             }
 
             // Ignore any echo replies.
@@ -276,7 +276,7 @@ impl StackInner {
         }
     }
 
-    fn process_ipv6(&mut self, phy: &mut dyn Phy, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
+    fn process_ipv6(&mut self, iface: &mut dyn Interface, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
         let ipv6_packet = check!(Ipv6Packet::new_checked(buf.payload_mut()));
 
         if ipv6_packet.version() != 6 {
@@ -305,7 +305,7 @@ impl StackInner {
         buf.pull_front(IPV6_HEADER_LEN);
 
         match next_header {
-            IpProtocol::Icmpv6 => self.process_icmpv6(phy, eth_src, src_addr, dst_addr, hop_limit, buf),
+            IpProtocol::Icmpv6 => self.process_icmpv6(iface, eth_src, src_addr, dst_addr, hop_limit, buf),
             _ => {
                 net_trace!("ipv6: protocol {} not supported", next_header);
             }
@@ -314,7 +314,7 @@ impl StackInner {
 
     fn process_icmpv6(
         &mut self,
-        phy: &mut dyn Phy,
+        iface: &mut dyn Interface,
         eth_src: Option<EthernetAddress>,
         src_addr: Ipv6Address,
         dst_addr: Ipv6Address,
@@ -348,7 +348,7 @@ impl StackInner {
                     reply_icmp.payload_mut().copy_from_slice(icmp_packet.payload());
                     reply_icmp.fill_checksum(&reply_src, &src_addr);
                 }
-                self.transmit_ipv6(phy, eth_src, reply, reply_src, src_addr, 64);
+                self.transmit_ipv6(iface, eth_src, reply, reply_src, src_addr, 64);
             }
 
             // Ignore any echo replies.
@@ -357,7 +357,7 @@ impl StackInner {
             // NDISC is only processed if the packet arrived with the un-decremented
             // hop limit, and only on Ethernet mediums.
             Icmpv6Message::NeighborSolicit if hop_limit == 0xff && eth_src.is_some() => {
-                self.process_ndisc_solicit(phy, eth_src, src_addr, dst_addr, &mut icmp_packet)
+                self.process_ndisc_solicit(iface, eth_src, src_addr, dst_addr, &mut icmp_packet)
             }
 
             _ => {}
@@ -366,7 +366,7 @@ impl StackInner {
 
     fn process_ndisc_solicit(
         &mut self,
-        phy: &mut dyn Phy,
+        iface: &mut dyn Interface,
         eth_src: Option<EthernetAddress>,
         src_addr: Ipv6Address,
         dst_addr: Ipv6Address,
@@ -423,13 +423,13 @@ impl StackInner {
                 }
                 na.fill_checksum(&target_addr, &src_addr);
             }
-            self.transmit_ipv6(phy, eth_src, reply, target_addr, src_addr, 0xff);
+            self.transmit_ipv6(iface, eth_src, reply, target_addr, src_addr, 0xff);
         }
     }
 
     fn transmit_ipv4(
         &self,
-        phy: &mut dyn Phy,
+        iface: &mut dyn Interface,
         dst_hw: Option<EthernetAddress>,
         mut buf: PacketBuf,
         src_addr: Ipv4Address,
@@ -457,12 +457,12 @@ impl StackInner {
             packet.set_dst_addr(dst_addr);
             packet.fill_checksum();
         }
-        self.transmit_frame(phy, dst_hw, buf, EthernetProtocol::Ipv4);
+        self.transmit_frame(iface, dst_hw, buf, EthernetProtocol::Ipv4);
     }
 
     fn transmit_ipv6(
         &self,
-        phy: &mut dyn Phy,
+        iface: &mut dyn Interface,
         dst_hw: Option<EthernetAddress>,
         mut buf: PacketBuf,
         src_addr: Ipv6Address,
@@ -482,17 +482,17 @@ impl StackInner {
             packet.set_src_addr(src_addr);
             packet.set_dst_addr(dst_addr);
         }
-        self.transmit_frame(phy, dst_hw, buf, EthernetProtocol::Ipv6);
+        self.transmit_frame(iface, dst_hw, buf, EthernetProtocol::Ipv6);
     }
 
     fn transmit_frame(
         &self,
-        phy: &mut dyn Phy,
+        iface: &mut dyn Interface,
         dst_hw: Option<EthernetAddress>,
         mut buf: PacketBuf,
         ethertype: EthernetProtocol,
     ) {
-        match phy.capabilities().medium {
+        match iface.capabilities().medium {
             Medium::Ethernet => {
                 let Some(dst_hw) = dst_hw else {
                     net_debug!("no destination hardware address");
@@ -506,8 +506,8 @@ impl StackInner {
             }
             Medium::Ip => {}
         }
-        if phy.transmit(buf).is_err() {
-            net_debug!("phy: cannot transmit, dropping packet");
+        if iface.transmit(buf).is_err() {
+            net_debug!("iface: cannot transmit, dropping packet");
         }
     }
 

@@ -4,7 +4,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::buf::PacketBuf;
-use crate::phy::{Medium, Phy, PhyCapabilities};
+use crate::iface::{IfaceCapabilities, Interface, Medium};
 use crate::wire::ETHERNET_HEADER_LEN;
 
 const SIOCGIFMTU: libc::c_ulong = 0x8921;
@@ -168,9 +168,9 @@ impl Drop for TunTapInterface {
     }
 }
 
-impl Phy for TunTapInterface {
-    fn capabilities(&self) -> PhyCapabilities {
-        PhyCapabilities {
+impl Interface for TunTapInterface {
+    fn capabilities(&self) -> IfaceCapabilities {
+        IfaceCapabilities {
             medium: self.medium,
             max_transmission_unit: self.mtu,
         }

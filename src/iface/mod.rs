@@ -1,13 +1,13 @@
 /*! Network interfaces.
 
-The `phy` module deals with the *network devices*. It provides the [Phy] trait, which
+The `iface` module deals with the *network devices*. It provides the [Interface] trait, which
 drivers implement to exchange owned [`PacketBuf`]s with the stack:
 
   * on receive, the driver hands a filled buffer up to the stack;
   * on transmit, the stack hands a built frame down to the driver, which owns the buffer
     until the hardware is done with it, then drops it.
 
-This module provides one implementation of [Phy]: the [TunTapInterface], to transmit and
+This module provides one implementation of [Interface]: the [TunTapInterface], to transmit and
 receive frames on the host OS.
 */
 
@@ -17,7 +17,7 @@ mod tuntap;
 
 pub use self::tuntap::TunTapInterface;
 
-/// Type of medium of a phy.
+/// Type of medium of an interface.
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum Medium {
     /// Ethernet medium. Devices of this type send and receive Ethernet frames.
@@ -28,11 +28,11 @@ pub enum Medium {
     Ip,
 }
 
-/// A description of phy capabilities.
+/// A description of iface capabilities.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
-pub struct PhyCapabilities {
-    /// Medium of the phy.
+pub struct IfaceCapabilities {
+    /// Medium of the iface.
     pub medium: Medium,
 
     /// Maximum transmission unit.
@@ -43,9 +43,9 @@ pub struct PhyCapabilities {
 }
 
 /// An interface for sending and receiving raw network frames.
-pub trait Phy {
-    /// Get a description of phy capabilities.
-    fn capabilities(&self) -> PhyCapabilities;
+pub trait Interface {
+    /// Get a description of iface capabilities.
+    fn capabilities(&self) -> IfaceCapabilities;
 
     /// Poll for a received frame.
     ///
@@ -53,9 +53,9 @@ pub trait Phy {
     /// ownership of it to the caller.
     fn receive(&mut self) -> Option<PacketBuf>;
 
-    /// Queue a frame for transmission, transferring ownership of the buffer to the phy.
+    /// Queue a frame for transmission, transferring ownership of the buffer to the iface.
     ///
-    /// The phy holds the buffer until the hardware is done with it, then drops it.
+    /// The iface holds the buffer until the hardware is done with it, then drops it.
     /// If the frame cannot be queued right now (device busy or queue full), the buffer
     /// is handed back in the `Err` variant.
     fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf>;

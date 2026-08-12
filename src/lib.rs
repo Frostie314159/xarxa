@@ -2,7 +2,7 @@
 mod macros;
 
 pub mod buf;
-pub mod phy;
+pub mod iface;
 pub mod stack;
 pub mod wire;
 
