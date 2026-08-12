@@ -83,7 +83,7 @@ impl StackInner {
     }
 
     fn process_ethernet(&mut self, iface: &mut dyn Interface, mut buf: PacketBuf) {
-        let eth_frame = check!(EthernetFrame::new_checked(buf.payload_mut()));
+        let eth_frame = check!(EthernetFrame::new_checked(&mut buf));
 
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
         if !eth_frame.dst_addr().is_broadcast()
@@ -110,7 +110,7 @@ impl StackInner {
         if buf.is_empty() {
             return;
         }
-        match IpVersion::of_packet(buf.payload()) {
+        match IpVersion::of_packet(&buf) {
             Ok(IpVersion::Ipv4) => self.process_ipv4(iface, None, buf),
             Ok(IpVersion::Ipv6) => self.process_ipv6(iface, None, buf),
             Err(_) => {}
@@ -118,7 +118,7 @@ impl StackInner {
     }
 
     fn process_arp(&mut self, iface: &mut dyn Interface, mut buf: PacketBuf) {
-        let arp_packet = check!(ArpPacket::new_checked(buf.payload_mut()));
+        let arp_packet = check!(ArpPacket::new_checked(&mut buf));
 
         if arp_packet.hardware_type() != ArpHardware::Ethernet
             || arp_packet.protocol_type() != EthernetProtocol::Ipv4
@@ -160,7 +160,7 @@ impl StackInner {
             reply.reserve(ETHERNET_HEADER_LEN);
             reply.set_len(ARP_BUFFER_LEN);
             {
-                let mut arp_reply = ArpPacket::new_unchecked(reply.payload_mut());
+                let mut arp_reply = ArpPacket::new_unchecked(&mut reply);
                 arp_reply.set_hardware_type(ArpHardware::Ethernet);
                 arp_reply.set_protocol_type(EthernetProtocol::Ipv4);
                 arp_reply.set_hardware_len(6);
@@ -176,7 +176,7 @@ impl StackInner {
     }
 
     fn process_ipv4(&mut self, iface: &mut dyn Interface, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
-        let ipv4_packet = check!(Ipv4Packet::new_checked(buf.payload_mut()));
+        let ipv4_packet = check!(Ipv4Packet::new_checked(&mut buf));
 
         if ipv4_packet.version() != 4 {
             return;
@@ -228,7 +228,7 @@ impl StackInner {
         dst_addr: Ipv4Address,
         mut buf: PacketBuf,
     ) {
-        let icmp_packet = check!(Icmpv4Packet::new_checked(buf.payload_mut()));
+        let icmp_packet = check!(Icmpv4Packet::new_checked(&mut buf));
         if !icmp_packet.verify_checksum() {
             net_trace!("icmpv4: checksum incorrect");
             return;
@@ -258,7 +258,7 @@ impl StackInner {
                 reply.reserve(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN);
                 reply.set_len(icmp_packet.header_len() + icmp_packet.data().len());
                 {
-                    let mut reply_icmp = Icmpv4Packet::new_unchecked(reply.payload_mut());
+                    let mut reply_icmp = Icmpv4Packet::new_unchecked(&mut reply);
                     reply_icmp.set_msg_type(Icmpv4Message::EchoReply);
                     reply_icmp.set_msg_code(0);
                     reply_icmp.set_echo_ident(icmp_packet.echo_ident());
@@ -277,7 +277,7 @@ impl StackInner {
     }
 
     fn process_ipv6(&mut self, iface: &mut dyn Interface, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
-        let ipv6_packet = check!(Ipv6Packet::new_checked(buf.payload_mut()));
+        let ipv6_packet = check!(Ipv6Packet::new_checked(&mut buf));
 
         if ipv6_packet.version() != 6 {
             return;
@@ -321,7 +321,7 @@ impl StackInner {
         hop_limit: u8,
         mut buf: PacketBuf,
     ) {
-        let mut icmp_packet = check!(Icmpv6Packet::new_checked(buf.payload_mut()));
+        let mut icmp_packet = check!(Icmpv6Packet::new_checked(&mut buf));
         if !icmp_packet.verify_checksum(&src_addr, &dst_addr) {
             net_trace!("icmpv6: checksum incorrect");
             return;
@@ -340,7 +340,7 @@ impl StackInner {
                 reply.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
                 reply.set_len(icmp_packet.header_len() + icmp_packet.payload().len());
                 {
-                    let mut reply_icmp = Icmpv6Packet::new_unchecked(reply.payload_mut());
+                    let mut reply_icmp = Icmpv6Packet::new_unchecked(&mut reply);
                     reply_icmp.set_msg_type(Icmpv6Message::EchoReply);
                     reply_icmp.set_msg_code(0);
                     reply_icmp.set_echo_ident(icmp_packet.echo_ident());
@@ -409,7 +409,7 @@ impl StackInner {
             reply.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
             reply.set_len(24 + 8);
             {
-                let mut na = Icmpv6Packet::new_unchecked(reply.payload_mut());
+                let mut na = Icmpv6Packet::new_unchecked(&mut reply);
                 na.set_msg_type(Icmpv6Message::NeighborAdvert);
                 na.set_msg_code(0);
                 na.clear_reserved();
@@ -440,7 +440,7 @@ impl StackInner {
         let payload_len = buf.len();
         buf.push_front(IPV4_HEADER_LEN);
         {
-            let mut packet = Ipv4Packet::new_unchecked(buf.payload_mut());
+            let mut packet = Ipv4Packet::new_unchecked(&mut buf);
             packet.set_version(4);
             packet.set_header_len(IPV4_HEADER_LEN as u8);
             packet.set_dscp(0);
@@ -472,7 +472,7 @@ impl StackInner {
         let payload_len = buf.len();
         buf.push_front(IPV6_HEADER_LEN);
         {
-            let mut packet = Ipv6Packet::new_unchecked(buf.payload_mut());
+            let mut packet = Ipv6Packet::new_unchecked(&mut buf);
             packet.set_version(6);
             packet.set_traffic_class(0);
             packet.set_flow_label(0);
@@ -499,7 +499,7 @@ impl StackInner {
                     return;
                 };
                 buf.push_front(ETHERNET_HEADER_LEN);
-                let mut frame = EthernetFrame::new_unchecked(buf.payload_mut());
+                let mut frame = EthernetFrame::new_unchecked(&mut buf);
                 frame.set_dst_addr(dst_hw);
                 frame.set_src_addr(self.hardware_addr);
                 frame.set_ethertype(ethertype);

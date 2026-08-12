@@ -287,7 +287,7 @@ mod test_ipv6 {
         frame.set_dst_addr(Address([0x01, 0x02, 0x03, 0x04, 0x05, 0x06]));
         frame.set_src_addr(Address([0x11, 0x12, 0x13, 0x14, 0x15, 0x16]));
         frame.set_ethertype(EtherType::Ipv6);
-        assert_eq!(PAYLOAD_BYTES.len(), frame.payload_mut().len());
+        assert_eq!(PAYLOAD_BYTES.len(), frame.payload().len());
         frame.payload_mut().copy_from_slice(&PAYLOAD_BYTES[..]);
         assert_eq!(&bytes[..], &FRAME_BYTES[..]);
     }

@@ -1,6 +1,7 @@
 //! Owned packet buffers.
 
 use core::fmt;
+use std::ops::{Deref, DerefMut};
 
 /// Size of the buffer in a [`PacketBuf`].
 ///
@@ -67,20 +68,6 @@ impl PacketBuf {
         PACKET_BUF_SIZE - self.headroom() - self.len()
     }
 
-    /// The valid data.
-    pub fn payload(&self) -> &[u8] {
-        let start = self.inner.headroom as usize;
-        let end = start + self.inner.len as usize;
-        &self.inner.data[start..end]
-    }
-
-    /// The valid data, mutably.
-    pub fn payload_mut(&mut self) -> &mut [u8] {
-        let start = self.inner.headroom as usize;
-        let end = start + self.inner.len as usize;
-        &mut self.inner.data[start..end]
-    }
-
     /// Set the headroom on an empty buffer, before writing a payload.
     ///
     /// # Panics
@@ -127,6 +114,22 @@ impl Default for PacketBuf {
     }
 }
 
+impl Deref for PacketBuf {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        let start = self.inner.headroom as usize;
+        let end = start + self.inner.len as usize;
+        &self.inner.data[start..end]
+    }
+}
+impl DerefMut for PacketBuf {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let start = self.inner.headroom as usize;
+        let end = start + self.inner.len as usize;
+        &mut self.inner.data[start..end]
+    }
+}
+
 impl fmt::Debug for PacketBuf {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PacketBuf")
@@ -152,17 +155,17 @@ mod tests {
         buf.set_len(100);
         assert_eq!(buf.len(), 100);
         assert_eq!(buf.tailroom(), PACKET_BUF_SIZE - 142);
-        buf.payload_mut().fill(0xaa);
+        buf.fill(0xaa);
 
         buf.push_front(20);
         assert_eq!(buf.headroom(), 22);
         assert_eq!(buf.len(), 120);
-        assert_eq!(buf.payload()[20], 0xaa);
+        assert_eq!(buf[20], 0xaa);
 
         buf.pull_front(20);
         assert_eq!(buf.headroom(), 42);
         assert_eq!(buf.len(), 100);
-        assert_eq!(buf.payload()[0], 0xaa);
+        assert_eq!(buf[0], 0xaa);
     }
 
     #[test]

@@ -179,7 +179,7 @@ impl Interface for TunTapInterface {
     fn receive(&mut self) -> Option<PacketBuf> {
         let mut buf = PacketBuf::new();
         buf.set_len(buf.capacity());
-        match self.recv(&mut buf.payload_mut()[..]) {
+        match self.recv(&mut buf[..]) {
             Ok(size) => {
                 buf.set_len(size);
                 Some(buf)
@@ -190,7 +190,7 @@ impl Interface for TunTapInterface {
     }
 
     fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
-        match self.send(buf.payload()) {
+        match self.send(&buf) {
             Ok(_) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
                 net_debug!("phy: tx failed due to WouldBlock");
