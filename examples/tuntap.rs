@@ -21,6 +21,7 @@ use std::os::unix::io::AsRawFd;
 
 use xarxa::iface::{Medium, TunTapInterface, wait};
 use xarxa::stack::{Config, Stack};
+use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, IpAddress, IpCidr};
 
 fn main() {
@@ -51,7 +52,7 @@ fn main() {
     stack.add_iface(Box::new(device));
 
     loop {
-        stack.poll();
+        stack.poll(Instant::now());
         wait(fd, None).unwrap();
     }
 }

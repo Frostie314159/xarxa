@@ -94,7 +94,6 @@ pub(crate) trait AddressExt {
     /// # Panics
     /// This function panics if the given address is not
     /// unicast.
-    #[allow(unused)]
     fn solicited_node(&self) -> Address;
 
     /// Return the scope of the address.
