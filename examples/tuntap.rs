@@ -1,4 +1,5 @@
-//! Bare minimum example: bring up a TUN/TAP interface and reply to pings.
+//! Bare minimum example: bring up a TUN/TAP interface, reply to pings, and echo
+//! UDP datagrams received on port 6969.
 //!
 //! Run with:
 //!
@@ -15,6 +16,8 @@
 //! sudo ip addr add fdaa::100/64 dev tap0
 //! ping 192.168.69.1
 //! ping fdaa::1
+//! nc -u 192.168.69.1 6969
+//! nc -u fdaa::1 6969
 //! ```
 
 use std::os::unix::io::AsRawFd;
@@ -51,8 +54,22 @@ fn main() {
     let mut stack = Stack::new(config);
     stack.add_iface(Box::new(device));
 
+    let udp_handle = stack.add_udp_socket();
+    stack.udp(udp_handle).bind(6969).unwrap();
+
     loop {
         let deadline = stack.poll(Instant::now());
+
+        // Echo received datagrams back to their sender.
+        let mut socket = stack.udp(udp_handle);
+        while let Ok(packet) = socket.recv() {
+            let meta = packet.meta();
+            log::info!("udp: echoing {} octets to {}", packet.payload().len(), meta);
+            let data = packet.payload().to_vec();
+            drop(packet); // free the buffer before sending
+            socket.send_slice(&data, meta.endpoint).unwrap();
+        }
+
         let timeout = deadline.map(|deadline| {
             let now = Instant::now();
             if deadline <= now {

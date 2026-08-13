@@ -39,6 +39,7 @@ pub(crate) mod ipv4;
 pub(crate) mod ipv6;
 mod ndisc;
 mod ndiscoption;
+mod udp;
 
 use core::fmt;
 
@@ -52,7 +53,10 @@ pub use self::arp::{
 };
 
 pub use self::ip::checksum;
-pub use self::ip::{Address as IpAddress, Cidr as IpCidr, Protocol as IpProtocol, Version as IpVersion};
+pub use self::ip::{
+    Address as IpAddress, Cidr as IpCidr, Endpoint as IpEndpoint, ListenEndpoint as IpListenEndpoint,
+    Protocol as IpProtocol, Version as IpVersion,
+};
 
 pub use self::ipv4::{
     Address as Ipv4Address, Cidr as Ipv4Cidr, HEADER_LEN as IPV4_HEADER_LEN, MIN_MTU as IPV4_MIN_MTU,
@@ -81,6 +85,8 @@ pub use self::icmpv6::{
 pub use self::ndisc::{NeighborFlags as NdiscNeighborFlags, RouterFlags as NdiscRouterFlags};
 
 pub use self::ndiscoption::{NdiscOption, PrefixInfoFlags as NdiscPrefixInfoFlags, Type as NdiscOptionType};
+
+pub use self::udp::{HEADER_LEN as UDP_HEADER_LEN, Packet as UdpPacket};
 
 /// Parsing a packet failed.
 ///

@@ -243,6 +243,117 @@ impl fmt::Display for Cidr {
     }
 }
 
+/// An internet endpoint address.
+///
+/// `Endpoint` always fully specifies both the address and the port.
+///
+/// See also [`ListenEndpoint`], which allows not specifying the address
+/// in order to listen on a given port on any address.
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
+pub struct Endpoint {
+    pub addr: Address,
+    pub port: u16,
+}
+
+impl Endpoint {
+    /// Create an endpoint address from given address and port.
+    pub const fn new(addr: Address, port: u16) -> Endpoint {
+        Endpoint { addr, port }
+    }
+}
+
+impl From<::core::net::SocketAddr> for Endpoint {
+    fn from(x: ::core::net::SocketAddr) -> Endpoint {
+        Endpoint {
+            addr: x.ip().into(),
+            port: x.port(),
+        }
+    }
+}
+
+impl From<Endpoint> for ::core::net::SocketAddr {
+    fn from(x: Endpoint) -> ::core::net::SocketAddr {
+        ::core::net::SocketAddr::new(x.addr.into(), x.port)
+    }
+}
+
+impl<T: Into<Address>> From<(T, u16)> for Endpoint {
+    fn from((addr, port): (T, u16)) -> Endpoint {
+        Endpoint {
+            addr: addr.into(),
+            port,
+        }
+    }
+}
+
+impl fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}:{}", self.addr, self.port)
+    }
+}
+
+/// An internet endpoint address for listening.
+///
+/// In contrast with [`Endpoint`], `ListenEndpoint` allows not specifying the address,
+/// in order to listen on a given port at all our addresses.
+///
+/// An endpoint can be constructed from a port, in which case the address is unspecified.
+#[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
+pub struct ListenEndpoint {
+    pub addr: Option<Address>,
+    pub port: u16,
+}
+
+impl ListenEndpoint {
+    /// Query whether the endpoint has a specified address and port.
+    pub const fn is_specified(&self) -> bool {
+        self.addr.is_some() && self.port != 0
+    }
+}
+
+impl From<u16> for ListenEndpoint {
+    fn from(port: u16) -> ListenEndpoint {
+        ListenEndpoint { addr: None, port }
+    }
+}
+
+impl From<Endpoint> for ListenEndpoint {
+    fn from(endpoint: Endpoint) -> ListenEndpoint {
+        ListenEndpoint {
+            addr: Some(endpoint.addr),
+            port: endpoint.port,
+        }
+    }
+}
+
+impl From<::core::net::SocketAddr> for ListenEndpoint {
+    fn from(x: ::core::net::SocketAddr) -> ListenEndpoint {
+        ListenEndpoint {
+            addr: Some(x.ip().into()),
+            port: x.port(),
+        }
+    }
+}
+
+impl<T: Into<Address>> From<(T, u16)> for ListenEndpoint {
+    fn from((addr, port): (T, u16)) -> ListenEndpoint {
+        ListenEndpoint {
+            addr: Some(addr.into()),
+            port,
+        }
+    }
+}
+
+impl fmt::Display for ListenEndpoint {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        if let Some(addr) = self.addr {
+            write!(f, "{}:{}", addr, self.port)
+        } else {
+            write!(f, "*:{}", self.port)
+        }
+    }
+}
+
 pub mod checksum {
     use byteorder::{ByteOrder, NetworkEndian};
 

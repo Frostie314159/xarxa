@@ -35,6 +35,14 @@ impl<T> Slab<T> {
         self.slots[index].take().expect("no item at this index")
     }
 
+    /// Get a mutable reference to the item at `index`.
+    ///
+    /// # Panics
+    /// Panics if the slot at `index` is empty.
+    pub fn get_mut(&mut self, index: usize) -> &mut T {
+        self.slots[index].as_mut().expect("no item at this index")
+    }
+
     /// Iterate over all occupied slots, with their indexes.
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
         self.slots

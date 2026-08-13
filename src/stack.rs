@@ -5,6 +5,7 @@ use crate::iface::{Interface, Medium};
 use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, PendingQueue, ProbeEvent};
 use crate::slab::Slab;
 use crate::time::Instant;
+use crate::udp::{UdpHandle, UdpSocket, UdpSocketState};
 use crate::wire::*;
 
 macro_rules! check {
@@ -36,12 +37,13 @@ pub struct IfaceHandle(pub(crate) usize);
 
 /// A network stack.
 pub struct Stack {
-    inner: StackInner,
-    ifaces: Slab<Iface>,
+    pub(crate) inner: StackInner,
+    pub(crate) ifaces: Slab<Iface>,
+    pub(crate) udp_sockets: Slab<UdpSocketState>,
 }
 
 /// An interface added to the stack.
-struct Iface {
+pub(crate) struct Iface {
     handle: IfaceHandle,
     dev: Box<dyn Interface>,
 }
@@ -50,7 +52,7 @@ struct Iface {
 ///
 /// Separate from `Stack` so that its methods can borrow an interface from `Stack::ifaces`
 /// while taking `&mut self`.
-struct StackInner {
+pub(crate) struct StackInner {
     hardware_addr: EthernetAddress,
     ip_addrs: Vec<IpCidr>,
     now: Instant,
@@ -80,6 +82,7 @@ impl Stack {
                 pending: PendingQueue::new(),
             },
             ifaces: Slab::new(),
+            udp_sockets: Slab::new(),
         }
     }
 
@@ -103,12 +106,37 @@ impl Stack {
         iface.dev
     }
 
+    /// Add a UDP socket to the stack, returning a handle to it.
+    pub fn add_udp_socket(&mut self) -> UdpHandle {
+        UdpHandle(self.udp_sockets.add_with(|_| UdpSocketState::new()))
+    }
+
+    /// Remove a UDP socket from the stack.
+    ///
+    /// # Panics
+    /// Panics if the handle is stale (the socket was already removed).
+    pub fn remove_udp_socket(&mut self, handle: UdpHandle) {
+        self.udp_sockets.remove(handle.0);
+    }
+
+    /// Borrow a UDP socket from the stack.
+    ///
+    /// # Panics
+    /// Panics if the handle is stale (the socket was already removed).
+    pub fn udp(&mut self, handle: UdpHandle) -> UdpSocket<'_> {
+        UdpSocket {
+            state: self.udp_sockets.get_mut(handle.0),
+            inner: &mut self.inner,
+            ifaces: &mut self.ifaces,
+        }
+    }
+
     /// Process all pending ingress packets on all ifaces.
     ///
     /// `timestamp` is the current time.
     ///
     /// Returns the earliest instant at which `poll` should be called again to advance
-    /// the timers, or `None` if no timers are pending — in that case it is enough to
+    /// the timers, or `None` if no timers are pending. In that case it is enough to
     /// call `poll` again when a packet is received.
     pub fn poll(&mut self, timestamp: Instant) -> Option<Instant> {
         self.inner.now = timestamp;
@@ -120,7 +148,7 @@ impl Stack {
             self.inner.poll_neighbor_timers(iface);
 
             while let Some(buf) = iface.dev.receive() {
-                self.inner.process(iface, buf);
+                self.inner.process(iface, &mut self.udp_sockets, buf);
             }
         }
 
@@ -132,14 +160,14 @@ impl Stack {
 }
 
 impl StackInner {
-    fn process(&mut self, iface: &mut Iface, buf: PacketBuf) {
+    fn process(&mut self, iface: &mut Iface, udp_sockets: &mut Slab<UdpSocketState>, buf: PacketBuf) {
         match iface.dev.capabilities().medium {
-            Medium::Ethernet => self.process_ethernet(iface, buf),
-            Medium::Ip => self.process_ip(iface, buf),
+            Medium::Ethernet => self.process_ethernet(iface, udp_sockets, buf),
+            Medium::Ip => self.process_ip(iface, udp_sockets, buf),
         }
     }
 
-    fn process_ethernet(&mut self, iface: &mut Iface, mut buf: PacketBuf) {
+    fn process_ethernet(&mut self, iface: &mut Iface, udp_sockets: &mut Slab<UdpSocketState>, mut buf: PacketBuf) {
         let eth_frame = check!(EthernetFrame::new_checked(&mut buf));
 
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
@@ -156,20 +184,20 @@ impl StackInner {
 
         match ethertype {
             EthernetProtocol::Arp => self.process_arp(iface, buf),
-            EthernetProtocol::Ipv4 => self.process_ipv4(iface, Some(src_addr), buf),
-            EthernetProtocol::Ipv6 => self.process_ipv6(iface, Some(src_addr), buf),
+            EthernetProtocol::Ipv4 => self.process_ipv4(iface, udp_sockets, Some(src_addr), buf),
+            EthernetProtocol::Ipv6 => self.process_ipv6(iface, udp_sockets, Some(src_addr), buf),
             // Drop all other traffic.
             _ => {}
         }
     }
 
-    fn process_ip(&mut self, iface: &mut Iface, buf: PacketBuf) {
+    fn process_ip(&mut self, iface: &mut Iface, udp_sockets: &mut Slab<UdpSocketState>, buf: PacketBuf) {
         if buf.is_empty() {
             return;
         }
         match IpVersion::of_packet(&buf) {
-            Ok(IpVersion::Ipv4) => self.process_ipv4(iface, None, buf),
-            Ok(IpVersion::Ipv6) => self.process_ipv6(iface, None, buf),
+            Ok(IpVersion::Ipv4) => self.process_ipv4(iface, udp_sockets, None, buf),
+            Ok(IpVersion::Ipv6) => self.process_ipv6(iface, udp_sockets, None, buf),
             Err(_) => {}
         }
     }
@@ -238,7 +266,13 @@ impl StackInner {
         }
     }
 
-    fn process_ipv4(&mut self, iface: &mut Iface, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
+    fn process_ipv4(
+        &mut self,
+        iface: &mut Iface,
+        udp_sockets: &mut Slab<UdpSocketState>,
+        eth_src: Option<EthernetAddress>,
+        mut buf: PacketBuf,
+    ) {
         let ipv4_packet = check!(Ipv4Packet::new_checked(&mut buf));
 
         if ipv4_packet.version() != 4 {
@@ -284,6 +318,13 @@ impl StackInner {
 
         match next_header {
             IpProtocol::Icmp => self.process_icmpv4(iface, src_addr, dst_addr, buf),
+            IpProtocol::Udp => self.process_udp(
+                udp_sockets,
+                IpAddress::Ipv4(src_addr),
+                IpAddress::Ipv4(dst_addr),
+                header_len,
+                buf,
+            ),
             _ => {
                 net_trace!("ipv4: protocol {} not supported", next_header);
             }
@@ -339,7 +380,13 @@ impl StackInner {
         }
     }
 
-    fn process_ipv6(&mut self, iface: &mut Iface, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
+    fn process_ipv6(
+        &mut self,
+        iface: &mut Iface,
+        udp_sockets: &mut Slab<UdpSocketState>,
+        eth_src: Option<EthernetAddress>,
+        mut buf: PacketBuf,
+    ) {
         let ipv6_packet = check!(Ipv6Packet::new_checked(&mut buf));
 
         if ipv6_packet.version() != 6 {
@@ -376,6 +423,13 @@ impl StackInner {
 
         match next_header {
             IpProtocol::Icmpv6 => self.process_icmpv6(iface, eth_src, src_addr, dst_addr, hop_limit, buf),
+            IpProtocol::Udp => self.process_udp(
+                udp_sockets,
+                IpAddress::Ipv6(src_addr),
+                IpAddress::Ipv6(dst_addr),
+                IPV6_HEADER_LEN,
+                buf,
+            ),
             _ => {
                 net_trace!("ipv6: protocol {} not supported", next_header);
             }
@@ -418,7 +472,7 @@ impl StackInner {
                     reply_icmp.payload_mut().copy_from_slice(icmp_packet.payload());
                     reply_icmp.fill_checksum(&reply_src, &src_addr);
                 }
-                self.transmit_ipv6(iface, reply, reply_src, src_addr, 64);
+                self.transmit_ipv6(iface, reply, reply_src, src_addr, IpProtocol::Icmpv6, 64);
             }
 
             // Ignore any echo replies.
@@ -481,7 +535,7 @@ impl StackInner {
                 }
                 na.fill_checksum(&target_addr, &src_addr);
             }
-            self.transmit_ipv6(iface, reply, target_addr, src_addr, 0xff);
+            self.transmit_ipv6(iface, reply, target_addr, src_addr, IpProtocol::Icmpv6, 0xff);
         }
     }
 
@@ -644,10 +698,10 @@ impl StackInner {
         }
         // The solicited-node destination is multicast, so this never recurses back
         // into neighbor resolution.
-        self.transmit_ipv6(iface, buf, src_addr, dst_addr, 0xff);
+        self.transmit_ipv6(iface, buf, src_addr, dst_addr, IpProtocol::Icmpv6, 0xff);
     }
 
-    fn transmit_ipv4(
+    pub(crate) fn transmit_ipv4(
         &mut self,
         iface: &mut Iface,
         mut buf: PacketBuf,
@@ -679,12 +733,13 @@ impl StackInner {
         self.transmit_ip_frame(iface, IpAddress::Ipv4(dst_addr), buf, EthernetProtocol::Ipv4);
     }
 
-    fn transmit_ipv6(
+    pub(crate) fn transmit_ipv6(
         &mut self,
         iface: &mut Iface,
         mut buf: PacketBuf,
         src_addr: Ipv6Address,
         dst_addr: Ipv6Address,
+        next_header: IpProtocol,
         hop_limit: u8,
     ) {
         let payload_len = buf.len();
@@ -695,7 +750,7 @@ impl StackInner {
             packet.set_traffic_class(0);
             packet.set_flow_label(0);
             packet.set_payload_len(payload_len as u16);
-            packet.set_next_header(IpProtocol::Icmpv6);
+            packet.set_next_header(next_header);
             packet.set_hop_limit(hop_limit);
             packet.set_src_addr(src_addr);
             packet.set_dst_addr(dst_addr);
@@ -798,9 +853,17 @@ impl StackInner {
         first_ipv4
     }
 
+    /// Get a source address for the given destination address.
+    pub(crate) fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
+        match dst_addr {
+            IpAddress::Ipv4(addr) => self.get_source_address_ipv4(addr).map(IpAddress::Ipv4),
+            IpAddress::Ipv6(addr) => Some(IpAddress::Ipv6(self.get_source_address_ipv6(addr))),
+        }
+    }
+
     /// Checks if an address is broadcast, taking into account ipv4 subnet-local
     /// broadcast addresses.
-    fn is_broadcast(&self, address: &IpAddress) -> bool {
+    pub(crate) fn is_broadcast(&self, address: &IpAddress) -> bool {
         match address {
             IpAddress::Ipv4(address) => self.is_broadcast_v4(*address),
             IpAddress::Ipv6(_) => false,

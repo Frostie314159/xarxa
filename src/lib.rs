@@ -7,7 +7,9 @@ pub mod neighbor;
 mod slab;
 pub mod stack;
 pub mod time;
+pub mod udp;
 pub mod wire;
 
 pub use buf::{PACKET_BUF_SIZE, PacketBuf};
 pub use stack::{Config, IfaceHandle, Stack};
+pub use udp::{UdpHandle, UdpSocket};
