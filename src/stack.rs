@@ -2,7 +2,8 @@
 
 use crate::buf::PacketBuf;
 use crate::iface::{Interface, Medium};
-use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, PendingQueue};
+use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, PendingQueue, ProbeEvent};
+use crate::slab::Slab;
 use crate::time::Instant;
 use crate::wire::*;
 
@@ -29,17 +30,20 @@ pub struct Config {
     pub ip_addrs: Vec<IpCidr>,
 }
 
+/// A handle to an interface added to a [`Stack`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct IfaceHandle(pub(crate) usize);
+
 /// A network stack.
 pub struct Stack {
     inner: StackInner,
-    ifaces: Vec<Iface>,
+    ifaces: Slab<Iface>,
 }
 
-/// An interface added to the stack: the device, plus the per-interface state.
+/// An interface added to the stack.
 struct Iface {
+    handle: IfaceHandle,
     dev: Box<dyn Interface>,
-    neighbor_cache: NeighborCache,
-    pending: PendingQueue,
 }
 
 /// The device-independent part of the stack.
@@ -50,6 +54,8 @@ struct StackInner {
     hardware_addr: EthernetAddress,
     ip_addrs: Vec<IpCidr>,
     now: Instant,
+    neighbor_cache: NeighborCache,
+    pending: PendingQueue,
 }
 
 /// The result of a neighbor lookupi.
@@ -70,38 +76,58 @@ impl Stack {
                 hardware_addr: config.hardware_addr,
                 ip_addrs: config.ip_addrs,
                 now: Instant::ZERO,
+                neighbor_cache: NeighborCache::new(),
+                pending: PendingQueue::new(),
             },
-            ifaces: Vec::new(),
+            ifaces: Slab::new(),
         }
     }
 
-    /// Add an interface to the stack.
-    pub fn add_iface(&mut self, dev: Box<dyn Interface>) {
-        self.ifaces.push(Iface {
+    /// Add an interface to the stack, returning a handle to it.
+    pub fn add_iface(&mut self, dev: Box<dyn Interface>) -> IfaceHandle {
+        let index = self.ifaces.add_with(|index| Iface {
+            handle: IfaceHandle(index),
             dev,
-            neighbor_cache: NeighborCache::new(),
-            pending: PendingQueue::new(),
         });
+        IfaceHandle(index)
+    }
+
+    /// Remove an interface from the stack, returning the device.
+    ///
+    /// # Panics
+    /// Panics if the handle is stale (the interface was already removed).
+    pub fn remove_iface(&mut self, handle: IfaceHandle) -> Box<dyn Interface> {
+        let iface = self.ifaces.remove(handle.0);
+        self.inner.neighbor_cache.purge_iface(handle);
+        self.inner.pending.purge_iface(handle);
+        iface.dev
     }
 
     /// Process all pending ingress packets on all ifaces.
     ///
     /// `timestamp` is the current time.
     ///
-    /// Returns `true` if any packets were processed.
-    pub fn poll(&mut self, timestamp: Instant) -> bool {
+    /// Returns the earliest instant at which `poll` should be called again to advance
+    /// the timers, or `None` if no timers are pending — in that case it is enough to
+    /// call `poll` again when a packet is received.
+    pub fn poll(&mut self, timestamp: Instant) -> Option<Instant> {
         self.inner.now = timestamp;
-        let mut processed = false;
-        for iface in self.ifaces.iter_mut() {
-            // Drop queued packets whose neighbor resolution timed out.
-            iface.pending.purge_expired(timestamp);
+
+        // Drop queued packets whose neighbor resolution timed out.
+        self.inner.pending.purge_expired(timestamp);
+
+        for (_, iface) in self.ifaces.iter_mut() {
+            self.inner.poll_neighbor_timers(iface);
 
             while let Some(buf) = iface.dev.receive() {
-                processed = true;
                 self.inner.process(iface, buf);
             }
         }
-        processed
+
+        [self.inner.neighbor_cache.poll_at(), self.inner.pending.poll_at()]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
 
@@ -248,9 +274,8 @@ impl StackInner {
         if let Some(eth_src) = eth_src
             && self.is_unicast_v4(dst_addr)
         {
-            iface
-                .neighbor_cache
-                .reset_expiry_if_existing(IpAddress::Ipv4(src_addr), eth_src, self.now);
+            self.neighbor_cache
+                .reset_expiry_if_existing((iface.handle, IpAddress::Ipv4(src_addr)), eth_src, self.now);
         }
 
         // Strip the IP header and any trailing padding added by the link layer.
@@ -341,9 +366,8 @@ impl StackInner {
         if let Some(eth_src) = eth_src
             && dst_addr.x_is_unicast()
         {
-            iface
-                .neighbor_cache
-                .reset_expiry_if_existing(IpAddress::Ipv6(src_addr), eth_src, self.now);
+            self.neighbor_cache
+                .reset_expiry_if_existing((iface.handle, IpAddress::Ipv6(src_addr)), eth_src, self.now);
         }
 
         // Strip the IP header and any trailing padding added by the link layer.
@@ -476,21 +500,52 @@ impl StackInner {
             if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
                 return;
             }
-            if flags.contains(NdiscNeighborFlags::OVERRIDE) || !iface.neighbor_cache.lookup(&ip_addr, self.now).found()
+            if flags.contains(NdiscNeighborFlags::OVERRIDE)
+                || !self.neighbor_cache.lookup(&(iface.handle, ip_addr), self.now).found()
             {
                 self.fill_neighbor(iface, ip_addr, lladdr)
             }
         }
     }
 
+    /// Advance the solicitation retransmission timers of the neighbors being resolved
+    /// on this interface, retransmitting solicitations and failing resolutions that
+    /// exhausted their probes.
+    fn poll_neighbor_timers(&mut self, iface: &mut Iface) {
+        for event in self.neighbor_cache.poll_retransmit(iface.handle, self.now) {
+            match event {
+                ProbeEvent::Retransmit(addr) => {
+                    net_debug!("neighbor {} still unresolved, retransmitting solicitation", addr);
+                    self.solicit_neighbor(iface, addr);
+                }
+                ProbeEvent::Failed(addr) => {
+                    net_debug!("neighbor {} resolution failed, dropping queued packets", addr);
+                    // Dropping the queued packets is all there is to do.
+                    // TODO: RFC 4861 says to send an ICMP destination unreachable
+                    // error for each of them.
+                    drop(self.pending.take_matching(&(iface.handle, addr)));
+                }
+            }
+        }
+    }
+
+    /// Send a solicitation (ARP request / NDISC neighbor solicit) for the given address.
+    fn solicit_neighbor(&mut self, iface: &mut Iface, addr: IpAddress) {
+        match addr {
+            IpAddress::Ipv4(addr) => self.transmit_arp_request(iface, addr),
+            IpAddress::Ipv6(addr) => self.transmit_ndisc_solicit(iface, addr),
+        }
+    }
+
     /// Fill the neighbor cache, and flush any packets that were queued waiting for
     /// this neighbor to resolve.
     fn fill_neighbor(&mut self, iface: &mut Iface, addr: IpAddress, hardware_addr: EthernetAddress) {
-        iface.neighbor_cache.fill(addr, hardware_addr, self.now);
+        let key = (iface.handle, addr);
+        self.neighbor_cache.fill(key, hardware_addr, self.now);
 
-        for packet in iface.pending.take_matching(&addr) {
+        for packet in self.pending.take_matching(&key) {
             net_trace!("neighbor: {} resolved, flushing queued packet", addr);
-            let ethertype = match packet.next_hop {
+            let ethertype = match packet.key.1 {
                 IpAddress::Ipv4(_) => EthernetProtocol::Ipv4,
                 IpAddress::Ipv6(_) => EthernetProtocol::Ipv6,
             };
@@ -524,26 +579,18 @@ impl StackInner {
             return NeighborLookup::NoRoute;
         };
 
-        match iface.neighbor_cache.lookup(&next_hop, self.now) {
+        match self.neighbor_cache.lookup(&(iface.handle, next_hop), self.now) {
             NeighborAnswer::Found(hardware_addr) => return NeighborLookup::Found(hardware_addr),
-            // A solicitation went out recently already, don't send another one yet.
-            NeighborAnswer::RateLimited => return NeighborLookup::Pending { next_hop },
+            // Resolution is already in progress; the retransmission timer owns
+            // any further solicitations.
+            NeighborAnswer::Pending => return NeighborLookup::Pending { next_hop },
             NeighborAnswer::NotFound => {}
         }
 
-        match next_hop {
-            IpAddress::Ipv4(addr) => {
-                net_debug!("address {} not in neighbor cache, sending ARP request", addr);
-                self.transmit_arp_request(iface, addr);
-            }
-            IpAddress::Ipv6(addr) => {
-                net_debug!("address {} not in neighbor cache, sending Neighbor Solicitation", addr);
-                self.transmit_ndisc_solicit(iface, addr);
-            }
-        }
-
-        // The request got dispatched, limit the rate on the cache.
-        iface.neighbor_cache.limit_rate(self.now);
+        // Start resolving: create the INCOMPLETE entry and send the first solicitation.
+        net_debug!("address {} not in neighbor cache, sending solicitation", next_hop);
+        self.neighbor_cache.start_resolution((iface.handle, next_hop), self.now);
+        self.solicit_neighbor(iface, next_hop);
 
         NeighborLookup::Pending { next_hop }
     }
@@ -674,7 +721,7 @@ impl StackInner {
                 NeighborLookup::Found(hardware_addr) => self.transmit_ethernet(iface, hardware_addr, buf, ethertype),
                 NeighborLookup::Pending { next_hop } => {
                     net_debug!("neighbor {} pending, queing packet", next_hop);
-                    iface.pending.push(next_hop, buf, self.now);
+                    self.pending.push((iface.handle, next_hop), buf, self.now);
                 }
                 NeighborLookup::NoRoute => {
                     net_debug!("no route to {}, dropping packet", dst_addr);

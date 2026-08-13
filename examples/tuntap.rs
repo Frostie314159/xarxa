@@ -52,7 +52,15 @@ fn main() {
     stack.add_iface(Box::new(device));
 
     loop {
-        stack.poll(Instant::now());
-        wait(fd, None).unwrap();
+        let deadline = stack.poll(Instant::now());
+        let timeout = deadline.map(|deadline| {
+            let now = Instant::now();
+            if deadline <= now {
+                std::time::Duration::ZERO
+            } else {
+                (deadline - now).into()
+            }
+        });
+        wait(fd, timeout).unwrap();
     }
 }
