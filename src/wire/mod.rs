@@ -39,6 +39,7 @@ pub(crate) mod ipv4;
 pub(crate) mod ipv6;
 mod ndisc;
 mod ndiscoption;
+mod tcp;
 mod udp;
 
 use core::fmt;
@@ -85,6 +86,10 @@ pub use self::icmpv6::{
 pub use self::ndisc::{NeighborFlags as NdiscNeighborFlags, RouterFlags as NdiscRouterFlags};
 
 pub use self::ndiscoption::{NdiscOption, PrefixInfoFlags as NdiscPrefixInfoFlags, Type as NdiscOptionType};
+
+pub use self::tcp::{
+    Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, Packet as TcpPacket, SeqNumber as TcpSeqNumber, TcpOption,
+};
 
 pub use self::udp::{HEADER_LEN as UDP_HEADER_LEN, Packet as UdpPacket};
 
