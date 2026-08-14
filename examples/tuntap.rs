@@ -25,7 +25,7 @@ use std::os::unix::io::AsRawFd;
 use xarxa::iface::{Medium, TunTapInterface, wait};
 use xarxa::stack::{Config, Stack};
 use xarxa::time::Instant;
-use xarxa::wire::{EthernetAddress, IpAddress, IpCidr};
+use xarxa::wire::{EthernetAddress, IpAddress, IpCidr, Ipv4Address};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
@@ -42,17 +42,23 @@ fn main() {
     let device = TunTapInterface::new(name, medium).unwrap();
     let fd = device.as_raw_fd();
 
-    let config = Config {
-        hardware_addr: EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
-        ip_addrs: vec![
-            IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24),
-            IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
-            IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
-        ],
-    };
+    let mut stack = Stack::new();
+    let iface = stack.add_iface(
+        Box::new(device),
+        Config {
+            hardware_addr: EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
+            ip_addrs: vec![
+                IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24),
+                IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
+                IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
+            ],
+        },
+    );
 
-    let mut stack = Stack::new(config);
-    stack.add_iface(Box::new(device));
+    // Off-link traffic routes to the host's address on this interface.
+    stack
+        .routes_mut()
+        .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100), iface);
 
     let udp_handle = stack.add_udp_socket();
     stack.udp(udp_handle).bind(6969).unwrap();

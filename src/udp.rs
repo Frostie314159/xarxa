@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 
 use crate::buf::PacketBuf;
 use crate::slab::Slab;
-use crate::stack::{StackInner, TxContext};
+use crate::stack::{Iface, StackInner, TxContext};
 use crate::wire::{
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
     IpVersion, Ipv4Packet, Ipv6Packet, UDP_HEADER_LEN, UdpPacket,
@@ -420,6 +420,7 @@ impl StackInner {
     /// `recv` can parse the addresses back out of it.
     pub(crate) fn process_udp(
         &mut self,
+        iface: &Iface,
         sockets: &mut Slab<UdpSocketState>,
         src_addr: IpAddress,
         dst_addr: IpAddress,
@@ -450,7 +451,7 @@ impl StackInner {
 
         // Sockets bound to a specific address also accept broadcast/multicast traffic
         // on their port.
-        let dst_is_bcast = self.is_broadcast(&dst_addr) || dst_addr.is_multicast();
+        let dst_is_bcast = iface.is_broadcast(&dst_addr) || dst_addr.is_multicast();
 
         for (_, socket) in sockets.iter_mut() {
             if socket.endpoint.port != dst_port {
@@ -482,14 +483,11 @@ impl StackInner {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::stack::{Config, Stack};
-    use crate::wire::{EthernetAddress, Ipv4Address};
+    use crate::stack::Stack;
+    use crate::wire::Ipv4Address;
 
     fn stack_with_socket() -> (Stack, UdpHandle) {
-        let mut stack = Stack::new(Config {
-            hardware_addr: EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]),
-            ip_addrs: vec![],
-        });
+        let mut stack = Stack::new();
         let handle = stack.add_udp_socket();
         (stack, handle)
     }

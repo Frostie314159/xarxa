@@ -3,6 +3,7 @@
 use crate::buf::PacketBuf;
 use crate::iface::{Interface, Medium};
 use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, PendingQueue, ProbeEvent};
+use crate::route::Routes;
 use crate::slab::Slab;
 use crate::time::Instant;
 use crate::udp::{UdpHandle, UdpSocket, UdpSocketState};
@@ -20,14 +21,14 @@ macro_rules! check {
     };
 }
 
-/// Configuration for a [`Stack`].
+/// Configuration for an interface added to a [`Stack`].
 pub struct Config {
-    /// Hardware (MAC) address of the stack.
+    /// Hardware (MAC) address of the interface.
     ///
     /// Used on [`Medium::Ethernet`] interfaces, ignored on [`Medium::Ip`] interfaces.
     pub hardware_addr: EthernetAddress,
 
-    /// IP addresses of the stack.
+    /// IP addresses of the interface.
     pub ip_addrs: Vec<IpCidr>,
 }
 
@@ -42,10 +43,12 @@ pub struct Stack {
     pub(crate) udp_sockets: Slab<UdpSocketState>,
 }
 
-/// An interface added to the stack.
+/// An interface added to the stack, with its configuration.
 pub(crate) struct Iface {
     handle: IfaceHandle,
     dev: Box<dyn Interface>,
+    hardware_addr: EthernetAddress,
+    ip_addrs: Vec<IpCidr>,
 }
 
 /// The device-independent part of the stack.
@@ -53,11 +56,10 @@ pub(crate) struct Iface {
 /// Separate from `Stack` so that its methods can borrow an interface from `Stack::ifaces`
 /// while taking `&mut self`.
 pub(crate) struct StackInner {
-    hardware_addr: EthernetAddress,
-    ip_addrs: Vec<IpCidr>,
     now: Instant,
     neighbor_cache: NeighborCache,
     pending: PendingQueue,
+    routes: Routes,
 }
 
 /// Borrowed stack context for socket egress.
@@ -71,9 +73,33 @@ pub(crate) struct TxContext<'a> {
 }
 
 impl TxContext<'_> {
-    /// Get a source address for the given destination address.
+    /// Get a source address for sending to the given destination, selected from the
+    /// interface the packet would go out of.
     pub(crate) fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
-        self.inner.get_source_address(dst_addr)
+        let handle = self.egress_iface(dst_addr)?;
+        self.ifaces.get(handle.0).get_source_address(dst_addr)
+    }
+
+    /// Pick the egress interface for a destination: the interface the destination is
+    /// on-link for, else the interface named by the matching route.
+    fn egress_iface(&self, dst_addr: &IpAddress) -> Option<IfaceHandle> {
+        if !dst_addr.is_unicast() {
+            // Broadcast and multicast destinations carry nothing to route on, so
+            // they go out the first interface.
+            // TODO: let the send API pick the interface.
+            return self.ifaces.iter().next().map(|(_, iface)| iface.handle);
+        }
+
+        self.ifaces
+            .iter()
+            .find(|(_, iface)| iface.in_same_network(dst_addr))
+            .map(|(_, iface)| iface.handle)
+            .or_else(|| {
+                self.inner
+                    .routes
+                    .lookup(dst_addr, self.inner.now)
+                    .map(|route| route.iface)
+            })
     }
 
     /// Transmit a fully-built IP payload, with the L4 header but not the IP header.
@@ -88,11 +114,11 @@ impl TxContext<'_> {
         next_header: IpProtocol,
         hop_limit: u8,
     ) {
-        // TODO: route to the right interface. For now, packets go out the first one.
-        let Some((_, iface)) = self.ifaces.iter_mut().next() else {
-            net_debug!("cannot transmit, stack has no interfaces");
+        let Some(handle) = self.egress_iface(&dst_addr) else {
+            net_debug!("no route to {}, dropping packet", dst_addr);
             return;
         };
+        let iface = self.ifaces.get_mut(handle.0);
         match (src_addr, dst_addr) {
             (IpAddress::Ipv4(src), IpAddress::Ipv4(dst)) => {
                 self.inner.transmit_ipv4(iface, buf, src, dst, next_header, hop_limit)
@@ -118,26 +144,28 @@ enum NeighborLookup {
 }
 
 impl Stack {
-    /// Create a network stack with the given configuration and no ifaces.
-    pub fn new(config: Config) -> Self {
+    /// Create a network stack.
+    pub fn new() -> Self {
         Self {
             inner: StackInner {
-                hardware_addr: config.hardware_addr,
-                ip_addrs: config.ip_addrs,
                 now: Instant::ZERO,
                 neighbor_cache: NeighborCache::new(),
                 pending: PendingQueue::new(),
+                routes: Routes::new(),
             },
             ifaces: Slab::new(),
             udp_sockets: Slab::new(),
         }
     }
 
-    /// Add an interface to the stack, returning a handle to it.
-    pub fn add_iface(&mut self, dev: Box<dyn Interface>) -> IfaceHandle {
+    /// Add an interface to the stack with the given configuration, returning a
+    /// handle to it.
+    pub fn add_iface(&mut self, dev: Box<dyn Interface>, config: Config) -> IfaceHandle {
         let index = self.ifaces.add_with(|index| Iface {
             handle: IfaceHandle(index),
             dev,
+            hardware_addr: config.hardware_addr,
+            ip_addrs: config.ip_addrs,
         });
         IfaceHandle(index)
     }
@@ -150,7 +178,18 @@ impl Stack {
         let iface = self.ifaces.remove(handle.0);
         self.inner.neighbor_cache.purge_iface(handle);
         self.inner.pending.purge_iface(handle);
+        self.inner.routes.purge_iface(handle);
         iface.dev
+    }
+
+    /// Access the routing table.
+    pub fn routes(&self) -> &Routes {
+        &self.inner.routes
+    }
+
+    /// Access the routing table for modification.
+    pub fn routes_mut(&mut self) -> &mut Routes {
+        &mut self.inner.routes
     }
 
     /// Add a UDP socket to the stack, returning a handle to it.
@@ -208,6 +247,12 @@ impl Stack {
     }
 }
 
+impl Default for Stack {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StackInner {
     fn process(&mut self, iface: &mut Iface, udp_sockets: &mut Slab<UdpSocketState>, buf: PacketBuf) {
         match iface.dev.capabilities().medium {
@@ -222,7 +267,7 @@ impl StackInner {
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
         if !eth_frame.dst_addr().is_broadcast()
             && !eth_frame.dst_addr().is_multicast()
-            && eth_frame.dst_addr() != self.hardware_addr
+            && eth_frame.dst_addr() != iface.hardware_addr
         {
             return;
         }
@@ -268,7 +313,7 @@ impl StackInner {
         let target_protocol_addr = Ipv4Address::from(<[u8; 4]>::try_from(arp_packet.target_protocol_addr()).unwrap());
 
         // Only process ARP packets for us.
-        if !self.has_ip_addr(target_protocol_addr) {
+        if !iface.has_ip_addr(target_protocol_addr) {
             return;
         }
 
@@ -284,7 +329,7 @@ impl StackInner {
             return;
         }
 
-        if !self.in_same_network(&IpAddress::Ipv4(source_protocol_addr)) {
+        if !iface.in_same_network(&IpAddress::Ipv4(source_protocol_addr)) {
             net_debug!("arp: source IP address not in same network as us");
             return;
         }
@@ -306,7 +351,7 @@ impl StackInner {
                 arp_reply.set_hardware_len(6);
                 arp_reply.set_protocol_len(4);
                 arp_reply.set_operation(ArpOperation::Reply);
-                arp_reply.set_source_hardware_addr(self.hardware_addr.as_bytes());
+                arp_reply.set_source_hardware_addr(iface.hardware_addr.as_bytes());
                 arp_reply.set_source_protocol_addr(&target_protocol_addr.octets());
                 arp_reply.set_target_hardware_addr(source_hardware_addr.as_bytes());
                 arp_reply.set_target_protocol_addr(&source_protocol_addr.octets());
@@ -342,20 +387,20 @@ impl StackInner {
         let header_len = ipv4_packet.header_len() as usize;
         let total_len = ipv4_packet.total_len() as usize;
 
-        if !self.is_unicast_v4(src_addr) && !src_addr.is_unspecified() {
+        if !iface.is_unicast_v4(src_addr) && !src_addr.is_unspecified() {
             // Discard packets with non-unicast source addresses but allow unspecified
             net_debug!("non-unicast or unspecified source address");
             return;
         }
 
-        if !self.has_ip_addr(dst_addr) && !self.is_broadcast_v4(dst_addr) {
+        if !iface.has_ip_addr(dst_addr) && !iface.is_broadcast_v4(dst_addr) {
             // Ignore IP packets not directed at us, or broadcast.
             net_trace!("Rejecting IPv4 packet; not for us");
             return;
         }
 
         if let Some(eth_src) = eth_src
-            && self.is_unicast_v4(dst_addr)
+            && iface.is_unicast_v4(dst_addr)
         {
             self.neighbor_cache
                 .reset_expiry_if_existing((iface.handle, IpAddress::Ipv4(src_addr)), eth_src, self.now);
@@ -368,6 +413,7 @@ impl StackInner {
         match next_header {
             IpProtocol::Icmp => self.process_icmpv4(iface, src_addr, dst_addr, buf),
             IpProtocol::Udp => self.process_udp(
+                iface,
                 udp_sockets,
                 IpAddress::Ipv4(src_addr),
                 IpAddress::Ipv4(dst_addr),
@@ -391,15 +437,15 @@ impl StackInner {
             // Respond to echo requests.
             (Icmpv4Message::EchoRequest, 0) => {
                 // Do not send ICMP replies to non-unicast sources.
-                if !self.is_unicast_v4(src_addr) {
+                if !iface.is_unicast_v4(src_addr) {
                     return;
                 }
                 // Reply as normal when src_addr and dst_addr are both unicast; only
                 // reply to broadcasts for echo replies and not other ICMP messages.
-                let reply_src = if self.is_unicast_v4(dst_addr) {
+                let reply_src = if iface.is_unicast_v4(dst_addr) {
                     dst_addr
-                } else if self.is_broadcast_v4(dst_addr) {
-                    match self.ipv4_addr() {
+                } else if iface.is_broadcast_v4(dst_addr) {
+                    match iface.ipv4_addr() {
                         Some(addr) => addr,
                         None => return,
                     }
@@ -454,7 +500,7 @@ impl StackInner {
             return;
         }
 
-        if !self.has_ip_addr(dst_addr) && !self.has_multicast_group(dst_addr) && !dst_addr.is_loopback() {
+        if !iface.has_ip_addr(dst_addr) && !iface.has_multicast_group(dst_addr) && !dst_addr.is_loopback() {
             net_trace!("Rejecting IPv6 packet; not for us");
             return;
         }
@@ -473,6 +519,7 @@ impl StackInner {
         match next_header {
             IpProtocol::Icmpv6 => self.process_icmpv6(iface, eth_src, src_addr, dst_addr, hop_limit, buf),
             IpProtocol::Udp => self.process_udp(
+                iface,
                 udp_sockets,
                 IpAddress::Ipv6(src_addr),
                 IpAddress::Ipv6(dst_addr),
@@ -506,7 +553,7 @@ impl StackInner {
                 let reply_src = if dst_addr.x_is_unicast() {
                     dst_addr
                 } else {
-                    self.get_source_address_ipv6(&src_addr)
+                    iface.get_source_address_ipv6(&src_addr)
                 };
 
                 let mut reply = PacketBuf::new();
@@ -563,7 +610,7 @@ impl StackInner {
             self.fill_neighbor(iface, IpAddress::Ipv6(src_addr), lladdr);
         }
 
-        if self.has_solicited_node(dst_addr) && self.has_ip_addr(target_addr) {
+        if iface.has_solicited_node(dst_addr) && iface.has_ip_addr(target_addr) {
             // Neighbor advert: NA header (24 bytes) plus the target link-layer
             // address option (8 bytes).
             let mut reply = PacketBuf::new();
@@ -580,7 +627,7 @@ impl StackInner {
                     let mut opt = NdiscOption::new_unchecked(na.payload_mut());
                     opt.set_option_type(NdiscOptionType::TargetLinkLayerAddr);
                     opt.set_data_len(1);
-                    opt.set_link_layer_addr(RawHardwareAddress::from(self.hardware_addr));
+                    opt.set_link_layer_addr(RawHardwareAddress::from(iface.hardware_addr));
                 }
                 na.fill_checksum(&target_addr, &src_addr);
             }
@@ -659,7 +706,7 @@ impl StackInner {
     /// Look up the destination hardware address for an egress packet, sending a
     /// solicitation (ARP request / NDISC neighbor solicit) if it is not resolved yet.
     fn lookup_hardware_addr(&mut self, iface: &mut Iface, dst_addr: &IpAddress) -> NeighborLookup {
-        if self.is_broadcast(dst_addr) {
+        if iface.is_broadcast(dst_addr) {
             return NeighborLookup::Found(EthernetAddress::BROADCAST);
         }
 
@@ -678,7 +725,7 @@ impl StackInner {
             return NeighborLookup::Found(hardware_addr);
         }
 
-        let Some(next_hop) = self.route(dst_addr) else {
+        let Some(next_hop) = self.route(iface, dst_addr) else {
             return NeighborLookup::NoRoute;
         };
 
@@ -699,7 +746,7 @@ impl StackInner {
     }
 
     fn transmit_arp_request(&mut self, iface: &mut Iface, target_addr: Ipv4Address) {
-        let Some(source_protocol_addr) = self.get_source_address_ipv4(&target_addr) else {
+        let Some(source_protocol_addr) = iface.get_source_address_ipv4(&target_addr) else {
             net_debug!("arp: no source address for request");
             return;
         };
@@ -714,7 +761,7 @@ impl StackInner {
             arp_packet.set_hardware_len(6);
             arp_packet.set_protocol_len(4);
             arp_packet.set_operation(ArpOperation::Request);
-            arp_packet.set_source_hardware_addr(self.hardware_addr.as_bytes());
+            arp_packet.set_source_hardware_addr(iface.hardware_addr.as_bytes());
             arp_packet.set_source_protocol_addr(&source_protocol_addr.octets());
             arp_packet.set_target_hardware_addr(EthernetAddress::BROADCAST.as_bytes());
             arp_packet.set_target_protocol_addr(&target_addr.octets());
@@ -723,7 +770,7 @@ impl StackInner {
     }
 
     fn transmit_ndisc_solicit(&mut self, iface: &mut Iface, target_addr: Ipv6Address) {
-        let src_addr = self.get_source_address_ipv6(&target_addr);
+        let src_addr = iface.get_source_address_ipv6(&target_addr);
         let dst_addr = target_addr.solicited_node();
 
         // Neighbor solicit: NS header (24 bytes) plus the source link-layer
@@ -741,7 +788,7 @@ impl StackInner {
                 let mut opt = NdiscOption::new_unchecked(ns.payload_mut());
                 opt.set_option_type(NdiscOptionType::SourceLinkLayerAddr);
                 opt.set_data_len(1);
-                opt.set_link_layer_addr(RawHardwareAddress::from(self.hardware_addr));
+                opt.set_link_layer_addr(RawHardwareAddress::from(iface.hardware_addr));
             }
             ns.fill_checksum(&src_addr, &dst_addr);
         }
@@ -844,7 +891,7 @@ impl StackInner {
         buf.push_front(ETHERNET_HEADER_LEN);
         let mut frame = EthernetFrame::new_unchecked(&mut buf);
         frame.set_dst_addr(dst_hw);
-        frame.set_src_addr(self.hardware_addr);
+        frame.set_src_addr(iface.hardware_addr);
         frame.set_ethertype(ethertype);
         self.transmit_raw(iface, buf);
     }
@@ -855,6 +902,23 @@ impl StackInner {
         }
     }
 
+    /// Route an address to the next hop on the given interface.
+    ///
+    /// On-link destinations resolve to themselves. Off-link destinations resolve to a
+    /// router from the routing table, but only if the route goes out this interface.
+    fn route(&self, iface: &Iface, addr: &IpAddress) -> Option<IpAddress> {
+        if iface.in_same_network(addr) {
+            Some(*addr)
+        } else {
+            self.routes
+                .lookup(addr, self.now)
+                .filter(|route| route.iface == iface.handle)
+                .map(|route| route.via_router)
+        }
+    }
+}
+
+impl Iface {
     fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
         let addr = addr.into();
         self.ip_addrs.iter().any(|probe| probe.address() == addr)
@@ -862,13 +926,6 @@ impl StackInner {
 
     fn in_same_network(&self, addr: &IpAddress) -> bool {
         self.ip_addrs.iter().any(|cidr| cidr.contains_addr(addr))
-    }
-
-    /// Route an address to the next hop: on-link destinations resolve to themselves.
-    ///
-    /// TODO: routing table / default gateway support.
-    fn route(&self, addr: &IpAddress) -> Option<IpAddress> {
-        if self.in_same_network(addr) { Some(*addr) } else { None }
     }
 
     /// Get the first IPv4 address of the interface.
