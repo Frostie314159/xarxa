@@ -60,7 +60,54 @@ pub(crate) struct StackInner {
     pending: PendingQueue,
 }
 
-/// The result of a neighbor lookupi.
+/// Borrowed stack context for socket egress.
+///
+/// Sockets hand fully-built L4 packets to [`TxContext::transmit_ip`]. Picking the
+/// egress interface, building the IP header and resolving the neighbor all happen
+/// in here, so socket code doesn't have to care about any of it.
+pub(crate) struct TxContext<'a> {
+    pub(crate) inner: &'a mut StackInner,
+    pub(crate) ifaces: &'a mut Slab<Iface>,
+}
+
+impl TxContext<'_> {
+    /// Get a source address for the given destination address.
+    pub(crate) fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
+        self.inner.get_source_address(dst_addr)
+    }
+
+    /// Transmit a fully-built IP payload, with the L4 header but not the IP header.
+    ///
+    /// `src_addr` and `dst_addr` must belong to the same address family, the packet
+    /// is dropped otherwise.
+    pub(crate) fn transmit_ip(
+        &mut self,
+        buf: PacketBuf,
+        src_addr: IpAddress,
+        dst_addr: IpAddress,
+        next_header: IpProtocol,
+        hop_limit: u8,
+    ) {
+        // TODO: route to the right interface. For now, packets go out the first one.
+        let Some((_, iface)) = self.ifaces.iter_mut().next() else {
+            net_debug!("cannot transmit, stack has no interfaces");
+            return;
+        };
+        match (src_addr, dst_addr) {
+            (IpAddress::Ipv4(src), IpAddress::Ipv4(dst)) => {
+                self.inner.transmit_ipv4(iface, buf, src, dst, next_header, hop_limit)
+            }
+            (IpAddress::Ipv6(src), IpAddress::Ipv6(dst)) => {
+                self.inner.transmit_ipv6(iface, buf, src, dst, next_header, hop_limit)
+            }
+            _ => {
+                net_debug!("cannot transmit, address family mismatch");
+            }
+        }
+    }
+}
+
+/// The result of a neighbor lookup.
 enum NeighborLookup {
     /// The destination hardware address.
     Found(EthernetAddress),
@@ -126,8 +173,10 @@ impl Stack {
     pub fn udp(&mut self, handle: UdpHandle) -> UdpSocket<'_> {
         UdpSocket {
             state: self.udp_sockets.get_mut(handle.0),
-            inner: &mut self.inner,
-            ifaces: &mut self.ifaces,
+            tx: TxContext {
+                inner: &mut self.inner,
+                ifaces: &mut self.ifaces,
+            },
         }
     }
 
@@ -701,7 +750,7 @@ impl StackInner {
         self.transmit_ipv6(iface, buf, src_addr, dst_addr, IpProtocol::Icmpv6, 0xff);
     }
 
-    pub(crate) fn transmit_ipv4(
+    fn transmit_ipv4(
         &mut self,
         iface: &mut Iface,
         mut buf: PacketBuf,
@@ -733,7 +782,7 @@ impl StackInner {
         self.transmit_ip_frame(iface, IpAddress::Ipv4(dst_addr), buf, EthernetProtocol::Ipv4);
     }
 
-    pub(crate) fn transmit_ipv6(
+    fn transmit_ipv6(
         &mut self,
         iface: &mut Iface,
         mut buf: PacketBuf,
@@ -854,7 +903,7 @@ impl StackInner {
     }
 
     /// Get a source address for the given destination address.
-    pub(crate) fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
+    fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
         match dst_addr {
             IpAddress::Ipv4(addr) => self.get_source_address_ipv4(addr).map(IpAddress::Ipv4),
             IpAddress::Ipv6(addr) => Some(IpAddress::Ipv6(self.get_source_address_ipv6(addr))),

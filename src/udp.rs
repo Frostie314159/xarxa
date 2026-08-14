@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 
 use crate::buf::PacketBuf;
 use crate::slab::Slab;
-use crate::stack::{Iface, StackInner};
+use crate::stack::{StackInner, TxContext};
 use crate::wire::{
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
     IpVersion, Ipv4Packet, Ipv6Packet, UDP_HEADER_LEN, UdpPacket,
@@ -201,8 +201,7 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
 /// [`Stack::udp`]: crate::Stack::udp
 pub struct UdpSocket<'a> {
     pub(crate) state: &'a mut UdpSocketState,
-    pub(crate) inner: &'a mut StackInner,
-    pub(crate) ifaces: &'a mut Slab<Iface>,
+    pub(crate) tx: TxContext<'a>,
 }
 
 impl UdpSocket<'_> {
@@ -368,7 +367,7 @@ impl UdpSocket<'_> {
         let src_addr = match meta.local_address.or(endpoint.addr) {
             Some(addr) => addr,
             None => self
-                .inner
+                .tx
                 .get_source_address(&meta.endpoint.addr)
                 .ok_or(SendError::Unaddressable)?,
         };
@@ -406,24 +405,8 @@ impl UdpSocket<'_> {
 
         net_trace!("udp:{}:{}: sending {} octets", endpoint, meta.endpoint, size);
 
-        // Hand it down the IP layer, out the first interface.
-        // TODO: route to the right interface.
-        let Some((_, iface)) = self.ifaces.iter_mut().next() else {
-            net_debug!("udp: no interface, dropping packet");
-            return Ok(());
-        };
-        match (src_addr, meta.endpoint.addr) {
-            (IpAddress::Ipv4(src), IpAddress::Ipv4(dst)) => {
-                self.inner
-                    .transmit_ipv4(iface, buf, src, dst, IpProtocol::Udp, hop_limit)
-            }
-            (IpAddress::Ipv6(src), IpAddress::Ipv6(dst)) => {
-                self.inner
-                    .transmit_ipv6(iface, buf, src, dst, IpProtocol::Udp, hop_limit)
-            }
-            // Family mismatch is rejected above.
-            _ => unreachable!(),
-        }
+        self.tx
+            .transmit_ip(buf, src_addr, meta.endpoint.addr, IpProtocol::Udp, hop_limit);
         Ok(())
     }
 }
