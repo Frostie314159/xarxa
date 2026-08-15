@@ -24,8 +24,8 @@ mod repr;
 mod ring_buffer;
 
 use self::assembler::Assembler;
-pub(crate) use self::listener::TcpListenerState;
 pub use self::listener::{TcpListener, TcpListenerHandle};
+pub(crate) use self::listener::{TcpListenerState, process_listeners};
 pub(crate) use self::repr::TcpRepr;
 pub use self::repr::{TcpTimestampGenerator, TcpTimestampRepr};
 use self::ring_buffer::RingBuffer;
@@ -3031,13 +3031,17 @@ mod test {
     /// Offer a segment from `REMOTE_END` to `LOCAL_END` to the stack's
     /// listeners the way `process_tcp` does, returning whether it was consumed.
     fn listener_deliver(stack: &mut Stack, repr: &TcpRepr) -> bool {
-        let src_addr = IpAddress::from(REMOTE_ADDR);
-        let dst_addr = IpAddress::from(LOCAL_ADDR);
-        stack
-            .sockets
-            .tcp_listeners
-            .iter_mut()
-            .any(|(_, listener)| listener.process(&src_addr, &dst_addr, repr))
+        listener_deliver_to(stack, LOCAL_ADDR, repr)
+    }
+
+    /// Like [`listener_deliver`], with an explicit destination address.
+    fn listener_deliver_to(stack: &mut Stack, dst_addr: Ipv4Address, repr: &TcpRepr) -> bool {
+        process_listeners(
+            &mut stack.sockets.tcp_listeners,
+            &IpAddress::from(REMOTE_ADDR),
+            &IpAddress::from(dst_addr),
+            repr,
+        )
     }
 
     fn syn_repr() -> TcpRepr<'static> {
@@ -3192,6 +3196,26 @@ mod test {
         stack.tcp_listener(h).listen((LOCAL_ADDR, LOCAL_PORT)).unwrap();
         assert!(listener_deliver(&mut stack, &syn_repr()));
         assert!(stack.tcp_listener(h).can_accept());
+    }
+
+    #[test]
+    fn test_listener_priority() {
+        // Among listeners on the same port, an exact local-address match beats
+        // a wildcard one, regardless of creation order.
+        let mut stack = test_stack();
+        let h_any = stack.add_tcp_listener();
+        let h_addr = stack.add_tcp_listener();
+        stack.tcp_listener(h_any).listen(LOCAL_PORT).unwrap();
+        stack.tcp_listener(h_addr).listen((LOCAL_ADDR, LOCAL_PORT)).unwrap();
+
+        // A SYN to the listened address goes to the specific listener...
+        assert!(listener_deliver(&mut stack, &syn_repr()));
+        assert!(stack.tcp_listener(h_addr).can_accept());
+        assert!(!stack.tcp_listener(h_any).can_accept());
+
+        // ...a SYN to any other address to the wildcard one.
+        assert!(listener_deliver_to(&mut stack, OTHER_ADDR, &syn_repr()));
+        assert!(stack.tcp_listener(h_any).can_accept());
     }
 
     #[test]
@@ -9567,6 +9591,52 @@ mod stack_test {
         }));
         stack.poll(Instant::from_millis(1));
         assert!(queues.borrow().tx.is_empty());
+    }
+
+    #[test]
+    fn test_stack_established_socket_beats_listener() {
+        // Set up an established connection through the listener.
+        let (mut stack, queues) = stack();
+        let lh = stack.add_tcp_listener();
+        stack.tcp_listener(lh).listen(LOCAL_PORT).unwrap();
+        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ..SEND_TEMPL
+        }));
+        stack.poll(Instant::from_millis(0));
+        let h = stack.tcp_listener(lh).accept(64, 64).unwrap();
+        stack.poll(Instant::from_millis(0));
+        queues.borrow_mut().tx.pop_front().unwrap(); // the SYN|ACK
+        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            ..SEND_TEMPL
+        }));
+        stack.poll(Instant::from_millis(1));
+        assert_eq!(stack.tcp(h).state(), State::Established);
+
+        // A SYN matching the established connection's exact 4-tuple goes to
+        // the connected socket (which discards it: it carries no ACK) and
+        // never reaches the listener, so no new connection attempt is queued.
+        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ + 100,
+            ..SEND_TEMPL
+        }));
+        stack.poll(Instant::from_millis(2));
+        assert!(!stack.tcp_listener(lh).can_accept());
+        assert!(queues.borrow().tx.is_empty());
+
+        // A SYN from a different source port reaches the listener.
+        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            src_port: REMOTE_PORT + 1,
+            ..SEND_TEMPL
+        }));
+        stack.poll(Instant::from_millis(3));
+        assert!(stack.tcp_listener(lh).can_accept());
     }
 
     #[test]

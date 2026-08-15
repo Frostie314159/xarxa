@@ -191,14 +191,15 @@ impl TxContext<'_> {
     }
 }
 
-/// Query whether `addr` falls within a bind's address filter. No address matches
-/// anything, an unspecified one matches its own IP version, and a concrete one
-/// matches only itself.
-pub(crate) fn addr_matches(filter: &IpListenEndpoint, addr: &IpAddress) -> bool {
+/// Score `addr` against a bind's address filter, the way ingress demux ranks
+/// candidate sockets: `None` if it does not match, else how specific the filter
+/// that matched it is. No address matches anything (0), an unspecified one
+/// matches its own IP version (1), and a concrete one matches only itself (2).
+pub(crate) fn addr_score(filter: &IpListenEndpoint, addr: &IpAddress) -> Option<u8> {
     match filter.addr {
-        None => true,
-        Some(a) if a.is_unspecified() => a.version() == addr.version(),
-        Some(a) => a == *addr,
+        None => Some(0),
+        Some(a) if a.is_unspecified() => (a.version() == addr.version()).then_some(1),
+        Some(a) => (a == *addr).then_some(2),
     }
 }
 
@@ -727,12 +728,12 @@ impl StackInner {
         }
 
         // Listeners: a SYN to a listened endpoint is recorded in the accept
-        // queue, and an RST aimed at a recorded SYN cancels it. Nothing is
-        // replied, the handshake starts when the connection is accepted.
-        for (_, listener) in listeners.iter_mut() {
-            if listener.process(&src_addr, &dst_addr, &tcp_repr) {
-                return;
-            }
+        // queue of the most specific matching listener (exact local address
+        // beats wildcard), and an RST aimed at a recorded SYN cancels it.
+        // Nothing is replied, the handshake starts when the connection is
+        // accepted.
+        if crate::tcp::process_listeners(listeners, &src_addr, &dst_addr, &tcp_repr) {
+            return;
         }
 
         // The packet wasn't handled by a socket: send a TCP RST packet.

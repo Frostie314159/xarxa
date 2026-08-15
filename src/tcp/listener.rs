@@ -8,7 +8,7 @@ use super::{
 };
 use crate::rand::Rand;
 use crate::slab::Slab;
-use crate::stack::addr_matches;
+use crate::stack::addr_score;
 use crate::tcp::TcpSeqNumber;
 use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
@@ -56,76 +56,116 @@ impl TcpListenerState {
         }
     }
 
-    /// Whether a segment to (`dst_addr`, `dst_port`) is aimed at this listener.
-    pub(crate) fn matches(&self, dst_addr: &IpAddress, dst_port: u16) -> bool {
-        self.local.port != 0 && dst_port == self.local.port && addr_matches(&self.local, dst_addr)
+    /// Score this listener against a segment to (`dst_addr`, `dst_port`).
+    ///
+    /// `None` if the listener does not match, else how specific the match is: an
+    /// exact local-address match outscores a per-version one, which outscores a
+    /// wildcard.
+    pub(crate) fn match_score(&self, dst_addr: &IpAddress, dst_port: u16) -> Option<u8> {
+        if self.local.port == 0 || dst_port != self.local.port {
+            return None;
+        }
+        addr_score(&self.local, dst_addr)
     }
 
-    /// Offer an ingress segment to this listener, returning whether it was
-    /// consumed.
+    /// Record a SYN aimed at this listener in the accept queue.
     ///
-    /// The listener consumes exactly two things, and never replies to either.
-    /// A SYN to the listened endpoint is recorded in the accept queue,
-    /// deduplicated by 4-tuple with the newest SYN winning, so retransmissions
-    /// (or a client aborting and reconnecting from the same port) update the
-    /// entry in place. An RST aimed at a recorded SYN removes it. Everything
-    /// else is left to the caller's RST fallback.
-    pub(crate) fn process(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress, repr: &TcpRepr) -> bool {
+    /// The queue is deduplicated by 4-tuple, with the newest SYN winning: a
+    /// retransmission (or a client aborting and reconnecting from the same
+    /// port) updates the entry in place instead of queueing a duplicate. On a
+    /// full queue the SYN is dropped silently, and the client retries. Nothing
+    /// is ever transmitted in response. The SYN|ACK is sent by the socket
+    /// [`accept`](TcpListener::accept) creates.
+    fn record_syn(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress, repr: &TcpRepr) {
+        debug_assert!(repr.control == TcpControl::Syn && repr.ack_number.is_none());
         let tuple = Tuple {
             local: IpEndpoint::new(*dst_addr, repr.dst_port),
             remote: IpEndpoint::new(*src_addr, repr.src_port),
         };
+        let syn = PendingSyn {
+            tuple,
+            remote_seq_no: repr.seq_number + 1,
+            // The window field of a SYN is never scaled.
+            remote_win_len: repr.window_len as usize,
+            remote_win_scale: repr.window_scale,
+            remote_has_sack: repr.sack_permitted,
+            remote_mss: match repr.max_seg_size {
+                // A zero MSS is treated as if the option were absent, a tiny
+                // one is clamped.
+                Some(mss) if mss != 0 => (mss as usize).max(MIN_REMOTE_MSS),
+                _ => DEFAULT_MSS,
+            },
+            timestamp: repr.timestamp,
+        };
 
-        match repr.control {
-            TcpControl::Syn if repr.ack_number.is_none() => {
-                if !self.matches(dst_addr, repr.dst_port) {
-                    return false;
-                }
-
-                let syn = PendingSyn {
-                    tuple,
-                    remote_seq_no: repr.seq_number + 1,
-                    // The window field of a SYN is never scaled.
-                    remote_win_len: repr.window_len as usize,
-                    remote_win_scale: repr.window_scale,
-                    remote_has_sack: repr.sack_permitted,
-                    remote_mss: match repr.max_seg_size {
-                        // A zero MSS is treated as if the option were absent,
-                        // a tiny one is clamped.
-                        Some(mss) if mss != 0 => (mss as usize).max(MIN_REMOTE_MSS),
-                        _ => DEFAULT_MSS,
-                    },
-                    timestamp: repr.timestamp,
-                };
-
-                if let Some(entry) = self.queue.iter_mut().find(|s| s.tuple == tuple) {
-                    // A retransmission of a queued SYN, or a new connection
-                    // attempt reusing the same ports. The newest SYN wins.
-                    *entry = syn;
-                } else {
-                    net_trace!("listener:{}: SYN from {}", self.local, tuple.remote);
-                    self.queue.push_back(syn);
-                }
-                true
-            }
-            TcpControl::Rst => {
-                // The client gave up before we accepted. The only acceptable
-                // sequence number for a connection with nothing received past
-                // the SYN is exactly RCV.NXT.
-                if let Some(index) = self
-                    .queue
-                    .iter()
-                    .position(|s| s.tuple == tuple && repr.seq_number == s.remote_seq_no)
-                {
-                    net_trace!("listener: queued SYN {} reset by remote", tuple);
-                    self.queue.remove(index);
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => false,
+        if let Some(entry) = self.queue.iter_mut().find(|s| s.tuple == tuple) {
+            *entry = syn;
+        } else {
+            net_trace!("listener:{}: SYN from {}", self.local, tuple.remote);
+            self.queue.push_back(syn);
         }
+    }
+
+    /// Remove the queued SYN an RST is aimed at, if any, returning whether one
+    /// was removed. The client gave up before we accepted. The only acceptable
+    /// sequence number for a connection with nothing received past the SYN is
+    /// exactly RCV.NXT.
+    fn process_rst(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress, repr: &TcpRepr) -> bool {
+        debug_assert!(repr.control == TcpControl::Rst);
+        let tuple = Tuple {
+            local: IpEndpoint::new(*dst_addr, repr.dst_port),
+            remote: IpEndpoint::new(*src_addr, repr.src_port),
+        };
+        if let Some(index) = self
+            .queue
+            .iter()
+            .position(|s| s.tuple == tuple && repr.seq_number == s.remote_seq_no)
+        {
+            net_trace!("listener: queued SYN {} reset by remote", tuple);
+            self.queue.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Offer an ingress segment to the stack's listeners, returning whether it was
+/// consumed.
+///
+/// The listeners consume exactly two things, and never reply to either. A SYN
+/// to a listened endpoint is recorded on the *most specific* matching listener,
+/// where an exact local-address match beats a wildcard one, so a per-address
+/// listener takes its address's connections away from an any-address one on the
+/// same port. An RST aimed at a recorded SYN removes it. Everything else is
+/// left to the caller's RST fallback.
+pub(crate) fn process_listeners(
+    listeners: &mut Slab<TcpListenerState>,
+    src_addr: &IpAddress,
+    dst_addr: &IpAddress,
+    repr: &TcpRepr,
+) -> bool {
+    match repr.control {
+        TcpControl::Syn if repr.ack_number.is_none() => {
+            let mut best: Option<(usize, u8)> = None;
+            for (index, listener) in listeners.iter() {
+                if let Some(score) = listener.match_score(dst_addr, repr.dst_port)
+                    && best.is_none_or(|(_, best_score)| score > best_score)
+                {
+                    best = Some((index, score));
+                }
+            }
+            if let Some((index, _)) = best {
+                listeners.get_mut(index).record_syn(src_addr, dst_addr, repr);
+                true
+            } else {
+                false
+            }
+        }
+        TcpControl::Rst => listeners
+            .iter_mut()
+            .any(|(_, listener)| listener.process_rst(src_addr, dst_addr, repr)),
+        _ => false,
     }
 }
 

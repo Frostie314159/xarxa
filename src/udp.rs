@@ -21,7 +21,7 @@ use std::collections::VecDeque;
 
 use crate::buf::PacketBuf;
 use crate::slab::Slab;
-use crate::stack::{Iface, StackInner, TxContext, addr_matches, alloc_ephemeral_port};
+use crate::stack::{Iface, StackInner, TxContext, addr_score, alloc_ephemeral_port};
 use crate::wire::{
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
     IpVersion, Ipv4Packet, Ipv6Packet, UDP_HEADER_LEN, UdpPacket,
@@ -161,6 +161,45 @@ impl UdpSocketState {
     /// included), truncated to the UDP length.
     pub(crate) fn rx_enqueue(&mut self, buf: PacketBuf) {
         self.rx_queue.push_back(buf);
+    }
+
+    /// Score this socket against an ingress datagram.
+    ///
+    /// `None` if the socket does not match (a specified tuple part differs),
+    /// else how specific the match is, so that the most specific socket wins the
+    /// datagram. Connected sockets outscore bound-only ones, and exact addresses
+    /// outscore wildcards (see [`addr_score`]).
+    ///
+    /// `dst_is_bcast` relaxes the local-address filter: sockets bound to a
+    /// specific address also accept broadcast/multicast traffic on their port.
+    /// It never relaxes the IP version.
+    fn match_score(
+        &self,
+        src_addr: &IpAddress,
+        src_port: u16,
+        dst_addr: &IpAddress,
+        dst_port: u16,
+        dst_is_bcast: bool,
+    ) -> Option<u8> {
+        // The local port is always concrete on a bound socket, and must match.
+        if self.local.port != dst_port {
+            return None;
+        }
+        let mut score = match addr_score(&self.local, dst_addr) {
+            Some(score) => score,
+            // Bound to one address, and this is broadcast/multicast traffic on
+            // its port: it gets it anyway, as long as the version is its own.
+            None if dst_is_bcast && self.local.version() == Some(dst_addr.version()) => 2,
+            None => return None,
+        };
+        score += addr_score(&self.remote, src_addr)?;
+        if self.remote.port != 0 {
+            if self.remote.port != src_port {
+                return None;
+            }
+            score += 1;
+        }
+        Some(score)
     }
 }
 
@@ -622,33 +661,22 @@ impl StackInner {
         // on their port.
         let dst_is_bcast = iface.is_broadcast(&dst_addr) || dst_addr.is_multicast();
 
-        for (_, socket) in sockets.iter_mut() {
-            if socket.local.port != dst_port {
-                continue;
+        // Linear scan, most specific match wins: every candidate whose
+        // specified tuple parts all match is scored by how specific those parts
+        // are. Connected sockets beat bound-only ones, exact addresses beat
+        // per-version wildcards beat wildcards. Ties (only possible between
+        // sockets specific in *different* parts) go to the earliest socket.
+        let mut best: Option<(usize, u8)> = None;
+        for (index, socket) in sockets.iter() {
+            if let Some(score) = socket.match_score(&src_addr, src_port, &dst_addr, dst_port, dst_is_bcast)
+                && best.is_none_or(|(_, best_score)| score > best_score)
+            {
+                best = Some((index, score));
             }
-            // The broadcast relaxation applies to the address, never to the IP
-            // version: a socket bound to any IPv4 address is not an IPv6 socket.
-            match socket.local.addr {
-                None => {}
-                Some(addr) if addr.is_unspecified() => {
-                    if addr.version() != dst_addr.version() {
-                        continue;
-                    }
-                }
-                Some(addr) => {
-                    if addr != dst_addr && !dst_is_bcast {
-                        continue;
-                    }
-                }
-            }
-            // Specified parts of the remote half filter the sender.
-            if !addr_matches(&socket.remote, &src_addr) {
-                continue;
-            }
-            if socket.remote.port != 0 && socket.remote.port != src_port {
-                continue;
-            }
+        }
 
+        if let Some((index, _)) = best {
+            let socket = sockets.get_mut(index);
             net_trace!(
                 "udp:{}: receiving {} octets from {}:{}",
                 socket.local,
@@ -722,7 +750,7 @@ mod test {
     }
 
     /// Build a queued-datagram buffer the way ingress does, as a full IPv4 + UDP packet.
-    fn queued_packet_from(src_addr: Ipv4Address, src_port: u16, payload: &[u8]) -> PacketBuf {
+    fn queued_packet_from(src_addr: Ipv4Address, src_port: u16, dst_addr: Ipv4Address, payload: &[u8]) -> PacketBuf {
         let udp_len = UDP_HEADER_LEN + payload.len();
         let mut buf = PacketBuf::new();
         buf.set_len(IPV4_HEADER_LEN + udp_len);
@@ -733,7 +761,7 @@ mod test {
             ip.set_total_len((IPV4_HEADER_LEN + udp_len) as u16);
             ip.set_next_header(IpProtocol::Udp);
             ip.set_src_addr(src_addr);
-            ip.set_dst_addr(LOCAL_ADDR);
+            ip.set_dst_addr(dst_addr);
         }
         {
             let mut udp = UdpPacket::new_unchecked(&mut buf[IPV4_HEADER_LEN..]);
@@ -741,24 +769,29 @@ mod test {
             udp.set_dst_port(LOCAL_PORT);
             udp.set_len(udp_len as u16);
             udp.payload_mut().copy_from_slice(payload);
-            udp.fill_checksum(&src_addr.into(), &LOCAL_ADDR.into());
+            udp.fill_checksum(&src_addr.into(), &dst_addr.into());
         }
         buf
     }
 
     fn queued_packet(payload: &[u8]) -> PacketBuf {
-        queued_packet_from(REMOTE_ADDR, REMOTE_PORT, payload)
+        queued_packet_from(REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, payload)
     }
 
     /// Run a packet through the stack's UDP ingress demux.
     fn deliver(stack: &mut Stack, src_addr: Ipv4Address, src_port: u16, payload: &[u8]) {
-        let mut buf = queued_packet_from(src_addr, src_port, payload);
+        deliver_to(stack, src_addr, src_port, LOCAL_ADDR, payload)
+    }
+
+    /// Like [`deliver`], with an explicit destination address.
+    fn deliver_to(stack: &mut Stack, src_addr: Ipv4Address, src_port: u16, dst_addr: Ipv4Address, payload: &[u8]) {
+        let mut buf = queued_packet_from(src_addr, src_port, dst_addr, payload);
         buf.pull_front(IPV4_HEADER_LEN);
         stack.inner.process_udp(
             stack.ifaces.get(0),
             &mut stack.sockets.udp,
             src_addr.into(),
-            LOCAL_ADDR.into(),
+            dst_addr.into(),
             IPV4_HEADER_LEN,
             buf,
         );
@@ -988,6 +1021,64 @@ mod test {
         assert_eq!(&*stack.udp(handle).recv().unwrap(), b"a");
         assert_eq!(&*stack.udp(handle).recv().unwrap(), b"b");
         assert!(!stack.udp(handle).can_recv());
+    }
+
+    #[test]
+    fn test_demux_priority() {
+        // When several sockets match a datagram, the most specific one wins,
+        // regardless of creation order: connected beats bound-to-address beats
+        // wildcard.
+        let mut stack = stack_with_iface();
+        let h_any = stack.add_udp_socket();
+        let h_addr = stack.add_udp_socket();
+        let h_conn = stack.add_udp_socket();
+        stack.udp(h_any).bind(LOCAL_PORT, ANY).unwrap();
+        stack.udp(h_addr).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
+        stack
+            .udp(h_conn)
+            .bind((LOCAL_ADDR, LOCAL_PORT), (REMOTE_ADDR, REMOTE_PORT))
+            .unwrap();
+
+        // From the connected remote: the connected socket wins.
+        deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"conn");
+        // From another port of the same peer: the address-bound socket.
+        deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT + 1, b"addr");
+        // To another local address: only the wildcard socket matches.
+        deliver_to(&mut stack, REMOTE_ADDR, REMOTE_PORT, OTHER_ADDR, b"any");
+
+        assert_eq!(&*stack.udp(h_conn).recv().unwrap(), b"conn");
+        assert!(!stack.udp(h_conn).can_recv());
+        assert_eq!(&*stack.udp(h_addr).recv().unwrap(), b"addr");
+        assert!(!stack.udp(h_addr).can_recv());
+        assert_eq!(&*stack.udp(h_any).recv().unwrap(), b"any");
+        assert!(!stack.udp(h_any).can_recv());
+    }
+
+    #[test]
+    fn test_demux_priority_per_version() {
+        // The per-version wildcard sits between the address-less bind and an
+        // exact address: it takes its version's traffic away from the
+        // dual-stack socket, and gives it up to the exact address in turn.
+        let mut stack = stack_with_iface();
+        let h_any = stack.add_udp_socket();
+        let h_v4 = stack.add_udp_socket();
+        let h_addr = stack.add_udp_socket();
+        stack.udp(h_any).bind(LOCAL_PORT, ANY).unwrap();
+        stack
+            .udp(h_v4)
+            .bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT), ANY)
+            .unwrap();
+
+        deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"v4");
+        assert_eq!(&*stack.udp(h_v4).recv().unwrap(), b"v4");
+        assert!(!stack.udp(h_any).can_recv());
+
+        stack.udp(h_addr).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
+
+        deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"addr");
+        assert_eq!(&*stack.udp(h_addr).recv().unwrap(), b"addr");
+        assert!(!stack.udp(h_v4).can_recv());
+        assert!(!stack.udp(h_any).can_recv());
     }
 
     #[test]
