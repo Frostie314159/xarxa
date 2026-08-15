@@ -10,7 +10,7 @@ use core::{fmt, mem};
 use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
 use crate::rand::Rand;
 use crate::slab::Slab;
-use crate::stack::{TxContext, addr_matches, alloc_ephemeral_port};
+use crate::stack::{TxContext, alloc_ephemeral_port};
 use crate::time::{Duration, Instant};
 use crate::wire::{
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
@@ -19,10 +19,13 @@ use crate::wire::{
 
 mod assembler;
 mod congestion;
+mod listener;
 mod repr;
 mod ring_buffer;
 
 use self::assembler::Assembler;
+pub(crate) use self::listener::TcpListenerState;
+pub use self::listener::{TcpListener, TcpListenerHandle};
 pub(crate) use self::repr::TcpRepr;
 pub use self::repr::{TcpTimestampGenerator, TcpTimestampRepr};
 use self::ring_buffer::RingBuffer;
@@ -54,11 +57,13 @@ pub(crate) enum PollAt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TcpHandle(pub(crate) usize);
 
-/// Error returned by [`TcpSocket::listen`]
+/// Error returned by [`TcpListener::listen`]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ListenError {
     InvalidState,
     Unaddressable,
+    /// Another TCP listener is bound to the identical endpoint.
+    InUse,
 }
 
 impl Display for ListenError {
@@ -66,6 +71,7 @@ impl Display for ListenError {
         match *self {
             ListenError::InvalidState => write!(f, "invalid state"),
             ListenError::Unaddressable => write!(f, "unaddressable destination"),
+            ListenError::InUse => write!(f, "port in use"),
         }
     }
 }
@@ -136,11 +142,14 @@ pub(crate) type SocketBuffer = RingBuffer<u8>;
 
 /// The state of a TCP socket, according to [RFC 793].
 ///
+/// There is no `LISTEN` state: passive open is the job of [`TcpListener`], and
+/// a `TcpSocket` only ever represents a single connection (its 4-tuple is fully
+/// set from the start).
+///
 /// [RFC 793]: https://tools.ietf.org/html/rfc793
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum State {
     Closed,
-    Listen,
     SynSent,
     SynReceived,
     Established,
@@ -156,7 +165,6 @@ impl fmt::Display for State {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             State::Closed => write!(f, "CLOSED"),
-            State::Listen => write!(f, "LISTEN"),
             State::SynSent => write!(f, "SYN-SENT"),
             State::SynReceived => write!(f, "SYN-RECEIVED"),
             State::Established => write!(f, "ESTABLISHED"),
@@ -465,12 +473,8 @@ pub enum CongestionControl {
     Cubic,
 }
 
-/// A Transmission Control Protocol socket.
-///
-/// A TCP socket may passively listen for connections or actively connect to another endpoint.
-/// Note that, for listening sockets, there is no "backlog"; to be able to simultaneously
-/// accept several connections, as many sockets must be allocated, or any new connection
-/// attempts will be reset.
+/// The state of a TCP socket, stored in the stack's socket slab. The public API
+/// lives on [`TcpSocket`], the view of one of these borrowed from the stack.
 #[derive(Debug)]
 pub(crate) struct TcpSocketState {
     state: State,
@@ -486,9 +490,6 @@ pub(crate) struct TcpSocketState {
     keep_alive: Option<Duration>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
-    /// Address passed to listen(). Listen address is set when listen() is called and
-    /// used every time the socket is reset back to the LISTEN state.
-    listen_endpoint: IpListenEndpoint,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
@@ -589,7 +590,6 @@ impl TcpSocketState {
             timeout: None,
             keep_alive: None,
             hop_limit: None,
-            listen_endpoint: IpListenEndpoint::default(),
             tuple: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -653,7 +653,6 @@ impl TcpSocketState {
         self.tx_buffer.clear();
         self.rx_buffer.clear();
         self.rx_fin_received = false;
-        self.listen_endpoint = IpListenEndpoint::default();
         self.tuple = None;
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
@@ -810,31 +809,19 @@ impl TcpSocketState {
             return false;
         }
 
-        // If we're still listening for SYNs and the packet has an ACK or a RST,
-        // it cannot be destined to this socket, but another one may well listen
-        // on the same local endpoint.
-        if self.state == State::Listen && (repr.ack_number.is_some() || repr.control == TcpControl::Rst) {
+        // Reject packets not matching the 4-tuple.
+        let Some(tuple) = &self.tuple else {
             return false;
-        }
-
-        if let Some(tuple) = &self.tuple {
-            // Reject packets not matching the 4-tuple
-            *dst_addr == tuple.local.addr
-                && repr.dst_port == tuple.local.port
-                && *src_addr == tuple.remote.addr
-                && repr.src_port == tuple.remote.port
-        } else {
-            // We're listening, reject packets not matching the listen endpoint.
-            addr_matches(&self.listen_endpoint, dst_addr)
-                && repr.dst_port != 0
-                && repr.dst_port == self.listen_endpoint.port
-        }
+        };
+        *dst_addr == tuple.local.addr
+            && repr.dst_port == tuple.local.port
+            && *src_addr == tuple.remote.addr
+            && repr.src_port == tuple.remote.port
     }
 
     pub(crate) fn process(
         &mut self,
         now: Instant,
-        rand: &mut Rand,
         src_addr: &IpAddress,
         dst_addr: &IpAddress,
         repr: &TcpRepr,
@@ -869,10 +856,6 @@ impl TcpSocketState {
             }
             // Any other RST need only have a valid sequence number.
             (_, TcpControl::Rst, _) => (),
-            // The initial SYN cannot contain an acknowledgement.
-            (State::Listen, _, None) => (),
-            // This case is handled in `accepts()`.
-            (State::Listen, _, Some(_)) => unreachable!(),
             // SYN|ACK in the SYN-SENT state must have the exact ACK number.
             (State::SynSent, TcpControl::Syn, Some(ack_number)) => {
                 if ack_number != self.local_seq_no + 1 {
@@ -950,8 +933,8 @@ impl TcpSocketState {
         let segment_end = repr.seq_number + repr.payload.len();
 
         let (payload, payload_offset) = match self.state {
-            // In LISTEN and SYN-SENT states, we have not yet synchronized with the remote end.
-            State::Listen | State::SynSent => (&[][..], 0),
+            // In the SYN-SENT state, we have not yet synchronized with the remote end.
+            State::SynSent => (&[][..], 0),
             _ => {
                 // https://www.rfc-editor.org/rfc/rfc9293.html#name-segment-acceptability-tests
                 let segment_in_window = match (segment_start == segment_end, window_start == window_end) {
@@ -1102,58 +1085,12 @@ impl TcpSocketState {
 
         // Validate and update the state.
         match (self.state, control) {
-            // RSTs are not accepted in the LISTEN state.
-            (State::Listen, TcpControl::Rst) => return None,
-
-            // RSTs in SYN-RECEIVED flip the socket back to the LISTEN state.
-            // Here we need to additionally check `listen_endpoint`, because we want to make sure
-            // that SYN-RECEIVED was actually converted from the LISTEN state (another possible
-            // reason is TCP simultaneous open).
-            (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
-                tcp_trace!("received RST");
-                self.tuple = None;
-                self.set_state(State::Listen);
-                return None;
-            }
-
-            // RSTs in any other state close the socket.
+            // RSTs close the socket.
             (_, TcpControl::Rst) => {
                 tcp_trace!("received RST");
                 self.set_state(State::Closed);
                 self.tuple = None;
                 return None;
-            }
-
-            // SYN packets in the LISTEN state change it to SYN-RECEIVED.
-            (State::Listen, TcpControl::Syn) => {
-                tcp_trace!("received SYN");
-                if let Some(max_seg_size) = repr.max_seg_size {
-                    // Treat a zero MSS as if the option were absent, like Linux does.
-                    if max_seg_size != 0 {
-                        self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS);
-                        self.congestion_controller.inner_mut().set_mss(self.remote_mss);
-                    }
-                }
-
-                self.tuple = Some(Tuple {
-                    local: IpEndpoint::new(*dst_addr, repr.dst_port),
-                    remote: IpEndpoint::new(*src_addr, repr.src_port),
-                });
-                self.local_seq_no = Self::random_seq_no(rand);
-                self.remote_seq_no = repr.seq_number + 1;
-                self.remote_last_seq = self.local_seq_no;
-                self.remote_has_sack = repr.sack_permitted;
-                self.remote_win_scale = repr.window_scale;
-                // Remote doesn't support window scaling, don't do it.
-                if self.remote_win_scale.is_none() {
-                    self.remote_win_shift = 0;
-                }
-                // Remote doesn't support timestamping, don't do it.
-                if repr.timestamp.is_none() {
-                    self.tsval_generator = None;
-                }
-                self.set_state(State::SynReceived);
-                self.timer.set_for_idle(now, self.keep_alive);
             }
 
             // ACK packets in the SYN-RECEIVED state change it to ESTABLISHED.
@@ -1753,9 +1690,6 @@ impl TcpSocketState {
                 repr.control = TcpControl::Rst;
             }
 
-            // We never transmit anything in the LISTEN state.
-            State::Listen => return Ok(()),
-
             // We transmit a SYN in the SYN-SENT state.
             // We transmit a SYN|ACK in the SYN-RECEIVED state.
             State::SynSent | State::SynReceived => {
@@ -2050,12 +1984,12 @@ pub(crate) fn flush(state: &mut TcpSocketState, cx: &mut TxContext<'_>) {
     }
 }
 
-/// A TCP socket borrowed from a [`Stack`], returned by [`Stack::tcp`].
+/// A Transmission Control Protocol socket, borrowed from a [`Stack`] by
+/// [`Stack::tcp`].
 ///
-/// A TCP socket may passively listen for connections or actively connect to another
-/// endpoint. Note that, for listening sockets, there is no "backlog". To be able to
-/// simultaneously accept several connections, as many sockets must be allocated, or
-/// any new connection attempts will be reset.
+/// A TCP socket represents a single connection (connecting or connected): its
+/// 4-tuple is fully set from the start, by [`connect`](Self::connect) or by
+/// [`TcpListener::accept`]. Passive open lives in [`TcpListener`].
 ///
 /// [`Stack`]: crate::Stack
 /// [`Stack::tcp`]: crate::Stack::tcp
@@ -2245,12 +2179,6 @@ impl TcpSocket<'_> {
         self.inner_mut().hop_limit = hop_limit
     }
 
-    /// Return the listen endpoint
-    #[inline]
-    pub fn listen_endpoint(&self) -> IpListenEndpoint {
-        self.inner().listen_endpoint
-    }
-
     /// Return the local endpoint, or None if not connected.
     #[inline]
     pub fn local_endpoint(&self) -> Option<IpEndpoint> {
@@ -2269,47 +2197,6 @@ impl TcpSocket<'_> {
         self.inner().state
     }
 
-    /// Start listening on the given endpoint.
-    ///
-    /// The endpoint's address scopes the listen. Absent, it accepts connections
-    /// to any address of either IP version. Unspecified (`0.0.0.0` / `::`), to
-    /// any address of that version alone. Concrete, to that address alone.
-    ///
-    /// This function returns `Err(Error::InvalidState)` if the socket was already open
-    /// (see [is_open](#method.is_open)), and `Err(Error::Unaddressable)`
-    /// if the port in the given endpoint is zero.
-    pub fn listen<T>(&mut self, local_endpoint: T) -> Result<(), ListenError>
-    where
-        T: Into<IpListenEndpoint>,
-    {
-        let local_endpoint = local_endpoint.into();
-        if local_endpoint.port == 0 {
-            return Err(ListenError::Unaddressable);
-        }
-
-        if self.is_open() {
-            // If we were already listening to same endpoint there is nothing to do; exit early.
-            //
-            // In the past listening on an socket that was already listening was an error,
-            // however this makes writing an acceptor loop with multiple sockets impossible.
-            // Without this early exit, if you tried to listen on a socket that's already listening you'll
-            // immediately get an error. The only way around this is to abort the socket first
-            // before listening again, but this means that incoming connections can actually
-            // get aborted between the abort() and the next listen().
-            if matches!(self.inner_mut().state, State::Listen) && self.inner_mut().listen_endpoint == local_endpoint {
-                return Ok(());
-            } else {
-                return Err(ListenError::InvalidState);
-            }
-        }
-
-        self.inner_mut().reset();
-        self.inner_mut().listen_endpoint = local_endpoint;
-        self.inner_mut().tuple = None;
-        self.inner_mut().set_state(State::Listen);
-        Ok(())
-    }
-
     /// Connect to a given endpoint.
     ///
     /// The local endpoint may be left mostly unspecified: a local port of zero
@@ -2323,10 +2210,11 @@ impl TcpSocket<'_> {
     /// Only the full 4-tuple must be unique, not the local port: two sockets
     /// may connect from the same local port as long as the remote (or the
     /// local address) differs. Ingress matches connected sockets by exact
-    /// tuple, so distinct tuples are never ambiguous. Ephemeral allocation
-    /// applies the same rule (it only additionally avoids ports listened on),
-    /// and an explicit local endpoint that would duplicate another socket's
-    /// tuple is rejected with `Err(ConnectError::InUse)`.
+    /// tuple, so distinct tuples are never ambiguous. Sharing a port with a
+    /// listener is fine too, since connected sockets are matched before
+    /// listeners. Ephemeral allocation applies the same rule, and an explicit
+    /// local endpoint that would duplicate another socket's tuple is rejected
+    /// with `Err(ConnectError::InUse)`.
     ///
     /// This function returns an error if the socket was open (see
     /// [is_open](#method.is_open)). It also returns an error if the remote port
@@ -2379,15 +2267,11 @@ impl TcpSocket<'_> {
         if local_endpoint.port == 0 {
             local_endpoint.port = alloc_ephemeral_port(self.tx.rand(), |port| {
                 tuple_in_use(IpEndpoint::new(local_endpoint.addr, port))
-                    || sockets
-                        .iter()
-                        .any(|(i, s)| i != index && s.listen_endpoint.port == port)
             })
             .ok_or(ConnectError::NoFreePorts)?;
         } else if tuple_in_use(local_endpoint) {
             return Err(ConnectError::InUse);
         }
-
         let seq = TcpSocketState::random_seq_no(self.tx.rand());
 
         let s = self.inner_mut();
@@ -2409,8 +2293,6 @@ impl TcpSocket<'_> {
     /// data and would like to reuse the socket right away, use [abort](#method.abort).
     pub fn close(&mut self) {
         match self.inner_mut().state {
-            // In the LISTEN state there is no established connection.
-            State::Listen => self.inner_mut().set_state(State::Closed),
             // In the SYN-SENT state the remote endpoint is not yet synchronized and, upon
             // receiving an RST, will abort the connection.
             State::SynSent => self.inner_mut().set_state(State::Closed),
@@ -2434,17 +2316,6 @@ impl TcpSocket<'_> {
     /// the `CLOSED` state.
     pub fn abort(&mut self) {
         self.inner_mut().set_state(State::Closed);
-    }
-
-    /// Return whether the socket is passively listening for incoming connections.
-    ///
-    /// In terms of the TCP state machine, the socket must be in the `LISTEN` state.
-    #[inline]
-    pub fn is_listening(&self) -> bool {
-        match self.inner().state {
-            State::Listen => true,
-            _ => false,
-        }
     }
 
     /// Return whether the socket is open.
@@ -2474,14 +2345,13 @@ impl TcpSocket<'_> {
     /// If a connection is established, [abort](#method.close) will send a reset to
     /// the remote endpoint.
     ///
-    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`, `TIME-WAIT`,
-    /// or `LISTEN` state.
+    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`
+    /// or `TIME-WAIT` state.
     #[inline]
     pub fn is_active(&self) -> bool {
         match self.inner().state {
             State::Closed => false,
             State::TimeWait => false,
-            State::Listen => false,
             _ => true,
         }
     }
@@ -2741,10 +2611,6 @@ mod test {
 
     const LOCAL_PORT: u16 = 80;
     const REMOTE_PORT: u16 = 49500;
-    const LISTEN_END: IpListenEndpoint = IpListenEndpoint {
-        addr: None,
-        port: LOCAL_PORT,
-    };
     const TUPLE: Tuple = Tuple {
         local: LOCAL_END,
         remote: REMOTE_END,
@@ -2862,11 +2728,7 @@ mod test {
 
         assert!(socket.sockets.get_mut(0).accepts(&src_addr, &dst_addr, repr));
 
-        match socket
-            .sockets
-            .get_mut(0)
-            .process(timestamp, &mut socket.stack.inner.rand, &src_addr, &dst_addr, repr)
-        {
+        match socket.sockets.get_mut(0).process(timestamp, &src_addr, &dst_addr, repr) {
             Some(repr) => {
                 net_trace!("recv: {}", repr);
                 Some(repr)
@@ -2983,7 +2845,8 @@ mod test {
         socket_with_buffer_sizes(64, 64)
     }
 
-    fn socket_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
+    /// A stack with one interface owning `LOCAL_ADDR`.
+    fn test_stack() -> Stack {
         let mut stack = Stack::new();
         stack.add_iface(
             Box::new(TestingDevice),
@@ -2995,6 +2858,11 @@ mod test {
                 ],
             },
         );
+        stack
+    }
+
+    fn socket_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
+        let stack = test_stack();
 
         let rx_buffer = SocketBuffer::new(vec![0; rx_len]);
         let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
@@ -3142,23 +3010,6 @@ mod test {
     }
 
     #[test]
-    fn test_closed_reject_after_listen() {
-        let mut s = socket();
-        s.view().listen(LOCAL_END).unwrap();
-        s.view().close();
-
-        let tcp_repr = TcpRepr {
-            control: TcpControl::Syn,
-            ..SEND_TEMPL
-        };
-        assert!(
-            !s.sockets
-                .get(0)
-                .accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
-        );
-    }
-
-    #[test]
     fn test_closed_close() {
         let mut s = socket();
         s.view().close();
@@ -3166,29 +3017,92 @@ mod test {
     }
 
     // =========================================================================================//
-    // Tests for the LISTEN state.
+    // Tests for listeners.
     // =========================================================================================//
-    fn socket_listen() -> TestSocket {
-        let mut s = socket();
-        s.state = State::Listen;
-        s.listen_endpoint = LISTEN_END;
-        s
+
+    /// A stack with a listener on `LOCAL_PORT` (any address).
+    fn listener_stack() -> (Stack, TcpListenerHandle) {
+        let mut stack = test_stack();
+        let h = stack.add_tcp_listener();
+        stack.tcp_listener(h).listen(LOCAL_PORT).unwrap();
+        (stack, h)
+    }
+
+    /// Offer a segment from `REMOTE_END` to `LOCAL_END` to the stack's
+    /// listeners the way `process_tcp` does, returning whether it was consumed.
+    fn listener_deliver(stack: &mut Stack, repr: &TcpRepr) -> bool {
+        let src_addr = IpAddress::from(REMOTE_ADDR);
+        let dst_addr = IpAddress::from(LOCAL_ADDR);
+        stack
+            .sockets
+            .tcp_listeners
+            .iter_mut()
+            .any(|(_, listener)| listener.process(&src_addr, &dst_addr, repr))
+    }
+
+    fn syn_repr() -> TcpRepr<'static> {
+        TcpRepr {
+            control: TcpControl::Syn,
+            seq_number: REMOTE_SEQ,
+            ack_number: None,
+            ..SEND_TEMPL
+        }
     }
 
     #[test]
-    fn test_listen_sack_option() {
-        let mut s = socket_listen();
-        send!(
-            s,
-            TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
-                sack_permitted: false,
-                ..SEND_TEMPL
-            }
-        );
-        assert!(!s.remote_has_sack);
+    fn test_listener_listen_validation() {
+        let mut stack = test_stack();
+        let h1 = stack.add_tcp_listener();
+        let h2 = stack.add_tcp_listener();
+
+        assert_eq!(stack.tcp_listener(h1).listen(0), Err(ListenError::Unaddressable));
+        assert_eq!(stack.tcp_listener(h1).listen(80), Ok(()));
+        assert!(stack.tcp_listener(h1).is_open());
+        // Re-listening on the same endpoint is a no-op...
+        assert_eq!(stack.tcp_listener(h1).listen(80), Ok(()));
+        // ...but a different one is an error.
+        assert_eq!(stack.tcp_listener(h1).listen(81), Err(ListenError::InvalidState));
+
+        // An identical sibling bind is rejected. The same port with a
+        // different (more specific) address is fine, the most specific match
+        // wins.
+        assert_eq!(stack.tcp_listener(h2).listen(80), Err(ListenError::InUse));
+        assert_eq!(stack.tcp_listener(h2).listen((LOCAL_ADDR, 80)), Ok(()));
+
+        let h3 = stack.add_tcp_listener();
+        assert_eq!(stack.tcp_listener(h3).listen((LOCAL_ADDR, 80)), Err(ListenError::InUse));
+        assert_eq!(stack.tcp_listener(h3).listen(81), Ok(()));
+    }
+
+    #[test]
+    fn test_listener_syn_and_accept() {
+        let (mut stack, h) = listener_stack();
+
+        // A SYN is recorded in the accept queue, nothing is transmitted.
+        assert!(!stack.tcp_listener(h).can_accept());
+        assert!(listener_deliver(&mut stack, &syn_repr()));
+        assert!(stack.tcp_listener(h).can_accept());
+
+        // Accept allocates the actual socket, in SYN-RECEIVED.
+        let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
+        assert!(!stack.tcp_listener(h).can_accept());
+        assert!(stack.tcp_listener(h).accept(64, 64).is_none());
+        assert_eq!(stack.tcp(sh).state(), State::SynReceived);
+        assert_eq!(stack.tcp(sh).local_endpoint(), Some(LOCAL_END));
+        assert_eq!(stack.tcp(sh).remote_endpoint(), Some(REMOTE_END));
+
+        // The accepted socket is exactly a SYN-RECEIVED socket: it sends the
+        // SYN|ACK, advertising its actual receive window, and completes the
+        // handshake like any other socket.
+        let mut s = TestSocket {
+            sockets: {
+                let mut sockets = Slab::new();
+                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
+                sockets
+            },
+            stack,
+        };
+        sanity!(&s, &socket_syn_received());
         recv!(
             s,
             [TcpRepr {
@@ -3199,63 +3113,135 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-
-        let mut s = socket_listen();
         send!(
             s,
             TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
-                sack_permitted: true,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
                 ..SEND_TEMPL
             }
         );
-        assert!(s.remote_has_sack);
-        recv!(
-            s,
-            [TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: LOCAL_SEQ,
-                ack_number: Some(REMOTE_SEQ + 1),
-                max_seg_size: Some(BASE_MSS),
-                sack_permitted: true,
-                ..RECV_TEMPL
-            }]
-        );
+        sanity!(s, socket_established());
     }
 
     #[test]
-    fn test_listen_syn_win_scale_buffers() {
-        for (buffer_size, shift_amt) in &[
-            (64, 0),
-            (128, 0),
-            (1024, 0),
-            (65535, 0),
-            (65536, 1),
-            (65537, 1),
-            (131071, 1),
-            (131072, 2),
-            (524287, 3),
-            (524288, 4),
-            (655350, 4),
-            (1048576, 5),
+    fn test_listener_syn_dedup() {
+        let (mut stack, h) = listener_stack();
+
+        // A retransmitted SYN updates the queue entry in place rather than
+        // queueing a duplicate...
+        assert!(listener_deliver(&mut stack, &syn_repr()));
+        assert!(listener_deliver(&mut stack, &syn_repr()));
+        // ...and a new connection attempt reusing the same ports (a new ISN)
+        // replaces the stale entry: the newest SYN wins.
+        assert!(listener_deliver(
+            &mut stack,
+            &TcpRepr {
+                seq_number: REMOTE_SEQ + 100,
+                ..syn_repr()
+            }
+        ));
+
+        let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
+        assert!(stack.tcp_listener(h).accept(64, 64).is_none());
+        assert_eq!(stack.sockets.tcp.get(sh.0).remote_seq_no, REMOTE_SEQ + 101);
+    }
+
+    #[test]
+    fn test_listener_rst_cancels_syn() {
+        let (mut stack, h) = listener_stack();
+        listener_deliver(&mut stack, &syn_repr());
+
+        // An RST with the wrong sequence number is ignored (the only
+        // acceptable one is exactly RCV.NXT)...
+        assert!(!listener_deliver(
+            &mut stack,
+            &TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        ));
+        assert!(stack.tcp_listener(h).can_accept());
+
+        // ...an exact RST removes the queued SYN.
+        assert!(listener_deliver(
+            &mut stack,
+            &TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        ));
+        assert!(!stack.tcp_listener(h).can_accept());
+    }
+
+    #[test]
+    fn test_listener_addr_filter() {
+        // A listener bound to a specific address ignores SYNs to other
+        // addresses.
+        let mut stack = test_stack();
+        let h = stack.add_tcp_listener();
+        stack.tcp_listener(h).listen((OTHER_ADDR, LOCAL_PORT)).unwrap();
+        assert!(!listener_deliver(&mut stack, &syn_repr()));
+
+        // Bound to the address the SYN targets, it records it.
+        stack.tcp_listener(h).close();
+        stack.tcp_listener(h).listen((LOCAL_ADDR, LOCAL_PORT)).unwrap();
+        assert!(listener_deliver(&mut stack, &syn_repr()));
+        assert!(stack.tcp_listener(h).can_accept());
+    }
+
+    #[test]
+    fn test_listener_syn_mss() {
+        // A tiny MSS is clamped, and a zero MSS is treated as absent.
+        for (sent, effective) in [
+            (Some(10), MIN_REMOTE_MSS),
+            (Some(0), DEFAULT_MSS),
+            (None, DEFAULT_MSS),
+            (Some(1000), 1000),
         ] {
-            let mut s = socket_with_buffer_sizes(64, *buffer_size);
-            s.state = State::Listen;
-            s.listen_endpoint = LISTEN_END;
-            assert_eq!(s.remote_win_shift, *shift_amt);
-            send!(
-                s,
-                TcpRepr {
-                    control: TcpControl::Syn,
-                    seq_number: REMOTE_SEQ,
-                    ack_number: None,
-                    window_scale: Some(0),
-                    ..SEND_TEMPL
+            let (mut stack, h) = listener_stack();
+            assert!(listener_deliver(
+                &mut stack,
+                &TcpRepr {
+                    max_seg_size: sent,
+                    ..syn_repr()
                 }
-            );
-            assert_eq!(s.remote_win_shift, *shift_amt);
+            ));
+            let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
+            assert_eq!(stack.sockets.tcp.get(sh.0).remote_mss, effective);
+        }
+    }
+
+    #[test]
+    fn test_listener_window_scaling() {
+        // When the remote offers window scaling, the accepted socket's shift
+        // comes from its actual rx buffer capacity, and the SYN|ACK advertises
+        // it (with the unscaled real window).
+        for (buffer_size, shift) in [(64, 0), (65535, 0), (65536, 1), (1048576, 5)] {
+            let (mut stack, h) = listener_stack();
+            assert!(listener_deliver(
+                &mut stack,
+                &TcpRepr {
+                    window_scale: Some(7),
+                    ..syn_repr()
+                }
+            ));
+            let sh = stack.tcp_listener(h).accept(buffer_size, 64).unwrap();
+            assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_scale, Some(7));
+            assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_shift, shift);
+
+            let mut s = TestSocket {
+                sockets: {
+                    let mut sockets = Slab::new();
+                    sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
+                    sockets
+                },
+                stack,
+            };
             recv!(
                 s,
                 [TcpRepr {
@@ -3263,127 +3249,51 @@ mod test {
                     seq_number: LOCAL_SEQ,
                     ack_number: Some(REMOTE_SEQ + 1),
                     max_seg_size: Some(BASE_MSS),
-                    window_scale: Some(*shift_amt),
-                    window_len: u16::try_from(*buffer_size).unwrap_or(u16::MAX),
+                    window_scale: Some(shift),
+                    window_len: u16::try_from(buffer_size).unwrap_or(u16::MAX),
                     ..RECV_TEMPL
                 }]
             );
         }
-    }
 
-    #[test]
-    fn test_listen_syn_tiny_mss_is_clamped() {
-        let mut s = socket_listen();
-        send!(
-            s,
-            TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
-                max_seg_size: Some(10),
-                ..SEND_TEMPL
-            }
-        );
-        assert_eq!(s.state, State::SynReceived);
-        assert_eq!(s.remote_mss, MIN_REMOTE_MSS);
-    }
-
-    #[test]
-    fn test_listen_syn_zero_mss_is_ignored() {
-        let mut s = socket_listen();
-        send!(
-            s,
-            TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
-                max_seg_size: Some(0),
-                ..SEND_TEMPL
-            }
-        );
-        assert_eq!(s.state, State::SynReceived);
-        assert_eq!(s.remote_mss, DEFAULT_MSS);
-    }
-
-    #[test]
-    fn test_listen_sanity() {
-        let mut s = socket();
-        s.view().listen(LOCAL_PORT).unwrap();
-        sanity!(s, socket_listen());
-    }
-
-    #[test]
-    fn test_listen_validation() {
-        let mut s = socket();
-        assert_eq!(s.view().listen(0), Err(ListenError::Unaddressable));
-    }
-
-    #[test]
-    fn test_listen_twice() {
-        let mut s = socket();
-        assert_eq!(s.view().listen(80), Ok(()));
-        // multiple calls to listen are okay if its the same local endpoint and the state is still in listening
-        assert_eq!(s.view().listen(80), Ok(()));
-        s.set_state(State::SynReceived); // state change, simulate incoming connection
-        assert_eq!(s.view().listen(80), Err(ListenError::InvalidState));
-    }
-
-    #[test]
-    fn test_listen_syn() {
-        let mut s = socket_listen();
-        send!(
-            s,
-            TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
-                ..SEND_TEMPL
-            }
-        );
-        sanity!(s, socket_syn_received());
-    }
-
-    #[test]
-    fn test_listen_syn_reject_ack() {
-        let s = socket_listen();
-
-        let tcp_repr = TcpRepr {
-            control: TcpControl::Syn,
-            seq_number: REMOTE_SEQ,
-            ack_number: Some(LOCAL_SEQ),
-            ..SEND_TEMPL
+        // Without an offer from the remote, scaling is off entirely.
+        let (mut stack, h) = listener_stack();
+        assert!(listener_deliver(&mut stack, &syn_repr()));
+        let sh = stack.tcp_listener(h).accept(65536, 64).unwrap();
+        assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_scale, None);
+        assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_shift, 0);
+        let mut s = TestSocket {
+            sockets: {
+                let mut sockets = Slab::new();
+                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
+                sockets
+            },
+            stack,
         };
-        assert!(
-            !s.sockets
-                .get(0)
-                .accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                window_scale: None,
+                window_len: u16::MAX,
+                ..RECV_TEMPL
+            }]
         );
-
-        assert_eq!(s.state, State::Listen);
     }
 
     #[test]
-    fn test_listen_rst() {
-        let s = socket_listen();
-        let tcp_repr = TcpRepr {
-            control: TcpControl::Rst,
-            seq_number: REMOTE_SEQ,
-            ack_number: None,
-            ..SEND_TEMPL
-        };
-        assert!(
-            !s.sockets
-                .get(0)
-                .accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
-        );
-        assert_eq!(s.state, State::Listen);
-    }
+    fn test_listener_close_drops_syns() {
+        let (mut stack, h) = listener_stack();
+        listener_deliver(&mut stack, &syn_repr());
+        assert!(stack.tcp_listener(h).can_accept());
 
-    #[test]
-    fn test_listen_close() {
-        let mut s = socket_listen();
-        s.view().close();
-        assert_eq!(s.state, State::Closed);
+        stack.tcp_listener(h).close();
+        assert!(!stack.tcp_listener(h).is_open());
+        assert!(!stack.tcp_listener(h).can_accept());
+        assert!(!listener_deliver(&mut stack, &syn_repr()));
     }
 
     // =========================================================================================//
@@ -3520,7 +3430,6 @@ mod test {
     #[test]
     fn test_syn_received_rst() {
         let mut s = socket_syn_received();
-        s.listen_endpoint = LISTEN_END;
         recv!(
             s,
             [TcpRepr {
@@ -3540,87 +3449,8 @@ mod test {
                 ..SEND_TEMPL
             }
         );
-        assert_eq!(s.state, State::Listen);
-        assert_eq!(s.listen_endpoint, LISTEN_END);
+        assert_eq!(s.state, State::Closed);
         assert_eq!(s.tuple, None);
-    }
-
-    #[test]
-    fn test_syn_received_no_window_scaling() {
-        let mut s = socket_listen();
-        send!(
-            s,
-            TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
-                ..SEND_TEMPL
-            }
-        );
-        assert_eq!(s.view().state(), State::SynReceived);
-        assert_eq!(s.tuple, Some(TUPLE));
-        recv!(
-            s,
-            [TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: LOCAL_SEQ,
-                ack_number: Some(REMOTE_SEQ + 1),
-                max_seg_size: Some(BASE_MSS),
-                window_scale: None,
-                ..RECV_TEMPL
-            }]
-        );
-        send!(
-            s,
-            TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                window_scale: None,
-                ..SEND_TEMPL
-            }
-        );
-        assert_eq!(s.remote_win_shift, 0);
-        assert_eq!(s.remote_win_scale, None);
-    }
-
-    #[test]
-    fn test_syn_received_window_scaling() {
-        for scale in 0..14 {
-            let mut s = socket_listen();
-            send!(
-                s,
-                TcpRepr {
-                    control: TcpControl::Syn,
-                    seq_number: REMOTE_SEQ,
-                    ack_number: None,
-                    window_scale: Some(scale),
-                    ..SEND_TEMPL
-                }
-            );
-            assert_eq!(s.view().state(), State::SynReceived);
-            assert_eq!(s.tuple, Some(TUPLE));
-            recv!(
-                s,
-                [TcpRepr {
-                    control: TcpControl::Syn,
-                    seq_number: LOCAL_SEQ,
-                    ack_number: Some(REMOTE_SEQ + 1),
-                    max_seg_size: Some(BASE_MSS),
-                    window_scale: Some(0),
-                    ..RECV_TEMPL
-                }]
-            );
-            send!(
-                s,
-                TcpRepr {
-                    seq_number: REMOTE_SEQ + 1,
-                    ack_number: Some(LOCAL_SEQ + 1),
-                    window_scale: None,
-                    ..SEND_TEMPL
-                }
-            );
-            assert_eq!(s.remote_win_scale, Some(scale));
-        }
     }
 
     #[test]
@@ -3796,17 +3626,6 @@ mod test {
         let p2 = stack.tcp(h2).local_endpoint().unwrap().port;
         assert!(p2 >= EPHEMERAL_PORT_MIN);
         assert_ne!(p1, p2);
-
-        // Listening sockets claim their port too. The PRNG seed is fixed, so a
-        // fresh stack's first allocation starts at the same port as `p1` above.
-        // A listener squatting on it forces the allocator to probe past.
-        let mut stack2 = Stack::new();
-        let listener = stack2.add_tcp_socket(64, 64);
-        let client = stack2.add_tcp_socket(64, 64);
-        stack2.tcp(listener).listen(p1).unwrap();
-        stack2.tcp(client).connect(REMOTE_END, (LOCAL_ADDR, 0)).unwrap();
-        let pc = stack2.tcp(client).local_endpoint().unwrap().port;
-        assert_ne!(pc, p1);
     }
 
     #[test]
@@ -5856,50 +5675,6 @@ mod test {
     // =========================================================================================//
 
     #[test]
-    fn test_listen() {
-        let mut s = socket();
-        s.view().listen(LISTEN_END).unwrap();
-        assert_eq!(s.state, State::Listen);
-    }
-
-    #[test]
-    fn test_three_way_handshake() {
-        let mut s = socket_listen();
-        send!(
-            s,
-            TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
-                ..SEND_TEMPL
-            }
-        );
-        assert_eq!(s.view().state(), State::SynReceived);
-        assert_eq!(s.tuple, Some(TUPLE));
-        recv!(
-            s,
-            [TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: LOCAL_SEQ,
-                ack_number: Some(REMOTE_SEQ + 1),
-                max_seg_size: Some(BASE_MSS),
-                ..RECV_TEMPL
-            }]
-        );
-        send!(
-            s,
-            TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                ..SEND_TEMPL
-            }
-        );
-        assert_eq!(s.view().state(), State::Established);
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
-        assert_eq!(s.remote_seq_no, REMOTE_SEQ + 1);
-    }
-
-    #[test]
     fn test_remote_close() {
         let mut s = socket_established();
         send!(
@@ -7369,37 +7144,11 @@ mod test {
 
     #[test]
     fn test_maximum_segment_size() {
-        let mut s = socket_listen();
-        s.tx_buffer = SocketBuffer::new(vec![0; 32767]);
-        send!(
-            s,
-            TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
-                max_seg_size: Some(1000),
-                ..SEND_TEMPL
-            }
-        );
-        recv!(
-            s,
-            [TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: LOCAL_SEQ,
-                ack_number: Some(REMOTE_SEQ + 1),
-                max_seg_size: Some(BASE_MSS),
-                ..RECV_TEMPL
-            }]
-        );
-        send!(
-            s,
-            TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                window_len: 32767,
-                ..SEND_TEMPL
-            }
-        );
+        let mut s = socket_established_with_buffer_sizes(32767, 64);
+        // The remote advertised MSS 1000 in its SYN, and a 32767-byte window in
+        // its handshake ACK: segments are capped at 1000 bytes.
+        s.remote_mss = 1000;
+        s.remote_win_len = 32767;
         s.view().send_slice(&[0; 1200][..]).unwrap();
         recv!(
             s,
@@ -8323,13 +8072,6 @@ mod test {
     // =========================================================================================//
     // Tests for timeouts.
     // =========================================================================================//
-
-    #[test]
-    fn test_listen_timeout() {
-        let mut s = socket_listen();
-        s.view().set_timeout(Some(Duration::from_millis(100)));
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Ingress);
-    }
 
     #[test]
     fn test_connect_timeout() {
@@ -9405,63 +9147,27 @@ mod test {
     }
 
     #[test]
-    fn test_tsval_disabled_in_remote_client() {
-        let mut s = socket_listen();
-        s.view().set_tsval_generator(Some(|| 1));
-        assert!(s.view().timestamp_enabled());
-        send!(
-            s,
-            TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
-                ..SEND_TEMPL
-            }
-        );
-        assert_eq!(s.view().state(), State::SynReceived);
-        assert_eq!(s.tuple, Some(TUPLE));
-        assert!(!s.view().timestamp_enabled());
-        recv!(
-            s,
-            [TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: LOCAL_SEQ,
-                ack_number: Some(REMOTE_SEQ + 1),
-                max_seg_size: Some(BASE_MSS),
-                ..RECV_TEMPL
-            }]
-        );
-        send!(
-            s,
-            TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                ..SEND_TEMPL
-            }
-        );
-        assert_eq!(s.view().state(), State::Established);
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
-        assert_eq!(s.remote_seq_no, REMOTE_SEQ + 1);
-    }
-
-    #[test]
-    fn test_tsval_disabled_in_local_server() {
-        let mut s = socket_listen();
-        // s.set_timestamp(false); // commented to alert if the default state changes
-        assert!(!s.view().timestamp_enabled());
-        send!(
-            s,
-            TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: REMOTE_SEQ,
-                ack_number: None,
+    fn test_tsval_in_accepted_socket() {
+        // Timestamps default to off, so an accepted socket does not negotiate
+        // them in its SYN|ACK...
+        let (mut stack, h) = listener_stack();
+        assert!(listener_deliver(
+            &mut stack,
+            &TcpRepr {
                 timestamp: Some(TcpTimestampRepr::new(500, 0)),
-                ..SEND_TEMPL
+                ..syn_repr()
             }
-        );
-        assert_eq!(s.view().state(), State::SynReceived);
-        assert_eq!(s.tuple, Some(TUPLE));
-        assert!(!s.view().timestamp_enabled());
+        ));
+        let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
+        assert!(!stack.tcp(sh).timestamp_enabled());
+        let mut s = TestSocket {
+            sockets: {
+                let mut sockets = Slab::new();
+                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
+                sockets
+            },
+            stack,
+        };
         recv!(
             s,
             [TcpRepr {
@@ -9469,20 +9175,42 @@ mod test {
                 seq_number: LOCAL_SEQ,
                 ack_number: Some(REMOTE_SEQ + 1),
                 max_seg_size: Some(BASE_MSS),
+                timestamp: None,
                 ..RECV_TEMPL
             }]
         );
-        send!(
-            s,
-            TcpRepr {
-                seq_number: REMOTE_SEQ + 1,
-                ack_number: Some(LOCAL_SEQ + 1),
-                ..SEND_TEMPL
+
+        // ...but enabling a generator on the accepted socket works: the SYN
+        // carried a timestamp, and the SYN|ACK echoes its tsval.
+        let (mut stack, h) = listener_stack();
+        assert!(listener_deliver(
+            &mut stack,
+            &TcpRepr {
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                ..syn_repr()
             }
+        ));
+        let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
+        stack.tcp(sh).set_tsval_generator(Some(|| 1));
+        let mut s = TestSocket {
+            sockets: {
+                let mut sockets = Slab::new();
+                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
+                sockets
+            },
+            stack,
+        };
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                timestamp: Some(TcpTimestampRepr::new(1, 500)),
+                ..RECV_TEMPL
+            }]
         );
-        assert_eq!(s.view().state(), State::Established);
-        assert_eq!(s.local_seq_no, LOCAL_SEQ + 1);
-        assert_eq!(s.remote_seq_no, REMOTE_SEQ + 1);
     }
 
     #[test]
@@ -9729,22 +9457,32 @@ mod stack_test {
     #[test]
     fn test_stack_handshake_data_and_close() {
         let (mut stack, queues) = stack();
-        let h = stack.add_tcp_socket(64, 64);
-        stack.tcp(h).set_ack_delay(None);
-        stack.tcp(h).listen(LOCAL_PORT).unwrap();
+        let lh = stack.add_tcp_listener();
+        stack.tcp_listener(lh).listen(LOCAL_PORT).unwrap();
 
-        // SYN in, SYN|ACK out.
+        // A SYN is recorded in the accept queue, nothing is transmitted until
+        // the connection is accepted.
         queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(0));
+        assert!(queues.borrow().tx.is_empty());
+        assert!(stack.tcp_listener(lh).can_accept());
+
+        // Accept allocates the actual socket, and the next poll sends the
+        // SYN|ACK, advertising the socket's actual receive window.
+        let h = stack.tcp_listener(lh).accept(64, 64).unwrap();
+        stack.tcp(h).set_ack_delay(None);
+        assert_eq!(stack.tcp(h).state(), State::SynReceived);
+        stack.poll(Instant::from_millis(0));
         let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.syn() && tcp.ack());
             assert_eq!(tcp.seq_number(), LOCAL_SEQ);
             assert_eq!(tcp.ack_number(), REMOTE_SEQ + 1);
+            assert_eq!(tcp.window_len(), 64);
         });
         assert!(queues.borrow().tx.is_empty());
 

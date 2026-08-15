@@ -7,7 +7,10 @@ use crate::rand::Rand;
 use crate::raw::{RawHandle, RawSocket, RawSocketState};
 use crate::route::Routes;
 use crate::slab::Slab;
-use crate::tcp::{PollAt, SocketBuffer, TcpHandle, TcpRepr, TcpSocket, TcpSocketState};
+use crate::tcp::{
+    PollAt, SocketBuffer, TcpHandle, TcpListener, TcpListenerHandle, TcpListenerState, TcpRepr, TcpSocket,
+    TcpSocketState,
+};
 use crate::time::Instant;
 use crate::udp::{UdpHandle, UdpSocket, UdpSocketState};
 use crate::wire::*;
@@ -51,6 +54,7 @@ pub(crate) struct Sockets {
     pub(crate) udp: Slab<UdpSocketState>,
     pub(crate) raw: Slab<RawSocketState>,
     pub(crate) tcp: Slab<TcpSocketState>,
+    pub(crate) tcp_listeners: Slab<TcpListenerState>,
 }
 
 /// An interface added to the stack, with its configuration.
@@ -243,6 +247,7 @@ impl Stack {
                 udp: Slab::new(),
                 raw: Slab::new(),
                 tcp: Slab::new(),
+                tcp_listeners: Slab::new(),
             },
         }
     }
@@ -372,6 +377,33 @@ impl Stack {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
             },
+        }
+    }
+
+    /// Add a TCP listener to the stack, returning a handle to it.
+    pub fn add_tcp_listener(&mut self) -> TcpListenerHandle {
+        TcpListenerHandle(self.sockets.tcp_listeners.add_with(|_| TcpListenerState::new()))
+    }
+
+    /// Remove a TCP listener from the stack.
+    ///
+    /// # Panics
+    /// Panics if the handle is stale (the listener was already removed).
+    pub fn remove_tcp_listener(&mut self, handle: TcpListenerHandle) {
+        self.sockets.tcp_listeners.remove(handle.0);
+    }
+
+    /// Borrow a TCP listener from the stack.
+    ///
+    /// # Panics
+    /// Panics if the handle is stale (the listener was already removed).
+    pub fn tcp_listener(&mut self, handle: TcpListenerHandle) -> TcpListener<'_> {
+        self.sockets.tcp_listeners.get(handle.0); // Stale handles panic here, not on first use.
+        TcpListener {
+            listeners: &mut self.sockets.tcp_listeners,
+            index: handle.0,
+            tcp: &mut self.sockets.tcp,
+            rand: &mut self.inner.rand,
         }
     }
 
@@ -633,6 +665,7 @@ impl StackInner {
             IpProtocol::Tcp => self.process_tcp(
                 iface,
                 &mut sockets.tcp,
+                &mut sockets.tcp_listeners,
                 IpAddress::Ipv4(src_addr),
                 IpAddress::Ipv4(dst_addr),
                 buf,
@@ -643,9 +676,13 @@ impl StackInner {
         }
     }
 
-    /// Process an ingress TCP segment: validate it and hand it to the first matching
+    /// Process an ingress TCP segment: validate it and hand it to the matching
     /// socket, transmitting whatever immediate reply the socket state machine
-    /// produces (RST, challenge ACK). Unmatched segments are answered with an RST.
+    /// produces (RST, challenge ACK). Connected sockets match first, by full
+    /// 4-tuple, then the listeners, which record SYNs to a listened endpoint in
+    /// their accept queues and transmit nothing (the SYN|ACK is sent by the
+    /// socket that `accept` creates). Unmatched segments are answered with an
+    /// RST.
     ///
     /// The socket's own transmissions (data, ACKs of received data) are not sent
     /// here. [`Stack::poll`] drives them right after ingress processing.
@@ -653,6 +690,7 @@ impl StackInner {
         &mut self,
         iface: &mut Iface,
         sockets: &mut Slab<TcpSocketState>,
+        listeners: &mut Slab<TcpListenerState>,
         src_addr: IpAddress,
         dst_addr: IpAddress,
         mut buf: PacketBuf,
@@ -677,12 +715,22 @@ impl StackInner {
             return;
         };
 
+        // Connected sockets: exact 4-tuple match.
         for (_, socket) in sockets.iter_mut() {
             if socket.accepts(&src_addr, &dst_addr, &tcp_repr) {
-                if let Some(reply) = socket.process(self.now, &mut self.rand, &src_addr, &dst_addr, &tcp_repr) {
+                if let Some(reply) = socket.process(self.now, &src_addr, &dst_addr, &tcp_repr) {
                     // Replies go back the way the segment came in.
                     self.transmit_tcp(iface, dst_addr, src_addr, 64, &reply);
                 }
+                return;
+            }
+        }
+
+        // Listeners: a SYN to a listened endpoint is recorded in the accept
+        // queue, and an RST aimed at a recorded SYN cancels it. Nothing is
+        // replied, the handshake starts when the connection is accepted.
+        for (_, listener) in listeners.iter_mut() {
+            if listener.process(&src_addr, &dst_addr, &tcp_repr) {
                 return;
             }
         }
@@ -829,6 +877,7 @@ impl StackInner {
             IpProtocol::Tcp => self.process_tcp(
                 iface,
                 &mut sockets.tcp,
+                &mut sockets.tcp_listeners,
                 IpAddress::Ipv6(src_addr),
                 IpAddress::Ipv6(dst_addr),
                 buf,

@@ -1,8 +1,8 @@
 //! TCP echo server: bring up a TUN/TAP interface and echo back everything
 //! received on TCP port 6969.
 //!
-//! There is no listen backlog: a single socket serves one connection at a time,
-//! and goes back to listening when the connection closes.
+//! A listener accepts any number of concurrent connections. Each accepted
+//! connection gets its own socket (and buffers), removed again when it closes.
 //!
 //! Run with:
 //!
@@ -63,43 +63,56 @@ fn main() {
         .routes_mut()
         .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100), iface);
 
-    let tcp_handle = stack.add_tcp_socket(4096, 4096);
+    let listener = stack.add_tcp_listener();
+    stack.tcp_listener(listener).listen(PORT).unwrap();
+    log::info!("tcp: listening on port {PORT}");
+
+    let mut connections = Vec::new();
     let mut buf = [0u8; 1024];
 
-    let mut was_active = false;
     loop {
+        // Process ingress. The socket operations below (accept, echo, close)
+        // make more segments due, which the second poll before sleeping
+        // transmits (along with recomputing the wakeup deadline).
+        stack.poll(Instant::now());
+
+        // Accept every queued connection attempt. Each accept allocates the
+        // connection's socket buffers, and the socket answers the SYN with a
+        // SYN|ACK on the next poll.
+        while let Some(handle) = stack.tcp_listener(listener).accept(4096, 4096) {
+            log::info!("tcp: connection from {}", stack.tcp(handle).remote_endpoint().unwrap());
+            connections.push(handle);
+        }
+
+        connections.retain(|&handle| {
+            let mut socket = stack.tcp(handle);
+
+            // Echo: move bytes from the receive buffer to the transmit buffer,
+            // dequeueing no more than the transmit buffer has room for.
+            while socket.can_recv() && socket.can_send() {
+                let free = socket.send_capacity() - socket.send_queue();
+                let len = buf.len().min(free);
+                let len = socket.recv_slice(&mut buf[..len]).unwrap();
+                socket.send_slice(&buf[..len]).unwrap();
+            }
+
+            // The remote endpoint closed its transmit half and everything
+            // received has been echoed back: close ours too.
+            if !socket.may_recv() && socket.may_send() {
+                socket.close();
+            }
+
+            // A fully closed socket is done: remove it from the stack.
+            if !socket.is_open() {
+                log::info!("tcp: connection closed");
+                drop(socket);
+                stack.remove_tcp_socket(handle);
+                return false;
+            }
+            true
+        });
+
         let deadline = stack.poll(Instant::now());
-
-        let mut socket = stack.tcp(tcp_handle);
-
-        if socket.is_active() && !was_active {
-            log::info!("tcp: connection from {}", socket.remote_endpoint().unwrap());
-        } else if !socket.is_active() && was_active {
-            log::info!("tcp: connection closed");
-        }
-        was_active = socket.is_active();
-
-        // A closed socket (initially, or after a connection ends) goes back to
-        // listening.
-        if !socket.is_open() {
-            log::info!("tcp: listening on port {PORT}");
-            socket.listen(PORT).unwrap();
-        }
-
-        // Echo: move bytes from the receive buffer to the transmit buffer,
-        // dequeueing no more than the transmit buffer has room for.
-        while socket.can_recv() && socket.can_send() {
-            let free = socket.send_capacity() - socket.send_queue();
-            let len = buf.len().min(free);
-            let len = socket.recv_slice(&mut buf[..len]).unwrap();
-            socket.send_slice(&buf[..len]).unwrap();
-        }
-
-        // The remote endpoint closed its transmit half and everything received
-        // has been echoed back: close ours too.
-        if !socket.may_recv() && socket.may_send() {
-            socket.close();
-        }
 
         let timeout = deadline.map(|deadline| {
             let now = Instant::now();

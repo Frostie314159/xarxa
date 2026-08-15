@@ -18,5 +18,5 @@ pub use buf::{PACKET_BUF_SIZE, PacketBuf};
 pub use raw::{RawHandle, RawMode, RawSocket};
 pub use route::{Route, Routes};
 pub use stack::{Config, IfaceHandle, Stack};
-pub use tcp::{TcpHandle, TcpSocket};
+pub use tcp::{TcpHandle, TcpListener, TcpListenerHandle, TcpSocket};
 pub use udp::{UdpHandle, UdpSocket};
