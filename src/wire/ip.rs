@@ -294,10 +294,20 @@ impl fmt::Display for Endpoint {
 
 /// An internet endpoint address for listening.
 ///
-/// In contrast with [`Endpoint`], `ListenEndpoint` allows not specifying the address,
-/// in order to listen on a given port at all our addresses.
+/// In contrast with [`Endpoint`], `ListenEndpoint` allows leaving the address
+/// unspecified, in order to listen on a given port at more than one of our
+/// addresses. The address field has three states, which are exactly the three
+/// ways a bind can be scoped:
 ///
-/// An endpoint can be constructed from a port, in which case the address is unspecified.
+/// - `None`: any address, of either IP version, a dual-stack bind.
+/// - `Some(addr)` with an unspecified address (`0.0.0.0` / `::`): any address
+///   of *that* version, and none of the other one.
+/// - `Some(addr)` with a concrete address: that address alone.
+///
+/// An endpoint can be constructed from a port alone, in which case the address
+/// is `None`, and from an (address, port) pair, in which case it is `Some`. So
+/// `(Ipv4Address::UNSPECIFIED, 80)` is the "any IPv4 address" bind, and
+/// `(Ipv6Address::UNSPECIFIED, 80)` the IPv6 one.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
 pub struct ListenEndpoint {
     pub addr: Option<Address>,
@@ -305,9 +315,23 @@ pub struct ListenEndpoint {
 }
 
 impl ListenEndpoint {
-    /// Query whether the endpoint has a specified address and port.
-    pub const fn is_specified(&self) -> bool {
-        self.addr.is_some() && self.port != 0
+    /// The fully wildcard endpoint: any address of any version, port zero.
+    pub const UNSPECIFIED: ListenEndpoint = ListenEndpoint { addr: None, port: 0 };
+
+    /// The address, if it is a concrete one, neither absent nor unspecified. That
+    /// is, one of our addresses rather than a filter over several.
+    pub fn concrete_addr(&self) -> Option<Address> {
+        self.addr.filter(|addr| !addr.is_unspecified())
+    }
+
+    /// The IP version this endpoint is restricted to, if it is restricted to one.
+    pub fn version(&self) -> Option<Version> {
+        self.addr.map(|addr| addr.version())
+    }
+
+    /// Query whether the endpoint names one concrete address and a nonzero port.
+    pub fn is_specified(&self) -> bool {
+        self.concrete_addr().is_some() && self.port != 0
     }
 }
 

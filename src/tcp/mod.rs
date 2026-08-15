@@ -10,7 +10,7 @@ use core::{fmt, mem};
 use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
 use crate::rand::Rand;
 use crate::slab::Slab;
-use crate::stack::{TxContext, alloc_ephemeral_port};
+use crate::stack::{TxContext, addr_matches, alloc_ephemeral_port};
 use crate::time::{Duration, Instant};
 use crate::wire::{
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
@@ -822,11 +822,9 @@ impl TcpSocketState {
                 && repr.src_port == tuple.remote.port
         } else {
             // We're listening, reject packets not matching the listen endpoint.
-            let addr_ok = match self.listen_endpoint.addr {
-                Some(addr) => *dst_addr == addr,
-                None => true,
-            };
-            addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port
+            addr_matches(&self.listen_endpoint, dst_addr)
+                && repr.dst_port != 0
+                && repr.dst_port == self.listen_endpoint.port
         }
     }
 
@@ -2270,6 +2268,10 @@ impl TcpSocket<'_> {
 
     /// Start listening on the given endpoint.
     ///
+    /// The endpoint's address scopes the listen. Absent, it accepts connections
+    /// to any address of either IP version. Unspecified (`0.0.0.0` / `::`), to
+    /// any address of that version alone. Concrete, to that address alone.
+    ///
     /// This function returns `Err(Error::InvalidState)` if the socket was already open
     /// (see [is_open](#method.is_open)), and `Err(Error::Unaddressable)`
     /// if the port in the given endpoint is zero.
@@ -2312,7 +2314,8 @@ impl TcpSocket<'_> {
     /// range, picked at a random starting point, avoiding every port in use by
     /// another TCP socket), and the local address, if not provided, is selected
     /// by the stack from the remote address. So the common case is simply
-    /// `connect(remote, 0)`.
+    /// `connect(remote, 0)`. An unspecified local address (`0.0.0.0` / `::`) is
+    /// selected the same way, but asserts the IP version the connection must be.
     ///
     /// This function returns an error if the socket was open (see
     /// [is_open](#method.is_open)). It also returns an error if the remote port
@@ -2344,16 +2347,15 @@ impl TcpSocket<'_> {
             .ok_or(ConnectError::NoFreePorts)?;
         }
 
-        // If local address is not provided, choose it automatically.
+        // If a concrete local address is not provided, choose it automatically.
+        // An unspecified one still pins the IP version the connection must be.
         let local_endpoint = IpEndpoint {
             addr: match local_endpoint.addr {
-                Some(addr) => {
-                    if addr.is_unspecified() {
-                        return Err(ConnectError::Unaddressable);
-                    }
-                    addr
+                Some(addr) if !addr.is_unspecified() => addr,
+                Some(addr) if addr.version() != remote_endpoint.addr.version() => {
+                    return Err(ConnectError::Unaddressable);
                 }
-                None => self
+                _ => self
                     .tx
                     .get_source_address(&remote_endpoint.addr)
                     .ok_or(ConnectError::Unaddressable)?,
@@ -2708,7 +2710,7 @@ mod test {
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface, Medium};
     use crate::stack::{Config, Stack};
-    use crate::wire::{EthernetAddress, IpCidr, Ipv4Address};
+    use crate::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv6Address};
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
 
@@ -2734,6 +2736,8 @@ mod test {
     const LOCAL_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 1);
     const REMOTE_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 2);
     const OTHER_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 1, 3);
+    /// The unspecified address of the *other* IP version than the one under test.
+    const OTHER_VERSION_ANY: IpAddress = IpAddress::Ipv6(Ipv6Address::UNSPECIFIED);
 
     const BASE_MSS: u16 = 1460;
 
@@ -2835,7 +2839,7 @@ mod test {
         let dst_addr = IpAddress::from(LOCAL_ADDR);
         net_trace!("send: {}", repr);
 
-        assert!(socket.sockets.get_mut(0).accepts(&src_addr, &dst_addr, repr));
+        assert!(socket.sockets.get(0).accepts(&src_addr, &dst_addr, repr));
 
         match socket
             .sockets
@@ -3109,7 +3113,11 @@ mod test {
             control: TcpControl::Syn,
             ..SEND_TEMPL
         };
-        assert!(!s.accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr));
+        assert!(
+            !s.sockets
+                .get(0)
+                .accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
+        );
     }
 
     #[test]
@@ -3122,7 +3130,11 @@ mod test {
             control: TcpControl::Syn,
             ..SEND_TEMPL
         };
-        assert!(!s.accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr));
+        assert!(
+            !s.sockets
+                .get(0)
+                .accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
+        );
     }
 
     #[test]
@@ -3320,7 +3332,11 @@ mod test {
             ack_number: Some(LOCAL_SEQ),
             ..SEND_TEMPL
         };
-        assert!(!s.accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr));
+        assert!(
+            !s.sockets
+                .get(0)
+                .accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
+        );
 
         assert_eq!(s.state, State::Listen);
     }
@@ -3334,7 +3350,11 @@ mod test {
             ack_number: None,
             ..SEND_TEMPL
         };
-        assert!(!s.accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr));
+        assert!(
+            !s.sockets
+                .get(0)
+                .accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
+        );
         assert_eq!(s.state, State::Listen);
     }
 
@@ -3597,20 +3617,26 @@ mod test {
     fn test_connect_validation() {
         let mut s = socket();
         assert_eq!(
-            s.view().connect(REMOTE_END, (IpvXAddress::UNSPECIFIED, 0)),
-            Err(ConnectError::Unaddressable)
-        );
-        assert_eq!(
-            s.view().connect(REMOTE_END, (IpvXAddress::UNSPECIFIED, 1024)),
-            Err(ConnectError::Unaddressable)
-        );
-        assert_eq!(
             s.view().connect((IpvXAddress::UNSPECIFIED, 0), LOCAL_END),
+            Err(ConnectError::Unaddressable)
+        );
+        // An unspecified local address of the other IP version is not a wildcard,
+        // it is a contradiction.
+        assert_eq!(
+            s.view().connect(REMOTE_END, (OTHER_VERSION_ANY, LOCAL_PORT)),
             Err(ConnectError::Unaddressable)
         );
         s.view()
             .connect(REMOTE_END, LOCAL_END)
             .expect("Connect failed with valid parameters");
+        assert_eq!(s.tuple, Some(TUPLE));
+
+        // An unspecified local address of the connection's own version means
+        // "select it automatically", like leaving it out entirely.
+        let mut s = socket();
+        s.view()
+            .connect(REMOTE_END, (IpvXAddress::UNSPECIFIED, LOCAL_PORT))
+            .expect("Connect failed with auto-selected local address");
         assert_eq!(s.tuple, Some(TUPLE));
     }
 
@@ -8249,7 +8275,7 @@ mod test {
     fn test_listen_timeout() {
         let mut s = socket_listen();
         s.view().set_timeout(Some(Duration::from_millis(100)));
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Ingress);
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Ingress);
     }
 
     #[test]
@@ -8268,7 +8294,7 @@ mod test {
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::SynSent);
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(250)));
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(250)));
         recv!(s, time 250, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
@@ -8284,23 +8310,23 @@ mod test {
         let mut s = socket_established();
         s.view().set_timeout(Some(Duration::from_millis(2000)));
         recv_nothing!(s, time 250);
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(2250)));
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(2250)));
         s.view().send_slice(b"abcdef").unwrap();
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Now);
         recv!(s, time 255, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(1255)));
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(1255)));
         recv!(s, time 1255, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(2255)));
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(2255)));
         recv!(s, time 2255, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1 + 6,
@@ -8322,13 +8348,13 @@ mod test {
             ..RECV_TEMPL
         }));
         recv_nothing!(s, time 100);
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(150)));
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(150)));
         send!(s, time 105, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         });
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(155)));
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(155)));
         recv!(s, time 155, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -8336,7 +8362,7 @@ mod test {
             ..RECV_TEMPL
         }));
         recv_nothing!(s, time 155);
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(205)));
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(205)));
         recv_nothing!(s, time 200);
         recv!(s, time 205, Ok(TcpRepr {
             control:    TcpControl::Rst,
@@ -8392,14 +8418,14 @@ mod test {
         s.view().set_timeout(Some(Duration::from_millis(200)));
         s.remote_last_ts = Some(Instant::from_millis(100));
         s.view().abort();
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Now);
         recv!(s, time 100, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Ingress);
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Ingress);
     }
 
     // =========================================================================================//
@@ -8430,7 +8456,7 @@ mod test {
         s.view().set_keep_alive(Some(Duration::from_millis(100)));
 
         // drain the forced keep-alive packet
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Now);
         recv!(s, time 0, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -8438,7 +8464,7 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(100)));
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(100)));
         recv_nothing!(s, time 95);
         recv!(s, time 100, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -8447,7 +8473,7 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(200)));
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(200)));
         recv_nothing!(s, time 195);
         recv!(s, time 200, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -8461,7 +8487,7 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         });
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(350)));
+        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(350)));
         recv_nothing!(s, time 345);
         recv!(s, time 350, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -9162,7 +9188,11 @@ mod test {
             dst_port: LOCAL_PORT + 1,
             ..SEND_TEMPL
         };
-        assert!(!s.accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr));
+        assert!(
+            !s.sockets
+                .get(0)
+                .accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
+        );
 
         let tcp_repr = TcpRepr {
             seq_number: REMOTE_SEQ + 1,
@@ -9170,7 +9200,11 @@ mod test {
             src_port: REMOTE_PORT + 1,
             ..SEND_TEMPL
         };
-        assert!(!s.accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr));
+        assert!(
+            !s.sockets
+                .get(0)
+                .accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
+        );
     }
 
     #[test]
@@ -9184,13 +9218,25 @@ mod test {
             ..SEND_TEMPL
         };
 
-        assert!(s.accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr));
+        assert!(
+            s.sockets
+                .get(0)
+                .accepts(&REMOTE_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
+        );
 
         // Wrong source address.
-        assert!(!s.accepts(&OTHER_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr));
+        assert!(
+            !s.sockets
+                .get(0)
+                .accepts(&OTHER_ADDR.into(), &LOCAL_ADDR.into(), &tcp_repr)
+        );
 
         // Wrong destination address.
-        assert!(!s.accepts(&REMOTE_ADDR.into(), &OTHER_ADDR.into(), &tcp_repr));
+        assert!(
+            !s.sockets
+                .get(0)
+                .accepts(&REMOTE_ADDR.into(), &OTHER_ADDR.into(), &tcp_repr)
+        );
     }
 
     // =========================================================================================//

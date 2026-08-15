@@ -64,8 +64,8 @@ impl fmt::Display for UdpMetadata {
 pub enum BindError {
     /// The socket is already bound.
     InvalidState,
-    /// Another UDP socket's binding overlaps this one: same port, and one of the
-    /// two binds is address-less or both name the same address.
+    /// Another UDP socket's binding overlaps this one: same port, and address
+    /// filters that can both match one address.
     InUse,
     /// No free port in the ephemeral range (only possible with tens of thousands
     /// of bound sockets).
@@ -213,6 +213,19 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
     (meta, payload)
 }
 
+/// Whether two bind address filters can both match one address, i.e. whether binding
+/// both would leave ingress demux with two equally good candidates.
+///
+/// The per-version wildcards are what make this more than an equality test: a bind to
+/// any IPv4 address overlaps every IPv4 bind and no IPv6 one.
+fn addrs_overlap(a: IpListenEndpoint, b: IpListenEndpoint) -> bool {
+    match (a.addr, b.addr) {
+        (None, _) | (_, None) => true,
+        (Some(a), Some(b)) if a.is_unspecified() || b.is_unspecified() => a.version() == b.version(),
+        (Some(a), Some(b)) => a == b,
+    }
+}
+
 /// A UDP socket borrowed from a [`Stack`], returned by [`Stack::udp`].
 ///
 /// [`Stack`]: crate::Stack
@@ -266,12 +279,18 @@ impl UdpSocket<'_> {
 
     /// Bind the socket to the given endpoint.
     ///
+    /// The endpoint's address scopes the bind. Absent, it matches any address of
+    /// either IP version. Unspecified (`0.0.0.0` / `::`), any address of that
+    /// version alone. Concrete, that address alone.
+    ///
     /// A port of zero means "allocate an ephemeral port": a free port in the
     /// 49152..=65535 range, picked at a random starting point. An explicit port
-    /// that overlaps another UDP socket's binding (same port, and either bind is
-    /// address-less or both name the same address) is rejected, since each
-    /// datagram is handed to a single socket and the binds would shadow each
-    /// other.
+    /// that overlaps another UDP socket's binding (same port, and address filters
+    /// that can both match one address) is rejected, since each datagram is handed
+    /// to a single socket and the binds would shadow each other. Binds that cannot
+    /// overlap are allowed, so the two halves of a dual stack,
+    /// `(Ipv4Address::UNSPECIFIED, port)` and `(Ipv6Address::UNSPECIFIED, port)`,
+    /// can be served by two sockets.
     ///
     /// Returns `Err(BindError::InvalidState)` if the socket is already bound (see
     /// [is_open](#method.is_open)), `Err(BindError::InUse)` on an overlapping
@@ -291,11 +310,11 @@ impl UdpSocket<'_> {
                 sockets.iter().any(|(i, s)| i != index && s.endpoint.port == port)
             })
             .ok_or(BindError::NoFreePorts)?;
-        } else if self.sockets.iter().any(|(i, s)| {
-            i != self.index
-                && s.endpoint.port == endpoint.port
-                && (s.endpoint.addr.is_none() || endpoint.addr.is_none() || s.endpoint.addr == endpoint.addr)
-        }) {
+        } else if self
+            .sockets
+            .iter()
+            .any(|(i, s)| i != self.index && s.endpoint.port == endpoint.port && addrs_overlap(s.endpoint, endpoint))
+        {
             return Err(BindError::InUse);
         }
 
@@ -420,10 +439,19 @@ impl UdpSocket<'_> {
         if meta.endpoint.addr.is_unspecified() || meta.endpoint.port == 0 {
             return Err(SendError::Unaddressable);
         }
+        // A bind scoped to one IP version cannot send over the other: the replies
+        // would arrive on a version its own ingress filter drops.
+        if endpoint
+            .version()
+            .is_some_and(|version| version != meta.endpoint.addr.version())
+        {
+            return Err(SendError::Unaddressable);
+        }
 
         // Pick the source address: explicit in the metadata, else the socket's bound
-        // address, else one chosen from the destination.
-        let src_addr = match meta.local_address.or(endpoint.addr) {
+        // address (only a concrete one is an address, the wildcards are filters),
+        // else one chosen from the destination.
+        let src_addr = match meta.local_address.or(endpoint.concrete_addr()) {
             Some(addr) => addr,
             None => self
                 .tx
@@ -516,11 +544,20 @@ impl StackInner {
             if socket.endpoint.port != dst_port {
                 continue;
             }
-            if let Some(addr) = socket.endpoint.addr
-                && addr != dst_addr
-                && !dst_is_bcast
-            {
-                continue;
+            // The broadcast relaxation applies to the address, never to the IP
+            // version: a socket bound to any IPv4 address is not an IPv6 socket.
+            match socket.endpoint.addr {
+                None => {}
+                Some(addr) if addr.is_unspecified() => {
+                    if addr.version() != dst_addr.version() {
+                        continue;
+                    }
+                }
+                Some(addr) => {
+                    if addr != dst_addr && !dst_is_bcast {
+                        continue;
+                    }
+                }
             }
 
             net_trace!(
@@ -543,7 +580,7 @@ impl StackInner {
 mod test {
     use super::*;
     use crate::stack::Stack;
-    use crate::wire::Ipv4Address;
+    use crate::wire::{Ipv4Address, Ipv6Address};
 
     fn stack_with_socket() -> (Stack, UdpHandle) {
         let mut stack = Stack::new();
@@ -645,6 +682,46 @@ mod test {
         stack.udp(h4).bind((OTHER_ADDR, LOCAL_PORT + 2)).unwrap();
         // ...but the same specific address may not.
         assert_eq!(stack.udp(h5).bind((LOCAL_ADDR, LOCAL_PORT + 2)), Err(BindError::InUse));
+    }
+
+    #[test]
+    fn test_bind_conflicts_per_version() {
+        let mut stack = Stack::new();
+        let h1 = stack.add_udp_socket();
+        let h2 = stack.add_udp_socket();
+        let h3 = stack.add_udp_socket();
+        let h4 = stack.add_udp_socket();
+
+        // The two halves of a dual stack can never match the same datagram, so
+        // they may share a port.
+        stack.udp(h1).bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT)).unwrap();
+        stack.udp(h2).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT)).unwrap();
+
+        // A concrete address does overlap the wildcard of its own version...
+        assert_eq!(stack.udp(h3).bind((LOCAL_ADDR, LOCAL_PORT)), Err(BindError::InUse));
+        // ...and so does the address-less bind, which matches both versions.
+        assert_eq!(stack.udp(h3).bind(LOCAL_PORT), Err(BindError::InUse));
+
+        // A different port is fine, and then the address-less bind takes both
+        // versions away from anything that would follow it.
+        stack.udp(h3).bind(LOCAL_PORT + 1).unwrap();
+        assert_eq!(
+            stack.udp(h4).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT + 1)),
+            Err(BindError::InUse)
+        );
+    }
+
+    #[test]
+    fn test_send_per_version_bind() {
+        let (mut stack, handle) = stack_with_socket();
+        let mut socket = stack.udp(handle);
+        socket.bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT)).unwrap();
+
+        // The bind scopes the socket to IPv6, so an IPv4 destination contradicts it.
+        assert_eq!(
+            socket.send_slice(b"hi", (REMOTE_ADDR, REMOTE_PORT)),
+            Err(SendError::Unaddressable)
+        );
     }
 
     #[test]

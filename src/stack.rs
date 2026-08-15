@@ -187,6 +187,17 @@ impl TxContext<'_> {
     }
 }
 
+/// Query whether `addr` falls within a bind's address filter. No address matches
+/// anything, an unspecified one matches its own IP version, and a concrete one
+/// matches only itself.
+pub(crate) fn addr_matches(filter: &IpListenEndpoint, addr: &IpAddress) -> bool {
+    match filter.addr {
+        None => true,
+        Some(a) if a.is_unspecified() => a.version() == addr.version(),
+        Some(a) => a == *addr,
+    }
+}
+
 /// The bottom of the ephemeral (dynamic) local port range, per IANA. The range
 /// runs to the top of the port space, 65535.
 pub(crate) const EPHEMERAL_PORT_MIN: u16 = 49152;
