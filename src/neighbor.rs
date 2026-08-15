@@ -1,6 +1,8 @@
 // Heads up! Before working on this file you should read, at least,
 // the parts of RFC 1122 that discuss ARP, and RFC 4861 § 7.2 and § 7.3.
 
+use alloc::vec::Vec;
+
 use crate::buf::PacketBuf;
 use crate::stack::IfaceHandle;
 use crate::time::{Duration, Instant};

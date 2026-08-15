@@ -1,7 +1,8 @@
 //! Owned packet buffers.
 
+use alloc::boxed::Box;
 use core::fmt;
-use std::ops::{Deref, DerefMut};
+use core::ops::{Deref, DerefMut};
 
 /// Size of the buffer in a [`PacketBuf`].
 ///

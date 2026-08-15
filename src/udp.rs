@@ -15,9 +15,9 @@
 //! The addresses returned in [`UdpMetadata`] are parsed back out of those header
 //! bytes.
 
+use alloc::collections::VecDeque;
 use core::fmt;
 use core::ops::{Deref, Range};
-use std::collections::VecDeque;
 
 use crate::buf::PacketBuf;
 use crate::slab::Slab;

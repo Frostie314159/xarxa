@@ -6,6 +6,7 @@
 // by the tests.
 #![allow(dead_code)]
 
+use alloc::vec::Vec;
 use core::cmp;
 
 /// Error returned when enqueuing into a full buffer.

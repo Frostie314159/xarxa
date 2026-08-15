@@ -14,6 +14,8 @@
 //! [`Stack::routes`]: crate::Stack::routes
 //! [`Stack::routes_mut`]: crate::Stack::routes_mut
 
+use alloc::vec::Vec;
+
 use crate::stack::IfaceHandle;
 use crate::time::Instant;
 use crate::wire::{IpAddress, IpCidr, Ipv4Address, Ipv4Cidr, Ipv6Address, Ipv6Cidr};

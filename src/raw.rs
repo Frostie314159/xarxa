@@ -9,8 +9,8 @@
 //! - **IP mode** ([`RawMode::Ip`]): whole IP packets on all interfaces. The socket may be
 //!   bound to an IP version and/or an IP protocol, both optional.
 
+use alloc::collections::VecDeque;
 use core::fmt;
-use std::collections::VecDeque;
 
 use crate::buf::PacketBuf;
 use crate::iface::Medium;

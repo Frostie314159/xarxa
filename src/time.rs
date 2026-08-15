@@ -63,6 +63,7 @@ impl Instant {
     ///
     /// [std::time::SystemTime]: https://doc.rust-lang.org/std/time/struct.SystemTime.html
     /// [std::time::SystemTime::now]: https://doc.rust-lang.org/std/time/struct.SystemTime.html#method.now
+    #[cfg(feature = "std")]
     pub fn now() -> Instant {
         Self::from(::std::time::SystemTime::now())
     }
@@ -97,6 +98,7 @@ impl Instant {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<::std::time::Instant> for Instant {
     fn from(other: ::std::time::Instant) -> Instant {
         static REFERENTIAL: ::std::sync::LazyLock<::std::time::Instant> =
@@ -107,6 +109,7 @@ impl From<::std::time::Instant> for Instant {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<::std::time::SystemTime> for Instant {
     fn from(other: ::std::time::SystemTime) -> Instant {
         let n = other
@@ -116,6 +119,7 @@ impl From<::std::time::SystemTime> for Instant {
     }
 }
 
+#[cfg(feature = "std")]
 impl From<Instant> for ::std::time::SystemTime {
     fn from(val: Instant) -> Self {
         ::std::time::UNIX_EPOCH + ::std::time::Duration::from_micros(val.micros as u64)

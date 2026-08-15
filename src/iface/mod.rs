@@ -13,8 +13,10 @@ receive frames on the host OS.
 
 use crate::buf::PacketBuf;
 
+#[cfg(feature = "std")]
 mod tuntap;
 
+#[cfg(feature = "std")]
 pub use self::tuntap::TunTapInterface;
 
 /// Type of medium of an interface.
@@ -62,6 +64,7 @@ pub trait Interface {
 }
 
 /// Wait until given file descriptor becomes readable, but no longer than given timeout.
+#[cfg(feature = "std")]
 pub fn wait(fd: std::os::unix::io::RawFd, duration: Option<std::time::Duration>) -> std::io::Result<()> {
     use std::{io, mem, ptr};
 

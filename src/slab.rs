@@ -1,5 +1,7 @@
 //! Vector of reusable slots addressed by plain indexes.
 
+use alloc::vec::Vec;
+
 pub(crate) struct Slab<T> {
     slots: Vec<Option<T>>,
 }

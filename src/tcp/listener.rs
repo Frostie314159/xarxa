@@ -1,6 +1,7 @@
 //! TCP listeners.
 
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
+use alloc::vec;
 
 use super::{
     DEFAULT_MSS, ListenError, MIN_REMOTE_MSS, SocketBuffer, State, TcpControl, TcpHandle, TcpRepr, TcpSocketState,
