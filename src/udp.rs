@@ -8,8 +8,8 @@
 //!
 //! A single [`bind`](UdpSocket::bind) call pins down (parts of) the socket's
 //! 4-tuple, local and remote halves at once, each part exact or wildcard. Binding
-//! to port 0 allocates an ephemeral port, and binds that would shadow another
-//! socket are rejected.
+//! to port 0 allocates an ephemeral port, and binding an identical 4-tuple to
+//! another socket's is rejected.
 //!
 //! Received packets are queued with their IP and UDP headers still in the buffer.
 //! The addresses returned in [`UdpMetadata`] are parsed back out of those header
@@ -66,8 +66,7 @@ impl fmt::Display for UdpMetadata {
 pub enum BindError {
     /// The socket is already bound.
     InvalidState,
-    /// Another UDP socket's binding overlaps this one: same port, and address
-    /// filters that can both match one address.
+    /// Another UDP socket holds an identical 4-tuple.
     InUse,
     /// No free port in the ephemeral range (only possible with tens of thousands
     /// of bound sockets).
@@ -227,19 +226,6 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
     (meta, payload)
 }
 
-/// Whether two bind address filters can both match one address, i.e. whether binding
-/// both would leave ingress demux with two equally good candidates.
-///
-/// The per-version wildcards are what make this more than an equality test: a bind to
-/// any IPv4 address overlaps every IPv4 bind and no IPv6 one.
-fn addrs_overlap(a: IpListenEndpoint, b: IpListenEndpoint) -> bool {
-    match (a.addr, b.addr) {
-        (None, _) | (_, None) => true,
-        (Some(a), Some(b)) if a.is_unspecified() || b.is_unspecified() => a.version() == b.version(),
-        (Some(a), Some(b)) => a == b,
-    }
-}
-
 /// A UDP socket borrowed from a [`Stack`], returned by [`Stack::udp`].
 ///
 /// [`Stack`]: crate::Stack
@@ -325,15 +311,18 @@ impl UdpSocket<'_> {
     /// not all-or-nothing: e.g. a remote with only the address specified accepts
     /// any port of that one peer.
     ///
-    /// An explicit local port that overlaps another UDP socket's binding (same
-    /// port, and address filters that can both match one address) is rejected,
-    /// since each datagram is handed to a single socket and the binds would shadow
-    /// each other. Binds that cannot overlap are allowed, so the two halves of a
-    /// dual stack, `(Ipv4Address::UNSPECIFIED, port)` and
-    /// `(Ipv6Address::UNSPECIFIED, port)`, can be served by two sockets.
+    /// A bind is rejected only if another UDP socket holds the *identical*
+    /// 4-tuple. Sharing a local port is fine as long as the tuples differ
+    /// (e.g. a connected socket next to a wildcard server socket, two sockets
+    /// connected to different remotes, or the two halves of a dual stack,
+    /// `(Ipv4Address::UNSPECIFIED, port)` and `(Ipv6Address::UNSPECIFIED,
+    /// port)`). Distinct overlapping tuples are never ambiguous, since each
+    /// datagram is handed to the most specific match. Ephemeral allocation
+    /// applies the same rule, so connected sockets can reuse ports held by
+    /// sockets with a different remote.
     ///
     /// Returns `Err(BindError::InvalidState)` if the socket is already bound (see
-    /// [is_open](#method.is_open)), `Err(BindError::InUse)` on an overlapping
+    /// [is_open](#method.is_open)), `Err(BindError::InUse)` on an identical
     /// bind, `Err(BindError::NoFreePorts)` if the ephemeral range is exhausted,
     /// and `Err(BindError::Unaddressable)` on an address family mismatch or if
     /// no local address is available for the given remote.
@@ -370,19 +359,22 @@ impl UdpSocket<'_> {
             );
         }
 
+        // Only an *identical* 4-tuple conflicts: any difference (a wildcard vs.
+        // an exact part included) is resolved by demux picking the most
+        // specific match, so nothing is shadowed.
+        let (sockets, index) = (&self.sockets, self.index);
+        let in_use = |local: IpListenEndpoint| {
+            sockets
+                .iter()
+                .any(|(i, s)| i != index && s.local == local && s.remote == remote)
+        };
+
         if local.port == 0 {
-            // Skip every port any other UDP socket has bound, regardless of
-            // address.
-            let (sockets, index) = (&self.sockets, self.index);
             local.port = alloc_ephemeral_port(self.tx.rand(), |port| {
-                sockets.iter().any(|(i, s)| i != index && s.local.port == port)
+                in_use(IpListenEndpoint { addr: local.addr, port })
             })
             .ok_or(BindError::NoFreePorts)?;
-        } else if self
-            .sockets
-            .iter()
-            .any(|(i, s)| i != self.index && s.local.port == local.port && addrs_overlap(s.local, local))
-        {
+        } else if in_use(local) {
             return Err(BindError::InUse);
         }
 
@@ -819,13 +811,12 @@ mod test {
         let h1 = stack.add_udp_socket();
         let h2 = stack.add_udp_socket();
 
-        // Address-less binds conflict on the port alone.
+        // Identical 4-tuples conflict.
         stack.udp(h1).bind(LOCAL_PORT, ANY).unwrap();
         assert_eq!(stack.udp(h2).bind(LOCAL_PORT, ANY), Err(BindError::InUse));
-        // A specific address conflicts with an address-less bind on the same port.
-        assert_eq!(stack.udp(h2).bind((LOCAL_ADDR, LOCAL_PORT), ANY), Err(BindError::InUse));
-        // A different port is fine.
-        stack.udp(h2).bind(LOCAL_PORT + 1, ANY).unwrap();
+        // A specific address next to an address-less bind on the same port is
+        // fine: the tuples differ, and demux picks the most specific match.
+        stack.udp(h2).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
 
         // Two different specific addresses may share a port.
         let h3 = stack.add_udp_socket();
@@ -841,28 +832,46 @@ mod test {
     }
 
     #[test]
-    fn test_bind_conflicts_per_version() {
-        let mut stack = Stack::new();
+    fn test_bind_conflicts_connected() {
+        let mut stack = stack_with_iface();
         let h1 = stack.add_udp_socket();
         let h2 = stack.add_udp_socket();
         let h3 = stack.add_udp_socket();
         let h4 = stack.add_udp_socket();
 
-        // The two halves of a dual stack can never match the same datagram, so
-        // they may share a port.
+        // A connected socket and a wildcard-remote socket share a local port:
+        // the 4-tuples differ.
+        stack.udp(h1).bind(LOCAL_PORT, (REMOTE_ADDR, REMOTE_PORT)).unwrap();
+        stack.udp(h2).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
+
+        // So do two sockets connected to different remotes.
+        stack.udp(h3).bind(LOCAL_PORT, (OTHER_ADDR, REMOTE_PORT)).unwrap();
+
+        // The identical local + remote is rejected. (h1's local address was
+        // resolved to LOCAL_ADDR, so this bind duplicates its whole tuple.)
+        assert_eq!(
+            stack.udp(h4).bind((LOCAL_ADDR, LOCAL_PORT), (REMOTE_ADDR, REMOTE_PORT)),
+            Err(BindError::InUse)
+        );
+    }
+
+    #[test]
+    fn test_bind_conflicts_per_version() {
+        let mut stack = Stack::new();
+        let h1 = stack.add_udp_socket();
+        let h2 = stack.add_udp_socket();
+        let h3 = stack.add_udp_socket();
+
+        // The two halves of a dual stack are different tuples, so they may
+        // share a port, as may the address-less bind that covers both.
         stack.udp(h1).bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT), ANY).unwrap();
         stack.udp(h2).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY).unwrap();
+        stack.udp(h3).bind(LOCAL_PORT, ANY).unwrap();
+        stack.udp(h3).close();
 
-        // A concrete address does overlap the wildcard of its own version...
-        assert_eq!(stack.udp(h3).bind((LOCAL_ADDR, LOCAL_PORT), ANY), Err(BindError::InUse));
-        // ...and so does the address-less bind, which matches both versions.
-        assert_eq!(stack.udp(h3).bind(LOCAL_PORT, ANY), Err(BindError::InUse));
-
-        // A different port is fine, and then the address-less bind takes both
-        // versions away from anything that would follow it.
-        stack.udp(h3).bind(LOCAL_PORT + 1, ANY).unwrap();
+        // Identity does distinguish the versions: only the same half conflicts.
         assert_eq!(
-            stack.udp(h4).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT + 1), ANY),
+            stack.udp(h3).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY),
             Err(BindError::InUse)
         );
     }

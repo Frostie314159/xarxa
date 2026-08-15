@@ -80,6 +80,8 @@ pub enum ConnectError {
     /// No free port in the ephemeral range (only possible with tens of thousands
     /// of open sockets).
     NoFreePorts,
+    /// Another TCP socket already holds the identical 4-tuple.
+    InUse,
 }
 
 impl Display for ConnectError {
@@ -88,6 +90,7 @@ impl Display for ConnectError {
             ConnectError::InvalidState => write!(f, "invalid state"),
             ConnectError::Unaddressable => write!(f, "unaddressable destination"),
             ConnectError::NoFreePorts => write!(f, "no free ports"),
+            ConnectError::InUse => write!(f, "4-tuple in use"),
         }
     }
 }
@@ -2311,11 +2314,19 @@ impl TcpSocket<'_> {
     ///
     /// The local endpoint may be left mostly unspecified: a local port of zero
     /// means "allocate an ephemeral port" (a free port in the 49152..=65535
-    /// range, picked at a random starting point, avoiding every port in use by
-    /// another TCP socket), and the local address, if not provided, is selected
-    /// by the stack from the remote address. So the common case is simply
-    /// `connect(remote, 0)`. An unspecified local address (`0.0.0.0` / `::`) is
-    /// selected the same way, but asserts the IP version the connection must be.
+    /// range, picked at a random starting point), and the local address, if not
+    /// provided, is selected by the stack from the remote address. So the
+    /// common case is simply `connect(remote, 0)`. An unspecified local address
+    /// (`0.0.0.0` / `::`) is selected the same way, but asserts the IP version
+    /// the connection must be.
+    ///
+    /// Only the full 4-tuple must be unique, not the local port: two sockets
+    /// may connect from the same local port as long as the remote (or the
+    /// local address) differs. Ingress matches connected sockets by exact
+    /// tuple, so distinct tuples are never ambiguous. Ephemeral allocation
+    /// applies the same rule (it only additionally avoids ports listened on),
+    /// and an explicit local endpoint that would duplicate another socket's
+    /// tuple is rejected with `Err(ConnectError::InUse)`.
     ///
     /// This function returns an error if the socket was open (see
     /// [is_open](#method.is_open)). It also returns an error if the remote port
@@ -2326,7 +2337,7 @@ impl TcpSocket<'_> {
         U: Into<IpListenEndpoint>,
     {
         let remote_endpoint: IpEndpoint = remote_endpoint.into();
-        let mut local_endpoint: IpListenEndpoint = local_endpoint.into();
+        let local: IpListenEndpoint = local_endpoint.into();
 
         if self.is_open() {
             return Err(ConnectError::InvalidState);
@@ -2335,36 +2346,46 @@ impl TcpSocket<'_> {
             return Err(ConnectError::Unaddressable);
         }
 
-        if local_endpoint.port == 0 {
-            // Allocate an ephemeral port, skipping every port in use by another
-            // TCP socket.
-            let (sockets, index) = (&self.sockets, self.index);
-            local_endpoint.port = alloc_ephemeral_port(self.tx.rand(), |port| {
-                sockets.iter().any(|(i, s)| {
-                    i != index && (s.listen_endpoint.port == port || s.tuple.is_some_and(|t| t.local.port == port))
-                })
-            })
-            .ok_or(ConnectError::NoFreePorts)?;
-        }
-
-        // If a concrete local address is not provided, choose it automatically.
-        // An unspecified one still pins the IP version the connection must be.
-        let local_endpoint = IpEndpoint {
-            addr: match local_endpoint.addr {
-                Some(addr) if !addr.is_unspecified() => addr,
-                Some(addr) if addr.version() != remote_endpoint.addr.version() => {
+        // Resolve the local address up front: conflicts are decided on the full,
+        // concrete 4-tuple. An unspecified local address is selected from the
+        // remote like a missing one, but restricts the IP version first.
+        let local_addr = match local.concrete_addr() {
+            Some(addr) => addr,
+            None => {
+                if let Some(version) = local.version()
+                    && version != remote_endpoint.addr.version()
+                {
                     return Err(ConnectError::Unaddressable);
                 }
-                _ => self
-                    .tx
+                self.tx
                     .get_source_address(&remote_endpoint.addr)
-                    .ok_or(ConnectError::Unaddressable)?,
-            },
-            port: local_endpoint.port,
+                    .ok_or(ConnectError::Unaddressable)?
+            }
+        };
+        let mut local_endpoint = IpEndpoint::new(local_addr, local.port);
+
+        let (sockets, index) = (&self.sockets, self.index);
+        let tuple_in_use = |local: IpEndpoint| {
+            sockets.iter().any(|(i, s)| {
+                i != index
+                    && s.tuple
+                        == Some(Tuple {
+                            local,
+                            remote: remote_endpoint,
+                        })
+            })
         };
 
-        if local_endpoint.addr.version() != remote_endpoint.addr.version() {
-            return Err(ConnectError::Unaddressable);
+        if local_endpoint.port == 0 {
+            local_endpoint.port = alloc_ephemeral_port(self.tx.rand(), |port| {
+                tuple_in_use(IpEndpoint::new(local_endpoint.addr, port))
+                    || sockets
+                        .iter()
+                        .any(|(i, s)| i != index && s.listen_endpoint.port == port)
+            })
+            .ok_or(ConnectError::NoFreePorts)?;
+        } else if tuple_in_use(local_endpoint) {
+            return Err(ConnectError::InUse);
         }
 
         let seq = TcpSocketState::random_seq_no(self.tx.rand());
@@ -2839,7 +2860,7 @@ mod test {
         let dst_addr = IpAddress::from(LOCAL_ADDR);
         net_trace!("send: {}", repr);
 
-        assert!(socket.sockets.get(0).accepts(&src_addr, &dst_addr, repr));
+        assert!(socket.sockets.get_mut(0).accepts(&src_addr, &dst_addr, repr));
 
         match socket
             .sockets
@@ -3769,7 +3790,8 @@ mod test {
         let p1 = stack.tcp(h1).local_endpoint().unwrap().port;
         assert!(p1 >= EPHEMERAL_PORT_MIN);
 
-        // A second allocation skips the port the first socket claimed.
+        // A second connection to the same remote would duplicate the 4-tuple,
+        // so the allocation skips the port the first socket claimed.
         stack.tcp(h2).connect(REMOTE_END, (LOCAL_ADDR, 0)).unwrap();
         let p2 = stack.tcp(h2).local_endpoint().unwrap().port;
         assert!(p2 >= EPHEMERAL_PORT_MIN);
@@ -3785,6 +3807,37 @@ mod test {
         stack2.tcp(client).connect(REMOTE_END, (LOCAL_ADDR, 0)).unwrap();
         let pc = stack2.tcp(client).local_endpoint().unwrap().port;
         assert_ne!(pc, p1);
+    }
+
+    #[test]
+    fn test_connect_tuple_conflicts() {
+        const OTHER_REMOTE_END: IpEndpoint = IpEndpoint {
+            addr: IpAddress::Ipv4(OTHER_ADDR),
+            port: REMOTE_PORT,
+        };
+
+        let mut stack = Stack::new();
+        let h1 = stack.add_tcp_socket(64, 64);
+        let h2 = stack.add_tcp_socket(64, 64);
+        let h3 = stack.add_tcp_socket(64, 64);
+        let h4 = stack.add_tcp_socket(64, 64);
+
+        stack.tcp(h1).connect(REMOTE_END, (LOCAL_ADDR, LOCAL_PORT)).unwrap();
+
+        // Only the full 4-tuple must be unique: the same local endpoint may
+        // connect to a different remote...
+        stack
+            .tcp(h2)
+            .connect(OTHER_REMOTE_END, (LOCAL_ADDR, LOCAL_PORT))
+            .unwrap();
+        // ...and a different local address may connect to the same remote.
+        stack.tcp(h3).connect(REMOTE_END, (OTHER_ADDR, LOCAL_PORT)).unwrap();
+
+        // The identical 4-tuple is rejected.
+        assert_eq!(
+            stack.tcp(h4).connect(REMOTE_END, (LOCAL_ADDR, LOCAL_PORT)),
+            Err(ConnectError::InUse)
+        );
     }
 
     #[test]
@@ -8275,7 +8328,7 @@ mod test {
     fn test_listen_timeout() {
         let mut s = socket_listen();
         s.view().set_timeout(Some(Duration::from_millis(100)));
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Ingress);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Ingress);
     }
 
     #[test]
@@ -8294,7 +8347,7 @@ mod test {
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::SynSent);
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(250)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(250)));
         recv!(s, time 250, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
@@ -8310,23 +8363,23 @@ mod test {
         let mut s = socket_established();
         s.view().set_timeout(Some(Duration::from_millis(2000)));
         recv_nothing!(s, time 250);
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(2250)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(2250)));
         s.view().send_slice(b"abcdef").unwrap();
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
         recv!(s, time 255, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(1255)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(1255)));
         recv!(s, time 1255, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(2255)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(2255)));
         recv!(s, time 2255, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1 + 6,
@@ -8348,13 +8401,13 @@ mod test {
             ..RECV_TEMPL
         }));
         recv_nothing!(s, time 100);
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(150)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(150)));
         send!(s, time 105, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         });
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(155)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(155)));
         recv!(s, time 155, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -8362,7 +8415,7 @@ mod test {
             ..RECV_TEMPL
         }));
         recv_nothing!(s, time 155);
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(205)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(205)));
         recv_nothing!(s, time 200);
         recv!(s, time 205, Ok(TcpRepr {
             control:    TcpControl::Rst,
@@ -8418,14 +8471,14 @@ mod test {
         s.view().set_timeout(Some(Duration::from_millis(200)));
         s.remote_last_ts = Some(Instant::from_millis(100));
         s.view().abort();
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
         recv!(s, time 100, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Ingress);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Ingress);
     }
 
     // =========================================================================================//
@@ -8456,7 +8509,7 @@ mod test {
         s.view().set_keep_alive(Some(Duration::from_millis(100)));
 
         // drain the forced keep-alive packet
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
         recv!(s, time 0, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -8464,7 +8517,7 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(100)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(100)));
         recv_nothing!(s, time 95);
         recv!(s, time 100, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -8473,7 +8526,7 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(200)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(200)));
         recv_nothing!(s, time 195);
         recv!(s, time 200, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -8487,7 +8540,7 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         });
-        assert_eq!(s.sockets.get(0).poll_at(), PollAt::Time(Instant::from_millis(350)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(350)));
         recv_nothing!(s, time 345);
         recv!(s, time 350, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
