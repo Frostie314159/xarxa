@@ -25,7 +25,6 @@
 use std::io::Write as _;
 use std::os::unix::io::AsRawFd;
 
-use rand::Rng;
 use xarxa::iface::{Medium, TunTapInterface, wait};
 use xarxa::stack::{Config, Stack};
 use xarxa::time::Instant;
@@ -73,9 +72,10 @@ fn main() {
 
     let tcp_handle = stack.add_tcp_socket(4096, 4096);
 
-    let local_port = rand::thread_rng().gen_range(49152..=65535);
-    log::info!("tcp: connecting to {remote} from port {local_port}");
-    stack.tcp(tcp_handle).connect(remote, local_port).unwrap();
+    // Local port 0: the stack allocates an ephemeral port.
+    let mut socket = stack.tcp(tcp_handle);
+    socket.connect(remote, 0).unwrap();
+    log::info!("tcp: connecting to {remote} from {}", socket.local_endpoint().unwrap());
 
     let mut greeting_sent = false;
     loop {

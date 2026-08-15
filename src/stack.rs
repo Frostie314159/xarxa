@@ -187,6 +187,23 @@ impl TxContext<'_> {
     }
 }
 
+/// The bottom of the ephemeral (dynamic) local port range, per IANA. The range
+/// runs to the top of the port space, 65535.
+pub(crate) const EPHEMERAL_PORT_MIN: u16 = 49152;
+
+/// Allocate an ephemeral local port: start at a random point in the range and
+/// linearly probe upward (wrapping) for the first port `in_use` doesn't claim.
+///
+/// The random start makes local ports hard to predict for off-path attackers
+/// (RFC 6056 §3.3). `None` is returned only when every port in the range is in use.
+pub(crate) fn alloc_ephemeral_port(rand: &mut Rand, mut in_use: impl FnMut(u16) -> bool) -> Option<u16> {
+    const RANGE: u32 = (u16::MAX - EPHEMERAL_PORT_MIN) as u32 + 1;
+    let start = rand.rand_u32() % RANGE;
+    (0..RANGE)
+        .map(|i| EPHEMERAL_PORT_MIN + ((start + i) % RANGE) as u16)
+        .find(|&port| !in_use(port))
+}
+
 /// The result of a neighbor lookup.
 enum NeighborLookup {
     /// The destination hardware address.
@@ -271,8 +288,10 @@ impl Stack {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     pub fn udp(&mut self, handle: UdpHandle) -> UdpSocket<'_> {
+        self.sockets.udp.get(handle.0); // Stale handles panic here, not on first use.
         UdpSocket {
-            state: self.sockets.udp.get_mut(handle.0),
+            sockets: &mut self.sockets.udp,
+            index: handle.0,
             tx: TxContext {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
@@ -334,8 +353,10 @@ impl Stack {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     pub fn tcp(&mut self, handle: TcpHandle) -> TcpSocket<'_> {
+        self.sockets.tcp.get(handle.0); // Stale handles panic here, not on first use.
         TcpSocket {
-            state: self.sockets.tcp.get_mut(handle.0),
+            sockets: &mut self.sockets.tcp,
+            index: handle.0,
             tx: TxContext {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
@@ -1435,4 +1456,25 @@ fn ndisc_lladdr_option(
         offset += opt_len;
     }
     Ok(lladdr)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_alloc_ephemeral_port() {
+        let mut rand = Rand::new(42);
+
+        // Unconstrained: any port in the ephemeral range.
+        let port = alloc_ephemeral_port(&mut rand, |_| false).unwrap();
+        assert!(port >= EPHEMERAL_PORT_MIN);
+
+        // The probe walks past used ports (wrapping) to the single free one.
+        let free = EPHEMERAL_PORT_MIN + 1234;
+        assert_eq!(alloc_ephemeral_port(&mut rand, |p| p != free), Some(free));
+
+        // Every port in use: allocation fails.
+        assert_eq!(alloc_ephemeral_port(&mut rand, |_| true), None);
+    }
 }

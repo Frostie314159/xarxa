@@ -1,4 +1,17 @@
 //! UDP sockets.
+//!
+//! [`Stack::add_udp_socket`](crate::Stack::add_udp_socket) creates a socket inside
+//! the stack and returns a [`UdpHandle`] identifying it. All operations go through
+//! [`Stack::udp`](crate::Stack::udp), which borrows the socket as a [`UdpSocket`]:
+//! receiving only touches the socket state, while sending transmits the datagram
+//! immediately.
+//!
+//! Binding to port 0 allocates an ephemeral port, and binds that would shadow
+//! another socket are rejected.
+//!
+//! Received packets are queued with their IP and UDP headers still in the buffer.
+//! The addresses returned in [`UdpMetadata`] are parsed back out of those header
+//! bytes.
 
 use core::fmt;
 use core::ops::{Deref, Range};
@@ -6,7 +19,7 @@ use std::collections::VecDeque;
 
 use crate::buf::PacketBuf;
 use crate::slab::Slab;
-use crate::stack::{Iface, StackInner, TxContext};
+use crate::stack::{Iface, StackInner, TxContext, alloc_ephemeral_port};
 use crate::wire::{
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
     IpVersion, Ipv4Packet, Ipv6Packet, UDP_HEADER_LEN, UdpPacket,
@@ -51,15 +64,20 @@ impl fmt::Display for UdpMetadata {
 pub enum BindError {
     /// The socket is already bound.
     InvalidState,
-    /// The port is zero.
-    Unaddressable,
+    /// Another UDP socket's binding overlaps this one: same port, and one of the
+    /// two binds is address-less or both name the same address.
+    InUse,
+    /// No free port in the ephemeral range (only possible with tens of thousands
+    /// of bound sockets).
+    NoFreePorts,
 }
 
 impl fmt::Display for BindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BindError::InvalidState => write!(f, "invalid state"),
-            BindError::Unaddressable => write!(f, "unaddressable"),
+            BindError::InUse => write!(f, "port in use"),
+            BindError::NoFreePorts => write!(f, "no free ports"),
         }
     }
 }
@@ -200,22 +218,35 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
 /// [`Stack`]: crate::Stack
 /// [`Stack::udp`]: crate::Stack::udp
 pub struct UdpSocket<'a> {
-    pub(crate) state: &'a mut UdpSocketState,
+    pub(crate) sockets: &'a mut Slab<UdpSocketState>,
+    pub(crate) index: usize,
     pub(crate) tx: TxContext<'a>,
 }
 
 impl UdpSocket<'_> {
+    /// This socket's state in the slab.
+    #[inline]
+    fn inner(&self) -> &UdpSocketState {
+        self.sockets.get(self.index)
+    }
+
+    /// Mutable variant of [`inner`](Self::inner).
+    #[inline]
+    fn inner_mut(&mut self) -> &mut UdpSocketState {
+        self.sockets.get_mut(self.index)
+    }
+
     /// Return the bound endpoint.
     #[inline]
     pub fn endpoint(&self) -> IpListenEndpoint {
-        self.state.endpoint
+        self.inner().endpoint
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     ///
     /// See also the [set_hop_limit](#method.set_hop_limit) method.
     pub fn hop_limit(&self) -> Option<u8> {
-        self.state.hop_limit
+        self.inner().hop_limit
     }
 
     /// Set the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -230,42 +261,65 @@ impl UdpSocket<'_> {
     /// [RFC 1122 § 3.2.1.7]: https://tools.ietf.org/html/rfc1122#section-3.2.1.7
     pub fn set_hop_limit(&mut self, hop_limit: Option<u8>) {
         assert!(hop_limit != Some(0));
-        self.state.hop_limit = hop_limit
+        self.inner_mut().hop_limit = hop_limit
     }
 
     /// Bind the socket to the given endpoint.
     ///
+    /// A port of zero means "allocate an ephemeral port": a free port in the
+    /// 49152..=65535 range, picked at a random starting point. An explicit port
+    /// that overlaps another UDP socket's binding (same port, and either bind is
+    /// address-less or both name the same address) is rejected, since each
+    /// datagram is handed to a single socket and the binds would shadow each
+    /// other.
+    ///
     /// Returns `Err(BindError::InvalidState)` if the socket is already bound (see
-    /// [is_open](#method.is_open)), and `Err(BindError::Unaddressable)` if the port
-    /// in the given endpoint is zero.
+    /// [is_open](#method.is_open)), `Err(BindError::InUse)` on an overlapping
+    /// bind, and `Err(BindError::NoFreePorts)` if the ephemeral range is
+    /// exhausted.
     pub fn bind<T: Into<IpListenEndpoint>>(&mut self, endpoint: T) -> Result<(), BindError> {
-        let endpoint = endpoint.into();
-        if endpoint.port == 0 {
-            return Err(BindError::Unaddressable);
-        }
+        let mut endpoint = endpoint.into();
         if self.is_open() {
             return Err(BindError::InvalidState);
         }
-        self.state.endpoint = endpoint;
+
+        if endpoint.port == 0 {
+            // Skip every port any other UDP socket has bound, regardless of
+            // address.
+            let (sockets, index) = (&self.sockets, self.index);
+            endpoint.port = alloc_ephemeral_port(self.tx.rand(), |port| {
+                sockets.iter().any(|(i, s)| i != index && s.endpoint.port == port)
+            })
+            .ok_or(BindError::NoFreePorts)?;
+        } else if self.sockets.iter().any(|(i, s)| {
+            i != self.index
+                && s.endpoint.port == endpoint.port
+                && (s.endpoint.addr.is_none() || endpoint.addr.is_none() || s.endpoint.addr == endpoint.addr)
+        }) {
+            return Err(BindError::InUse);
+        }
+
+        self.inner_mut().endpoint = endpoint;
         Ok(())
     }
 
     /// Close the socket, unbinding it and dropping any queued packets.
     pub fn close(&mut self) {
-        self.state.endpoint = IpListenEndpoint::default();
-        self.state.rx_queue.clear();
+        let state = self.inner_mut();
+        state.endpoint = IpListenEndpoint::default();
+        state.rx_queue.clear();
     }
 
     /// Check whether the socket is open (bound to a port).
     #[inline]
     pub fn is_open(&self) -> bool {
-        self.state.endpoint.port != 0
+        self.inner().endpoint.port != 0
     }
 
     /// Check whether the RX queue is not empty.
     #[inline]
     pub fn can_recv(&self) -> bool {
-        !self.state.rx_queue.is_empty()
+        !self.inner().rx_queue.is_empty()
     }
 
     /// Dequeue a received datagram, as an owned packet ([`RecvPacket`]).
@@ -274,7 +328,7 @@ impl UdpSocket<'_> {
     ///
     /// Returns `Err(RecvError::Exhausted)` if the RX queue is empty.
     pub fn recv(&mut self) -> Result<RecvPacket, RecvError> {
-        let buf = self.state.rx_queue.pop_front().ok_or(RecvError::Exhausted)?;
+        let buf = self.inner_mut().rx_queue.pop_front().ok_or(RecvError::Exhausted)?;
         Ok(RecvPacket::new(buf))
     }
 
@@ -300,7 +354,12 @@ impl UdpSocket<'_> {
     ///
     /// Returns `Err(RecvError::Exhausted)` if the RX queue is empty.
     pub fn peek(&mut self) -> Result<(&[u8], UdpMetadata), RecvError> {
-        let buf = self.state.rx_queue.front_mut().ok_or(RecvError::Exhausted)?;
+        let buf = self
+            .sockets
+            .get_mut(self.index)
+            .rx_queue
+            .front_mut()
+            .ok_or(RecvError::Exhausted)?;
         let (meta, payload) = parse_datagram(buf);
         Ok((&buf[payload], meta))
     }
@@ -352,8 +411,8 @@ impl UdpSocket<'_> {
         f: impl FnOnce(&mut [u8]) -> usize,
     ) -> Result<(), SendError> {
         let meta = meta.into();
-        let endpoint = self.state.endpoint;
-        let hop_limit = self.state.hop_limit.unwrap_or(64);
+        let endpoint = self.inner().endpoint;
+        let hop_limit = self.inner().hop_limit.unwrap_or(64);
 
         if endpoint.port == 0 {
             return Err(SendError::Unaddressable);
@@ -527,7 +586,6 @@ mod test {
         let (mut stack, handle) = stack_with_socket();
         let mut socket = stack.udp(handle);
         assert!(!socket.is_open());
-        assert_eq!(socket.bind(0), Err(BindError::Unaddressable));
         assert_eq!(socket.bind(LOCAL_PORT), Ok(()));
         assert!(socket.is_open());
         assert_eq!(socket.bind(LOCAL_PORT), Err(BindError::InvalidState));
@@ -545,6 +603,51 @@ mod test {
     }
 
     #[test]
+    fn test_bind_ephemeral() {
+        use crate::stack::EPHEMERAL_PORT_MIN;
+
+        let mut stack = Stack::new();
+        let h1 = stack.add_udp_socket();
+        let h2 = stack.add_udp_socket();
+
+        stack.udp(h1).bind(0).unwrap();
+        let p1 = stack.udp(h1).endpoint().port;
+        assert!(p1 >= EPHEMERAL_PORT_MIN);
+
+        // The second allocation must avoid the first socket's port.
+        stack.udp(h2).bind(0).unwrap();
+        let p2 = stack.udp(h2).endpoint().port;
+        assert!(p2 >= EPHEMERAL_PORT_MIN);
+        assert_ne!(p1, p2);
+    }
+
+    #[test]
+    fn test_bind_conflicts() {
+        const OTHER_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 3);
+
+        let mut stack = Stack::new();
+        let h1 = stack.add_udp_socket();
+        let h2 = stack.add_udp_socket();
+
+        // Address-less binds conflict on the port alone.
+        stack.udp(h1).bind(LOCAL_PORT).unwrap();
+        assert_eq!(stack.udp(h2).bind(LOCAL_PORT), Err(BindError::InUse));
+        // A specific address conflicts with an address-less bind on the same port.
+        assert_eq!(stack.udp(h2).bind((LOCAL_ADDR, LOCAL_PORT)), Err(BindError::InUse));
+        // A different port is fine.
+        stack.udp(h2).bind(LOCAL_PORT + 1).unwrap();
+
+        // Two different specific addresses may share a port.
+        let h3 = stack.add_udp_socket();
+        let h4 = stack.add_udp_socket();
+        let h5 = stack.add_udp_socket();
+        stack.udp(h3).bind((LOCAL_ADDR, LOCAL_PORT + 2)).unwrap();
+        stack.udp(h4).bind((OTHER_ADDR, LOCAL_PORT + 2)).unwrap();
+        // ...but the same specific address may not.
+        assert_eq!(stack.udp(h5).bind((LOCAL_ADDR, LOCAL_PORT + 2)), Err(BindError::InUse));
+    }
+
+    #[test]
     fn test_recv() {
         let (mut stack, handle) = stack_with_socket();
         let mut socket = stack.udp(handle);
@@ -553,7 +656,7 @@ mod test {
         assert!(!socket.can_recv());
         assert_eq!(socket.recv().err(), Some(RecvError::Exhausted));
 
-        socket.state.rx_enqueue(queued_packet(b"abcdef"));
+        socket.inner_mut().rx_enqueue(queued_packet(b"abcdef"));
         assert!(socket.can_recv());
 
         let packet = socket.recv().unwrap();
@@ -574,7 +677,7 @@ mod test {
         let (mut stack, handle) = stack_with_socket();
         let mut socket = stack.udp(handle);
         socket.bind(LOCAL_PORT).unwrap();
-        socket.state.rx_enqueue(queued_packet(b"abcdef"));
+        socket.inner_mut().rx_enqueue(queued_packet(b"abcdef"));
 
         let (payload, meta) = socket.peek().unwrap();
         assert_eq!(payload, b"abcdef");
@@ -596,7 +699,7 @@ mod test {
         let (mut stack, handle) = stack_with_socket();
         let mut socket = stack.udp(handle);
         socket.bind(LOCAL_PORT).unwrap();
-        socket.state.rx_enqueue(queued_packet(b"abcdef"));
+        socket.inner_mut().rx_enqueue(queued_packet(b"abcdef"));
 
         let mut slice = [0; 4];
         // peek_slice keeps the packet...

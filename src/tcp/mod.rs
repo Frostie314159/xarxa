@@ -9,7 +9,8 @@ use core::{fmt, mem};
 
 use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
 use crate::rand::Rand;
-use crate::stack::TxContext;
+use crate::slab::Slab;
+use crate::stack::{TxContext, alloc_ephemeral_port};
 use crate::time::{Duration, Instant};
 use crate::wire::{
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
@@ -76,6 +77,9 @@ impl core::error::Error for ListenError {}
 pub enum ConnectError {
     InvalidState,
     Unaddressable,
+    /// No free port in the ephemeral range (only possible with tens of thousands
+    /// of open sockets).
+    NoFreePorts,
 }
 
 impl Display for ConnectError {
@@ -83,6 +87,7 @@ impl Display for ConnectError {
         match *self {
             ConnectError::InvalidState => write!(f, "invalid state"),
             ConnectError::Unaddressable => write!(f, "unaddressable destination"),
+            ConnectError::NoFreePorts => write!(f, "no free ports"),
         }
     }
 }
@@ -457,8 +462,12 @@ pub enum CongestionControl {
     Cubic,
 }
 
-/// The state of a TCP socket, stored in the stack. The public API lives on
-/// [`TcpSocket`], the view of one of these borrowed from the stack.
+/// A Transmission Control Protocol socket.
+///
+/// A TCP socket may passively listen for connections or actively connect to another endpoint.
+/// Note that, for listening sockets, there is no "backlog"; to be able to simultaneously
+/// accept several connections, as many sockets must be allocated, or any new connection
+/// attempts will be reset.
 #[derive(Debug)]
 pub(crate) struct TcpSocketState {
     state: State,
@@ -2040,8 +2049,7 @@ pub(crate) fn flush(state: &mut TcpSocketState, cx: &mut TxContext<'_>) {
     }
 }
 
-/// A Transmission Control Protocol socket, borrowed from a [`Stack`] by
-/// [`Stack::tcp`].
+/// A TCP socket borrowed from a [`Stack`], returned by [`Stack::tcp`].
 ///
 /// A TCP socket may passively listen for connections or actively connect to another
 /// endpoint. Note that, for listening sockets, there is no "backlog". To be able to
@@ -2051,296 +2059,32 @@ pub(crate) fn flush(state: &mut TcpSocketState, cx: &mut TxContext<'_>) {
 /// [`Stack`]: crate::Stack
 /// [`Stack::tcp`]: crate::Stack::tcp
 pub struct TcpSocket<'a> {
-    pub(crate) state: &'a mut TcpSocketState,
+    pub(crate) sockets: &'a mut Slab<TcpSocketState>,
+    pub(crate) index: usize,
     pub(crate) tx: TxContext<'a>,
 }
 
 impl TcpSocket<'_> {
-    /// Return the connection state, in terms of the TCP state machine.
+    /// This socket's state in the slab.
     #[inline]
-    pub fn state(&self) -> State {
-        self.state.state
+    fn inner(&self) -> &TcpSocketState {
+        self.sockets.get(self.index)
     }
 
-    /// Return whether the socket is passively listening for incoming connections.
-    ///
-    /// In terms of the TCP state machine, the socket must be in the `LISTEN` state.
+    /// Mutable variant of [`inner`](Self::inner).
     #[inline]
-    pub fn is_listening(&self) -> bool {
-        match self.state.state {
-            State::Listen => true,
-            _ => false,
-        }
+    fn inner_mut(&mut self) -> &mut TcpSocketState {
+        self.sockets.get_mut(self.index)
     }
 
-    /// Return whether the socket is open.
-    ///
-    /// This function returns true if the socket will process incoming or dispatch outgoing
-    /// packets. Note that this does not mean that it is possible to send or receive data through
-    /// the socket; for that, use [can_send](#method.can_send) or [can_recv](#method.can_recv).
-    ///
-    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`
-    /// or `TIME-WAIT` states.
-    #[inline]
-    pub fn is_open(&self) -> bool {
-        match self.state.state {
-            State::Closed => false,
-            State::TimeWait => false,
-            _ => true,
-        }
+    /// Enable or disable TCP Timestamp.
+    pub fn set_tsval_generator(&mut self, generator: Option<TcpTimestampGenerator>) {
+        self.inner_mut().tsval_generator = generator;
     }
 
-    /// Return whether a connection is active.
-    ///
-    /// This function returns true if the socket is actively exchanging packets with
-    /// a remote endpoint. Note that this does not mean that it is possible to send or receive
-    /// data through the socket; for that, use [can_send](#method.can_send) or
-    /// [can_recv](#method.can_recv).
-    ///
-    /// If a connection is established, [abort](#method.close) will send a reset to
-    /// the remote endpoint.
-    ///
-    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`, `TIME-WAIT`,
-    /// or `LISTEN` state.
-    #[inline]
-    pub fn is_active(&self) -> bool {
-        match self.state.state {
-            State::Closed => false,
-            State::TimeWait => false,
-            State::Listen => false,
-            _ => true,
-        }
-    }
-
-    /// Return whether the transmit half of the full-duplex connection is open.
-    ///
-    /// This function returns true if it's possible to send data and have it arrive
-    /// to the remote endpoint. However, it does not make any guarantees about the state
-    /// of the transmit buffer, and even if it returns true, [send](#method.send) may
-    /// not be able to enqueue any octets.
-    ///
-    /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED` or
-    /// `CLOSE-WAIT` state.
-    #[inline]
-    pub fn may_send(&self) -> bool {
-        match self.state.state {
-            State::Established => true,
-            // In CLOSE-WAIT, the remote endpoint has closed our receive half of the connection
-            // but we still can transmit indefinitely.
-            State::CloseWait => true,
-            _ => false,
-        }
-    }
-
-    /// Return whether the receive half of the full-duplex connection is open.
-    ///
-    /// This function returns true if it's possible to receive data from the remote endpoint.
-    /// It will return true while there is data in the receive buffer, and if there isn't,
-    /// as long as the remote endpoint has not closed the connection.
-    ///
-    /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED`,
-    /// `FIN-WAIT-1`, or `FIN-WAIT-2` state, or have data in the receive buffer instead.
-    #[inline]
-    pub fn may_recv(&self) -> bool {
-        match self.state.state {
-            State::Established => true,
-            // In FIN-WAIT-1/2, we have closed our transmit half of the connection but
-            // we still can receive indefinitely.
-            State::FinWait1 | State::FinWait2 => true,
-            // If we have something in the receive buffer, we can receive that.
-            _ if self.can_recv() => true,
-            _ => false,
-        }
-    }
-
-    /// Check whether the transmit half of the full-duplex connection is open
-    /// (see [may_send](#method.may_send)), and the transmit buffer is not full.
-    #[inline]
-    pub fn can_send(&self) -> bool {
-        if !self.may_send() {
-            return false;
-        }
-
-        !self.state.tx_buffer.is_full()
-    }
-
-    /// Check whether the receive buffer is not empty.
-    #[inline]
-    pub fn can_recv(&self) -> bool {
-        !self.state.rx_buffer.is_empty()
-    }
-
-    /// Return the listen endpoint
-    #[inline]
-    pub fn listen_endpoint(&self) -> IpListenEndpoint {
-        self.state.listen_endpoint
-    }
-
-    /// Return the local endpoint, or None if not connected.
-    #[inline]
-    pub fn local_endpoint(&self) -> Option<IpEndpoint> {
-        Some(self.state.tuple?.local)
-    }
-
-    /// Return the remote endpoint, or None if not connected.
-    #[inline]
-    pub fn remote_endpoint(&self) -> Option<IpEndpoint> {
-        Some(self.state.tuple?.remote)
-    }
-
-    /// Return the maximum number of bytes inside the recv buffer.
-    #[inline]
-    pub fn recv_capacity(&self) -> usize {
-        self.state.rx_buffer.capacity()
-    }
-
-    /// Return the maximum number of bytes inside the transmit buffer.
-    #[inline]
-    pub fn send_capacity(&self) -> usize {
-        self.state.tx_buffer.capacity()
-    }
-
-    /// Return the amount of octets queued in the transmit buffer.
-    ///
-    /// Note that the Berkeley sockets interface does not have an equivalent of this API.
-    pub fn send_queue(&self) -> usize {
-        self.state.tx_buffer.len()
-    }
-
-    /// Return the amount of octets queued in the receive buffer. This value can be larger than
-    /// the slice read by the next `recv` or `peek` call because it includes all queued octets,
-    /// and not only the octets that may be returned as a contiguous slice.
-    ///
-    /// Note that the Berkeley sockets interface does not have an equivalent of this API.
-    pub fn recv_queue(&self) -> usize {
-        self.state.rx_buffer.len()
-    }
-
-    /// Return the timeout duration.
-    ///
-    /// See also the [set_timeout](#method.set_timeout) method.
-    pub fn timeout(&self) -> Option<Duration> {
-        self.state.timeout
-    }
-
-    /// Set the timeout duration.
-    ///
-    /// A socket with a timeout duration set will abort the connection if either of the following
-    /// occurs:
-    ///
-    ///   * After a [connect](#method.connect) call, the remote endpoint does not respond within
-    ///     the specified duration;
-    ///   * After establishing a connection, there is data in the transmit buffer and the remote
-    ///     endpoint exceeds the specified duration between any two packets it sends;
-    ///   * After enabling [keep-alive](#method.set_keep_alive), the remote endpoint exceeds
-    ///     the specified duration between any two packets it sends.
-    pub fn set_timeout(&mut self, duration: Option<Duration>) {
-        self.state.timeout = duration
-    }
-
-    /// Return the ACK delay duration.
-    ///
-    /// See also the [set_ack_delay](#method.set_ack_delay) method.
-    pub fn ack_delay(&self) -> Option<Duration> {
-        self.state.ack_delay
-    }
-
-    /// Set the ACK delay duration.
-    ///
-    /// By default, the ACK delay is set to 10ms.
-    pub fn set_ack_delay(&mut self, duration: Option<Duration>) {
-        self.state.ack_delay = duration
-    }
-
-    /// Return whether Nagle's Algorithm is enabled.
-    ///
-    /// See also the [set_nagle_enabled](#method.set_nagle_enabled) method.
-    pub fn nagle_enabled(&self) -> bool {
-        self.state.nagle
-    }
-
-    /// Enable or disable Nagle's Algorithm.
-    ///
-    /// Also known as "tinygram prevention". By default, it is enabled.
-    /// Disabling it is equivalent to Linux's TCP_NODELAY flag.
-    ///
-    /// When enabled, Nagle's Algorithm prevents sending segments smaller than MSS if
-    /// there is data in flight (sent but not acknowledged). In other words, it ensures
-    /// at most only one segment smaller than MSS is in flight at a time.
-    ///
-    /// It ensures better network utilization by preventing sending many very small packets,
-    /// at the cost of increased latency in some situations, particularly when the remote peer
-    /// has ACK delay enabled.
-    pub fn set_nagle_enabled(&mut self, enabled: bool) {
-        self.state.nagle = enabled
-    }
-
-    /// Return the keep-alive interval.
-    ///
-    /// See also the [set_keep_alive](#method.set_keep_alive) method.
-    pub fn keep_alive(&self) -> Option<Duration> {
-        self.state.keep_alive
-    }
-
-    /// Set the keep-alive interval.
-    ///
-    /// An idle socket with a keep-alive interval set will transmit a "keep-alive ACK" packet
-    /// every time it receives no communication during that interval. As a result, three things
-    /// may happen:
-    ///
-    ///   * The remote endpoint is fine and answers with an ACK packet.
-    ///   * The remote endpoint has rebooted and answers with an RST packet.
-    ///   * The remote endpoint has crashed and does not answer.
-    ///
-    /// The keep-alive functionality together with the timeout functionality allows to react
-    /// to these error conditions.
-    pub fn set_keep_alive(&mut self, interval: Option<Duration>) {
-        self.state.keep_alive = interval;
-        if self.state.keep_alive.is_some() {
-            // If the connection is idle and we've just set the option, it would not take effect
-            // until the next packet, unless we wind up the timer explicitly.
-            self.state.timer.set_keep_alive();
-        }
-    }
-
-    /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
-    ///
-    /// See also the [set_hop_limit](#method.set_hop_limit) method
-    pub fn hop_limit(&self) -> Option<u8> {
-        self.state.hop_limit
-    }
-
-    /// Set the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
-    ///
-    /// A socket without an explicitly set hop limit value uses the default [IANA recommended]
-    /// value (64).
-    ///
-    /// # Panics
-    ///
-    /// This function panics if a hop limit value of 0 is given. See [RFC 1122 § 3.2.1.7].
-    ///
-    /// [IANA recommended]: https://www.iana.org/assignments/ip-parameters/ip-parameters.xhtml
-    /// [RFC 1122 § 3.2.1.7]: https://tools.ietf.org/html/rfc1122#section-3.2.1.7
-    pub fn set_hop_limit(&mut self, hop_limit: Option<u8>) {
-        // A host MUST NOT send a datagram with a hop limit value of 0
-        if let Some(0) = hop_limit {
-            panic!("the time-to-live value of a packet must not be zero")
-        }
-
-        self.state.hop_limit = hop_limit
-    }
-
-    /// Return the current congestion control algorithm.
-    pub fn congestion_control(&self) -> CongestionControl {
-        use congestion::*;
-
-        match self.state.congestion_controller {
-            AnyController::None(_) => CongestionControl::None,
-
-            AnyController::Reno(_) => CongestionControl::Reno,
-
-            AnyController::Cubic(_) => CongestionControl::Cubic,
-        }
+    /// Return whether TCP Timestamp is enabled.
+    pub fn timestamp_enabled(&self) -> bool {
+        self.inner().tsval_generator.is_some()
     }
 
     /// Set an algorithm for congestion control.
@@ -2364,7 +2108,7 @@ impl TcpSocket<'_> {
     pub fn set_congestion_control(&mut self, congestion_control: CongestionControl) {
         use congestion::*;
 
-        self.state.congestion_controller = match congestion_control {
+        self.inner_mut().congestion_controller = match congestion_control {
             CongestionControl::None => AnyController::None(no_control::NoControl),
 
             CongestionControl::Reno => AnyController::Reno(reno::Reno::new()),
@@ -2373,14 +2117,155 @@ impl TcpSocket<'_> {
         }
     }
 
-    /// Return whether TCP Timestamp is enabled.
-    pub fn timestamp_enabled(&self) -> bool {
-        self.state.tsval_generator.is_some()
+    /// Return the current congestion control algorithm.
+    pub fn congestion_control(&self) -> CongestionControl {
+        use congestion::*;
+
+        match self.inner().congestion_controller {
+            AnyController::None(_) => CongestionControl::None,
+
+            AnyController::Reno(_) => CongestionControl::Reno,
+
+            AnyController::Cubic(_) => CongestionControl::Cubic,
+        }
     }
 
-    /// Enable or disable TCP Timestamp.
-    pub fn set_tsval_generator(&mut self, generator: Option<TcpTimestampGenerator>) {
-        self.state.tsval_generator = generator;
+    /// Return the timeout duration.
+    ///
+    /// See also the [set_timeout](#method.set_timeout) method.
+    pub fn timeout(&self) -> Option<Duration> {
+        self.inner().timeout
+    }
+
+    /// Return the ACK delay duration.
+    ///
+    /// See also the [set_ack_delay](#method.set_ack_delay) method.
+    pub fn ack_delay(&self) -> Option<Duration> {
+        self.inner().ack_delay
+    }
+
+    /// Return whether Nagle's Algorithm is enabled.
+    ///
+    /// See also the [set_nagle_enabled](#method.set_nagle_enabled) method.
+    pub fn nagle_enabled(&self) -> bool {
+        self.inner().nagle
+    }
+
+    /// Set the timeout duration.
+    ///
+    /// A socket with a timeout duration set will abort the connection if either of the following
+    /// occurs:
+    ///
+    ///   * After a [connect](#method.connect) call, the remote endpoint does not respond within
+    ///     the specified duration;
+    ///   * After establishing a connection, there is data in the transmit buffer and the remote
+    ///     endpoint exceeds the specified duration between any two packets it sends;
+    ///   * After enabling [keep-alive](#method.set_keep_alive), the remote endpoint exceeds
+    ///     the specified duration between any two packets it sends.
+    pub fn set_timeout(&mut self, duration: Option<Duration>) {
+        self.inner_mut().timeout = duration
+    }
+
+    /// Set the ACK delay duration.
+    ///
+    /// By default, the ACK delay is set to 10ms.
+    pub fn set_ack_delay(&mut self, duration: Option<Duration>) {
+        self.inner_mut().ack_delay = duration
+    }
+
+    /// Enable or disable Nagle's Algorithm.
+    ///
+    /// Also known as "tinygram prevention". By default, it is enabled.
+    /// Disabling it is equivalent to Linux's TCP_NODELAY flag.
+    ///
+    /// When enabled, Nagle's Algorithm prevents sending segments smaller than MSS if
+    /// there is data in flight (sent but not acknowledged). In other words, it ensures
+    /// at most only one segment smaller than MSS is in flight at a time.
+    ///
+    /// It ensures better network utilization by preventing sending many very small packets,
+    /// at the cost of increased latency in some situations, particularly when the remote peer
+    /// has ACK delay enabled.
+    pub fn set_nagle_enabled(&mut self, enabled: bool) {
+        self.inner_mut().nagle = enabled
+    }
+
+    /// Return the keep-alive interval.
+    ///
+    /// See also the [set_keep_alive](#method.set_keep_alive) method.
+    pub fn keep_alive(&self) -> Option<Duration> {
+        self.inner().keep_alive
+    }
+
+    /// Set the keep-alive interval.
+    ///
+    /// An idle socket with a keep-alive interval set will transmit a "keep-alive ACK" packet
+    /// every time it receives no communication during that interval. As a result, three things
+    /// may happen:
+    ///
+    ///   * The remote endpoint is fine and answers with an ACK packet.
+    ///   * The remote endpoint has rebooted and answers with an RST packet.
+    ///   * The remote endpoint has crashed and does not answer.
+    ///
+    /// The keep-alive functionality together with the timeout functionality allows to react
+    /// to these error conditions.
+    pub fn set_keep_alive(&mut self, interval: Option<Duration>) {
+        self.inner_mut().keep_alive = interval;
+        if self.inner_mut().keep_alive.is_some() {
+            // If the connection is idle and we've just set the option, it would not take effect
+            // until the next packet, unless we wind up the timer explicitly.
+            self.inner_mut().timer.set_keep_alive();
+        }
+    }
+
+    /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
+    ///
+    /// See also the [set_hop_limit](#method.set_hop_limit) method
+    pub fn hop_limit(&self) -> Option<u8> {
+        self.inner().hop_limit
+    }
+
+    /// Set the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
+    ///
+    /// A socket without an explicitly set hop limit value uses the default [IANA recommended]
+    /// value (64).
+    ///
+    /// # Panics
+    ///
+    /// This function panics if a hop limit value of 0 is given. See [RFC 1122 § 3.2.1.7].
+    ///
+    /// [IANA recommended]: https://www.iana.org/assignments/ip-parameters/ip-parameters.xhtml
+    /// [RFC 1122 § 3.2.1.7]: https://tools.ietf.org/html/rfc1122#section-3.2.1.7
+    pub fn set_hop_limit(&mut self, hop_limit: Option<u8>) {
+        // A host MUST NOT send a datagram with a hop limit value of 0
+        if let Some(0) = hop_limit {
+            panic!("the time-to-live value of a packet must not be zero")
+        }
+
+        self.inner_mut().hop_limit = hop_limit
+    }
+
+    /// Return the listen endpoint
+    #[inline]
+    pub fn listen_endpoint(&self) -> IpListenEndpoint {
+        self.inner().listen_endpoint
+    }
+
+    /// Return the local endpoint, or None if not connected.
+    #[inline]
+    pub fn local_endpoint(&self) -> Option<IpEndpoint> {
+        Some(self.inner().tuple?.local)
+    }
+
+    /// Return the remote endpoint, or None if not connected.
+    #[inline]
+    pub fn remote_endpoint(&self) -> Option<IpEndpoint> {
+        Some(self.inner().tuple?.remote)
+    }
+
+    /// Return the connection state, in terms of the TCP state machine.
+    #[inline]
+    pub fn state(&self) -> State {
+        self.inner().state
     }
 
     /// Start listening on the given endpoint.
@@ -2406,37 +2291,39 @@ impl TcpSocket<'_> {
             // immediately get an error. The only way around this is to abort the socket first
             // before listening again, but this means that incoming connections can actually
             // get aborted between the abort() and the next listen().
-            if matches!(self.state.state, State::Listen) && self.state.listen_endpoint == local_endpoint {
+            if matches!(self.inner_mut().state, State::Listen) && self.inner_mut().listen_endpoint == local_endpoint {
                 return Ok(());
             } else {
                 return Err(ListenError::InvalidState);
             }
         }
 
-        self.state.reset();
-        self.state.listen_endpoint = local_endpoint;
-        self.state.tuple = None;
-        self.state.set_state(State::Listen);
+        self.inner_mut().reset();
+        self.inner_mut().listen_endpoint = local_endpoint;
+        self.inner_mut().tuple = None;
+        self.inner_mut().set_state(State::Listen);
         Ok(())
     }
 
     /// Connect to a given endpoint.
     ///
-    /// The local port must be provided explicitly (typically an ephemeral port
-    /// picked at random between 49152 and 65535 by the caller).
+    /// The local endpoint may be left mostly unspecified: a local port of zero
+    /// means "allocate an ephemeral port" (a free port in the 49152..=65535
+    /// range, picked at a random starting point, avoiding every port in use by
+    /// another TCP socket), and the local address, if not provided, is selected
+    /// by the stack from the remote address. So the common case is simply
+    /// `connect(remote, 0)`.
     ///
-    /// The local address may optionally be provided.
-    ///
-    /// This function returns an error if the socket was open; see [is_open](#method.is_open).
-    /// It also returns an error if the local or remote port is zero, or if the remote address
-    /// is unspecified.
+    /// This function returns an error if the socket was open (see
+    /// [is_open](#method.is_open)). It also returns an error if the remote port
+    /// is zero, or if the remote address is unspecified.
     pub fn connect<T, U>(&mut self, remote_endpoint: T, local_endpoint: U) -> Result<(), ConnectError>
     where
         T: Into<IpEndpoint>,
         U: Into<IpListenEndpoint>,
     {
         let remote_endpoint: IpEndpoint = remote_endpoint.into();
-        let local_endpoint: IpListenEndpoint = local_endpoint.into();
+        let mut local_endpoint: IpListenEndpoint = local_endpoint.into();
 
         if self.is_open() {
             return Err(ConnectError::InvalidState);
@@ -2444,8 +2331,17 @@ impl TcpSocket<'_> {
         if remote_endpoint.port == 0 || remote_endpoint.addr.is_unspecified() {
             return Err(ConnectError::Unaddressable);
         }
+
         if local_endpoint.port == 0 {
-            return Err(ConnectError::Unaddressable);
+            // Allocate an ephemeral port, skipping every port in use by another
+            // TCP socket.
+            let (sockets, index) = (&self.sockets, self.index);
+            local_endpoint.port = alloc_ephemeral_port(self.tx.rand(), |port| {
+                sockets.iter().any(|(i, s)| {
+                    i != index && (s.listen_endpoint.port == port || s.tuple.is_some_and(|t| t.local.port == port))
+                })
+            })
+            .ok_or(ConnectError::NoFreePorts)?;
         }
 
         // If local address is not provided, choose it automatically.
@@ -2469,16 +2365,17 @@ impl TcpSocket<'_> {
             return Err(ConnectError::Unaddressable);
         }
 
-        self.state.reset();
-        self.state.tuple = Some(Tuple {
+        let seq = TcpSocketState::random_seq_no(self.tx.rand());
+
+        let s = self.inner_mut();
+        s.reset();
+        s.tuple = Some(Tuple {
             local: local_endpoint,
             remote: remote_endpoint,
         });
-        self.state.set_state(State::SynSent);
-
-        let seq = TcpSocketState::random_seq_no(self.tx.rand());
-        self.state.local_seq_no = seq;
-        self.state.remote_last_seq = seq;
+        s.set_state(State::SynSent);
+        s.local_seq_no = seq;
+        s.remote_last_seq = seq;
         Ok(())
     }
 
@@ -2488,16 +2385,16 @@ impl TcpSocket<'_> {
     /// connection; only the remote end can close it. If you no longer wish to receive any
     /// data and would like to reuse the socket right away, use [abort](#method.abort).
     pub fn close(&mut self) {
-        match self.state.state {
+        match self.inner_mut().state {
             // In the LISTEN state there is no established connection.
-            State::Listen => self.state.set_state(State::Closed),
+            State::Listen => self.inner_mut().set_state(State::Closed),
             // In the SYN-SENT state the remote endpoint is not yet synchronized and, upon
             // receiving an RST, will abort the connection.
-            State::SynSent => self.state.set_state(State::Closed),
+            State::SynSent => self.inner_mut().set_state(State::Closed),
             // In the SYN-RECEIVED, ESTABLISHED and CLOSE-WAIT states the transmit half
             // of the connection is open, and needs to be explicitly closed with a FIN.
-            State::SynReceived | State::Established => self.state.set_state(State::FinWait1),
-            State::CloseWait => self.state.set_state(State::LastAck),
+            State::SynReceived | State::Established => self.inner_mut().set_state(State::FinWait1),
+            State::CloseWait => self.inner_mut().set_state(State::LastAck),
             // In the FIN-WAIT-1, FIN-WAIT-2, CLOSING, LAST-ACK, TIME-WAIT and CLOSED states,
             // the transmit half of the connection is already closed, and no further
             // action is needed.
@@ -2513,7 +2410,127 @@ impl TcpSocket<'_> {
     /// In terms of the TCP state machine, the socket may be in any state and is moved to
     /// the `CLOSED` state.
     pub fn abort(&mut self) {
-        self.state.set_state(State::Closed);
+        self.inner_mut().set_state(State::Closed);
+    }
+
+    /// Return whether the socket is passively listening for incoming connections.
+    ///
+    /// In terms of the TCP state machine, the socket must be in the `LISTEN` state.
+    #[inline]
+    pub fn is_listening(&self) -> bool {
+        match self.inner().state {
+            State::Listen => true,
+            _ => false,
+        }
+    }
+
+    /// Return whether the socket is open.
+    ///
+    /// This function returns true if the socket will process incoming or dispatch outgoing
+    /// packets. Note that this does not mean that it is possible to send or receive data through
+    /// the socket; for that, use [can_send](#method.can_send) or [can_recv](#method.can_recv).
+    ///
+    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`
+    /// or `TIME-WAIT` states.
+    #[inline]
+    pub fn is_open(&self) -> bool {
+        match self.inner().state {
+            State::Closed => false,
+            State::TimeWait => false,
+            _ => true,
+        }
+    }
+
+    /// Return whether a connection is active.
+    ///
+    /// This function returns true if the socket is actively exchanging packets with
+    /// a remote endpoint. Note that this does not mean that it is possible to send or receive
+    /// data through the socket; for that, use [can_send](#method.can_send) or
+    /// [can_recv](#method.can_recv).
+    ///
+    /// If a connection is established, [abort](#method.close) will send a reset to
+    /// the remote endpoint.
+    ///
+    /// In terms of the TCP state machine, the socket must not be in the `CLOSED`, `TIME-WAIT`,
+    /// or `LISTEN` state.
+    #[inline]
+    pub fn is_active(&self) -> bool {
+        match self.inner().state {
+            State::Closed => false,
+            State::TimeWait => false,
+            State::Listen => false,
+            _ => true,
+        }
+    }
+
+    /// Return whether the transmit half of the full-duplex connection is open.
+    ///
+    /// This function returns true if it's possible to send data and have it arrive
+    /// to the remote endpoint. However, it does not make any guarantees about the state
+    /// of the transmit buffer, and even if it returns true, [send](#method.send) may
+    /// not be able to enqueue any octets.
+    ///
+    /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED` or
+    /// `CLOSE-WAIT` state.
+    #[inline]
+    pub fn may_send(&self) -> bool {
+        match self.inner().state {
+            State::Established => true,
+            // In CLOSE-WAIT, the remote endpoint has closed our receive half of the connection
+            // but we still can transmit indefinitely.
+            State::CloseWait => true,
+            _ => false,
+        }
+    }
+
+    /// Return whether the receive half of the full-duplex connection is open.
+    ///
+    /// This function returns true if it's possible to receive data from the remote endpoint.
+    /// It will return true while there is data in the receive buffer, and if there isn't,
+    /// as long as the remote endpoint has not closed the connection.
+    ///
+    /// In terms of the TCP state machine, the socket must be in the `ESTABLISHED`,
+    /// `FIN-WAIT-1`, or `FIN-WAIT-2` state, or have data in the receive buffer instead.
+    #[inline]
+    pub fn may_recv(&self) -> bool {
+        match self.inner().state {
+            State::Established => true,
+            // In FIN-WAIT-1/2, we have closed our transmit half of the connection but
+            // we still can receive indefinitely.
+            State::FinWait1 | State::FinWait2 => true,
+            // If we have something in the receive buffer, we can receive that.
+            _ if self.can_recv() => true,
+            _ => false,
+        }
+    }
+
+    /// Check whether the transmit half of the full-duplex connection is open
+    /// (see [may_send](#method.may_send)), and the transmit buffer is not full.
+    #[inline]
+    pub fn can_send(&self) -> bool {
+        if !self.may_send() {
+            return false;
+        }
+
+        !self.inner().tx_buffer.is_full()
+    }
+
+    /// Return the maximum number of bytes inside the recv buffer.
+    #[inline]
+    pub fn recv_capacity(&self) -> usize {
+        self.inner().rx_buffer.capacity()
+    }
+
+    /// Return the maximum number of bytes inside the transmit buffer.
+    #[inline]
+    pub fn send_capacity(&self) -> usize {
+        self.inner().tx_buffer.capacity()
+    }
+
+    /// Check whether the receive buffer is not empty.
+    #[inline]
+    pub fn can_recv(&self) -> bool {
+        !self.inner().rx_buffer.is_empty()
     }
 
     fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
@@ -2524,25 +2541,26 @@ impl TcpSocket<'_> {
             return Err(SendError::InvalidState);
         }
 
-        let old_length = self.state.tx_buffer.len();
-        let (size, result) = f(&mut self.state.tx_buffer);
+        let s = self.inner_mut();
+        let old_length = s.tx_buffer.len();
+        let (size, result) = f(&mut s.tx_buffer);
         if size > 0 {
             // The connection might have been idle for a long time, and so remote_last_ts
             // would be far in the past. Unless we clear it here, we'll abort the connection
             // down over in dispatch() by erroneously detecting it as timed out.
             if old_length == 0 {
-                self.state.remote_last_ts = None
+                s.remote_last_ts = None
             }
 
             // if remote win is zero and we go from having no data to some data pending to
             // send, start the zero window probe timer.
-            if self.state.remote_win_len == 0 && self.state.timer.is_idle() {
-                let delay = self.state.rtte.retransmission_timeout();
+            if s.remote_win_len == 0 && s.timer.is_idle() {
+                let delay = s.rtte.retransmission_timeout();
                 tcp_trace!("starting zero-window-probe timer for t+{}", delay);
 
                 // We don't have access to the current time here, so use Instant::ZERO instead.
                 // this will cause the first ZWP to be sent immediately, but that's okay.
-                self.state.timer.set_for_zero_window_probe(Instant::ZERO, delay);
+                s.timer.set_for_zero_window_probe(Instant::ZERO, delay);
             }
 
             tcp_trace!("tx buffer: enqueueing {} octets (now {})", size, old_length + size);
@@ -2580,7 +2598,7 @@ impl TcpSocket<'_> {
         // is fully open we must not dequeue any data, as it may be overwritten by e.g.
         // another (stale) SYN. (We do not support TCP Fast Open.)
         if !self.may_recv() {
-            if self.state.rx_fin_received {
+            if self.inner_mut().rx_fin_received {
                 return Err(RecvError::Finished);
             }
             return Err(RecvError::InvalidState);
@@ -2595,9 +2613,10 @@ impl TcpSocket<'_> {
     {
         self.recv_error_check()?;
 
-        let _old_length = self.state.rx_buffer.len();
-        let (size, result) = f(&mut self.state.rx_buffer);
-        self.state.remote_seq_no += size;
+        let s = self.inner_mut();
+        let _old_length = s.rx_buffer.len();
+        let (size, result) = f(&mut s.rx_buffer);
+        s.remote_seq_no += size;
         if size > 0 {
             tcp_trace!("rx buffer: dequeueing {} octets (now {})", size, _old_length - size);
         }
@@ -2641,7 +2660,7 @@ impl TcpSocket<'_> {
     pub fn peek(&mut self, size: usize) -> Result<&[u8], RecvError> {
         self.recv_error_check()?;
 
-        let buffer = self.state.rx_buffer.get_allocated(0, size);
+        let buffer = self.inner_mut().rx_buffer.get_allocated(0, size);
         if !buffer.is_empty() {
             tcp_trace!("rx buffer: peeking at {} octets", buffer.len());
         }
@@ -2653,7 +2672,23 @@ impl TcpSocket<'_> {
     ///
     /// This function otherwise behaves identically to [recv_slice](#method.recv_slice).
     pub fn peek_slice(&mut self, data: &mut [u8]) -> Result<usize, RecvError> {
-        Ok(self.state.rx_buffer.read_allocated(0, data))
+        Ok(self.inner_mut().rx_buffer.read_allocated(0, data))
+    }
+
+    /// Return the amount of octets queued in the transmit buffer.
+    ///
+    /// Note that the Berkeley sockets interface does not have an equivalent of this API.
+    pub fn send_queue(&self) -> usize {
+        self.inner().tx_buffer.len()
+    }
+
+    /// Return the amount of octets queued in the receive buffer. This value can be larger than
+    /// the slice read by the next `recv` or `peek` call because it includes all queued octets,
+    /// and not only the octets that may be returned as a contiguous slice.
+    ///
+    /// Note that the Berkeley sockets interface does not have an equivalent of this API.
+    pub fn recv_queue(&self) -> usize {
+        self.inner().rx_buffer.len()
     }
 }
 
@@ -2764,20 +2799,16 @@ mod test {
         }
     }
 
-    /// One socket plus the stack it sends through. Derefs to the socket's state
-    /// (which the tests poke at directly); [`view`] borrows both halves as a
-    /// [`TcpSocket`], the way [`Stack::tcp`] does.
-    ///
-    /// [`view`]: TestSocket::view
     struct TestSocket {
-        socket: TcpSocketState,
+        sockets: Slab<TcpSocketState>,
         stack: Stack,
     }
 
     impl TestSocket {
         fn view(&mut self) -> TcpSocket<'_> {
             TcpSocket {
-                state: &mut self.socket,
+                sockets: &mut self.sockets,
+                index: 0,
                 tx: self.stack.tx_context(),
             }
         }
@@ -2786,13 +2817,13 @@ mod test {
     impl Deref for TestSocket {
         type Target = TcpSocketState;
         fn deref(&self) -> &Self::Target {
-            &self.socket
+            self.sockets.get(0)
         }
     }
 
     impl DerefMut for TestSocket {
         fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.socket
+            self.sockets.get_mut(0)
         }
     }
 
@@ -2804,10 +2835,11 @@ mod test {
         let dst_addr = IpAddress::from(LOCAL_ADDR);
         net_trace!("send: {}", repr);
 
-        assert!(socket.socket.accepts(&src_addr, &dst_addr, repr));
+        assert!(socket.sockets.get_mut(0).accepts(&src_addr, &dst_addr, repr));
 
         match socket
-            .socket
+            .sockets
+            .get_mut(0)
             .process(timestamp, &mut socket.stack.inner.rand, &src_addr, &dst_addr, repr)
         {
             Some(repr) => {
@@ -2826,7 +2858,7 @@ mod test {
         socket.stack.inner.now = timestamp;
 
         let mut sent = 0;
-        let result = socket.socket.dispatch(
+        let result = socket.sockets.get_mut(0).dispatch(
             &mut socket.stack.tx_context(),
             |_, (src_addr, dst_addr, _hop_limit, tcp_repr)| {
                 assert_eq!(src_addr, LOCAL_ADDR.into());
@@ -2849,10 +2881,13 @@ mod test {
         socket.stack.inner.now = timestamp;
 
         let mut fail = false;
-        let result: Result<(), ()> = socket.socket.dispatch(&mut socket.stack.tx_context(), |_, _| {
-            fail = true;
-            Ok(())
-        });
+        let result: Result<(), ()> = socket
+            .sockets
+            .get_mut(0)
+            .dispatch(&mut socket.stack.tx_context(), |_, _| {
+                fail = true;
+                Ok(())
+            });
         if fail {
             panic!("Should not send a packet")
         }
@@ -2940,7 +2975,9 @@ mod test {
         let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
         let mut socket = TcpSocketState::new(rx_buffer, tx_buffer);
         socket.ack_delay = None;
-        TestSocket { socket, stack }
+        let mut sockets = Slab::new();
+        sockets.add_with(|_| socket);
+        TestSocket { sockets, stack }
     }
 
     fn socket_syn_received_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
@@ -3690,6 +3727,38 @@ mod test {
         let mut s = socket();
         assert_eq!(s.view().connect(REMOTE_END, 80), Ok(()));
         assert_eq!(s.view().connect(REMOTE_END, 80), Err(ConnectError::InvalidState));
+    }
+
+    #[test]
+    fn test_connect_ephemeral_port() {
+        use crate::stack::EPHEMERAL_PORT_MIN;
+
+        let mut stack = Stack::new();
+        let h1 = stack.add_tcp_socket(64, 64);
+        let h2 = stack.add_tcp_socket(64, 64);
+
+        // Local port 0 allocates an ephemeral port. (The explicit local address
+        // avoids needing an interface for source address selection.)
+        stack.tcp(h1).connect(REMOTE_END, (LOCAL_ADDR, 0)).unwrap();
+        let p1 = stack.tcp(h1).local_endpoint().unwrap().port;
+        assert!(p1 >= EPHEMERAL_PORT_MIN);
+
+        // A second allocation skips the port the first socket claimed.
+        stack.tcp(h2).connect(REMOTE_END, (LOCAL_ADDR, 0)).unwrap();
+        let p2 = stack.tcp(h2).local_endpoint().unwrap().port;
+        assert!(p2 >= EPHEMERAL_PORT_MIN);
+        assert_ne!(p1, p2);
+
+        // Listening sockets claim their port too. The PRNG seed is fixed, so a
+        // fresh stack's first allocation starts at the same port as `p1` above.
+        // A listener squatting on it forces the allocator to probe past.
+        let mut stack2 = Stack::new();
+        let listener = stack2.add_tcp_socket(64, 64);
+        let client = stack2.add_tcp_socket(64, 64);
+        stack2.tcp(listener).listen(p1).unwrap();
+        stack2.tcp(client).connect(REMOTE_END, (LOCAL_ADDR, 0)).unwrap();
+        let pc = stack2.tcp(client).local_endpoint().unwrap().port;
+        assert_ne!(pc, p1);
     }
 
     #[test]
@@ -8180,7 +8249,7 @@ mod test {
     fn test_listen_timeout() {
         let mut s = socket_listen();
         s.view().set_timeout(Some(Duration::from_millis(100)));
-        assert_eq!(s.socket.poll_at(), PollAt::Ingress);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Ingress);
     }
 
     #[test]
@@ -8199,7 +8268,7 @@ mod test {
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::SynSent);
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(250)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(250)));
         recv!(s, time 250, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
@@ -8215,23 +8284,23 @@ mod test {
         let mut s = socket_established();
         s.view().set_timeout(Some(Duration::from_millis(2000)));
         recv_nothing!(s, time 250);
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(2250)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(2250)));
         s.view().send_slice(b"abcdef").unwrap();
-        assert_eq!(s.socket.poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
         recv!(s, time 255, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(1255)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(1255)));
         recv!(s, time 1255, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(2255)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(2255)));
         recv!(s, time 2255, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1 + 6,
@@ -8253,13 +8322,13 @@ mod test {
             ..RECV_TEMPL
         }));
         recv_nothing!(s, time 100);
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(150)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(150)));
         send!(s, time 105, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         });
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(155)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(155)));
         recv!(s, time 155, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -8267,7 +8336,7 @@ mod test {
             ..RECV_TEMPL
         }));
         recv_nothing!(s, time 155);
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(205)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(205)));
         recv_nothing!(s, time 200);
         recv!(s, time 205, Ok(TcpRepr {
             control:    TcpControl::Rst,
@@ -8323,14 +8392,14 @@ mod test {
         s.view().set_timeout(Some(Duration::from_millis(200)));
         s.remote_last_ts = Some(Instant::from_millis(100));
         s.view().abort();
-        assert_eq!(s.socket.poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
         recv!(s, time 100, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
-        assert_eq!(s.socket.poll_at(), PollAt::Ingress);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Ingress);
     }
 
     // =========================================================================================//
@@ -8361,7 +8430,7 @@ mod test {
         s.view().set_keep_alive(Some(Duration::from_millis(100)));
 
         // drain the forced keep-alive packet
-        assert_eq!(s.socket.poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
         recv!(s, time 0, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -8369,7 +8438,7 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(100)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(100)));
         recv_nothing!(s, time 95);
         recv!(s, time 100, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -8378,7 +8447,7 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(200)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(200)));
         recv_nothing!(s, time 195);
         recv!(s, time 200, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -8392,7 +8461,7 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         });
-        assert_eq!(s.socket.poll_at(), PollAt::Time(Instant::from_millis(350)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(350)));
         recv_nothing!(s, time 345);
         recv!(s, time 350, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -8412,10 +8481,12 @@ mod test {
 
         s.view().set_hop_limit(Some(0x2a));
         assert_eq!(
-            s.socket.dispatch(&mut s.stack.tx_context(), |_, (_, _, hop_limit, _)| {
-                assert_eq!(hop_limit, 0x2a);
-                Ok::<_, ()>(())
-            }),
+            s.sockets
+                .get_mut(0)
+                .dispatch(&mut s.stack.tx_context(), |_, (_, _, hop_limit, _)| {
+                    assert_eq!(hop_limit, 0x2a);
+                    Ok::<_, ()>(())
+                }),
             Ok(())
         );
 

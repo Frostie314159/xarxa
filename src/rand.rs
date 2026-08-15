@@ -1,6 +1,7 @@
 //! Small non-cryptographic PRNG.
 //!
 //! This is used for:
+//! - Source ports for TCP and UDP.
 //! - TCP initial sequence numbers.
 
 // In test builds the TCP initial sequence number is a fixed value, leaving the
