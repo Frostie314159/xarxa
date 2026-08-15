@@ -245,10 +245,14 @@ impl fmt::Display for Cidr {
 
 /// An internet endpoint address.
 ///
-/// `Endpoint` always fully specifies both the address and the port.
+/// `Endpoint` names one peer: both the address and the port are meant to be
+/// specified. [`UNSPECIFIED`](Self::UNSPECIFIED) is the one exception, a
+/// sentinel for "no endpoint given" where an API defaults it from elsewhere.
+/// [`UdpSocket::send_with`](crate::udp::UdpSocket::send_with) takes the socket's
+/// connected remote for it.
 ///
-/// See also [`ListenEndpoint`], which allows not specifying the address
-/// in order to listen on a given port on any address.
+/// See also [`ListenEndpoint`], the endpoint of a *bind*, whose address is
+/// optional so that it can match more than one of our addresses.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct Endpoint {
     pub addr: Address,
@@ -256,9 +260,21 @@ pub struct Endpoint {
 }
 
 impl Endpoint {
+    /// The wildcard endpoint: unspecified address, port zero. Not a destination
+    /// anything can be sent to, but a sentinel for "no endpoint given".
+    pub const UNSPECIFIED: Endpoint = Endpoint {
+        addr: Address::Ipv4(Ipv4Address::UNSPECIFIED),
+        port: 0,
+    };
+
     /// Create an endpoint address from given address and port.
     pub const fn new(addr: Address, port: u16) -> Endpoint {
         Endpoint { addr, port }
+    }
+
+    /// Query whether both the address and the port are specified.
+    pub fn is_specified(&self) -> bool {
+        !self.addr.is_unspecified() && self.port != 0
     }
 }
 

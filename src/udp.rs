@@ -6,8 +6,10 @@
 //! receiving only touches the socket state, while sending transmits the datagram
 //! immediately.
 //!
-//! Binding to port 0 allocates an ephemeral port, and binds that would shadow
-//! another socket are rejected.
+//! A single [`bind`](UdpSocket::bind) call pins down (parts of) the socket's
+//! 4-tuple, local and remote halves at once, each part exact or wildcard. Binding
+//! to port 0 allocates an ephemeral port, and binds that would shadow another
+//! socket are rejected.
 //!
 //! Received packets are queued with their IP and UDP headers still in the buffer.
 //! The addresses returned in [`UdpMetadata`] are parsed back out of those header
@@ -19,7 +21,7 @@ use std::collections::VecDeque;
 
 use crate::buf::PacketBuf;
 use crate::slab::Slab;
-use crate::stack::{Iface, StackInner, TxContext, alloc_ephemeral_port};
+use crate::stack::{Iface, StackInner, TxContext, addr_matches, alloc_ephemeral_port};
 use crate::wire::{
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
     IpVersion, Ipv4Packet, Ipv6Packet, UDP_HEADER_LEN, UdpPacket,
@@ -70,6 +72,9 @@ pub enum BindError {
     /// No free port in the ephemeral range (only possible with tens of thousands
     /// of bound sockets).
     NoFreePorts,
+    /// The local and remote addresses belong to different address families, or no
+    /// local address is available for the given remote.
+    Unaddressable,
 }
 
 impl fmt::Display for BindError {
@@ -78,6 +83,7 @@ impl fmt::Display for BindError {
             BindError::InvalidState => write!(f, "invalid state"),
             BindError::InUse => write!(f, "port in use"),
             BindError::NoFreePorts => write!(f, "no free ports"),
+            BindError::Unaddressable => write!(f, "unaddressable"),
         }
     }
 }
@@ -129,7 +135,14 @@ impl core::error::Error for RecvError {}
 /// UDP socket state, stored inside the stack.
 #[derive(Debug)]
 pub(crate) struct UdpSocketState {
-    endpoint: IpListenEndpoint,
+    /// The local half of the socket's 4-tuple. The address filters the packet's
+    /// destination, from any address of any version to one exact address. A zero
+    /// port means the socket is not bound.
+    local: IpListenEndpoint,
+    /// The remote half of the socket's 4-tuple. Specified parts filter ingress
+    /// (only matching datagrams are delivered) and are the default destination
+    /// for sends. Unspecified parts match any remote.
+    remote: IpListenEndpoint,
     rx_queue: VecDeque<PacketBuf>,
     hop_limit: Option<u8>,
 }
@@ -138,7 +151,8 @@ impl UdpSocketState {
     /// Create an unbound UDP socket.
     pub(crate) fn new() -> UdpSocketState {
         UdpSocketState {
-            endpoint: IpListenEndpoint::default(),
+            local: IpListenEndpoint::UNSPECIFIED,
+            remote: IpListenEndpoint::UNSPECIFIED,
             rx_queue: VecDeque::new(),
             hop_limit: None,
         }
@@ -249,10 +263,18 @@ impl UdpSocket<'_> {
         self.sockets.get_mut(self.index)
     }
 
-    /// Return the bound endpoint.
+    /// Return the bound local endpoint. The address is the filter the bind
+    /// scoped the socket to. A zero port means the socket is not bound.
     #[inline]
-    pub fn endpoint(&self) -> IpListenEndpoint {
-        self.inner().endpoint
+    pub fn local_endpoint(&self) -> IpListenEndpoint {
+        self.inner().local
+    }
+
+    /// Return the bound remote endpoint. Unspecified parts match any remote:
+    /// a fully unspecified endpoint means an ordinary unconnected socket.
+    #[inline]
+    pub fn remote_endpoint(&self) -> IpListenEndpoint {
+        self.inner().remote
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -277,62 +299,111 @@ impl UdpSocket<'_> {
         self.inner_mut().hop_limit = hop_limit
     }
 
-    /// Bind the socket to the given endpoint.
+    /// Bind the socket, fixing (parts of) its 4-tuple.
     ///
-    /// The endpoint's address scopes the bind. Absent, it matches any address of
-    /// either IP version. Unspecified (`0.0.0.0` / `::`), any address of that
-    /// version alone. Concrete, that address alone.
+    /// Every UDP socket is identified by the (local address, local port, remote
+    /// address, remote port) tuple, and binding pins parts of it down: each part
+    /// of `local` and `remote` is either exact or a wildcard (absent or
+    /// unspecified address / zero port):
     ///
-    /// A port of zero means "allocate an ephemeral port": a free port in the
-    /// 49152..=65535 range, picked at a random starting point. An explicit port
-    /// that overlaps another UDP socket's binding (same port, and address filters
-    /// that can both match one address) is rejected, since each datagram is handed
-    /// to a single socket and the binds would shadow each other. Binds that cannot
-    /// overlap are allowed, so the two halves of a dual stack,
-    /// `(Ipv4Address::UNSPECIFIED, port)` and `(Ipv6Address::UNSPECIFIED, port)`,
-    /// can be served by two sockets.
+    /// - `bind(port, ANY)`: server on all addresses of both IP versions.
+    /// - `bind((Ipv4Address::UNSPECIFIED, port), ANY)`: server on all IPv4
+    ///   addresses, and no IPv6 one.
+    /// - `bind((addr, port), ANY)`: server on one address.
+    /// - `bind(0, ANY)`: unconnected sender. A free port in the 49152..=65535
+    ///   range is allocated, picked at a random starting point.
+    /// - `bind((addr, 0), ANY)`: pin the source address, allocate the port.
+    /// - `bind(0, remote)`: ordinary connected client. The local address is
+    ///   resolved from the routing tables (a connected socket always has a
+    ///   concrete local address), and an ephemeral local port is allocated.
+    ///
+    /// (`ANY` above is [`IpListenEndpoint::UNSPECIFIED`], the fully wildcard
+    /// remote.)
+    ///
+    /// Specified parts of `remote` filter ingress, so only datagrams matching them
+    /// are delivered, and are the default destination for sends. The remote half is
+    /// not all-or-nothing: e.g. a remote with only the address specified accepts
+    /// any port of that one peer.
+    ///
+    /// An explicit local port that overlaps another UDP socket's binding (same
+    /// port, and address filters that can both match one address) is rejected,
+    /// since each datagram is handed to a single socket and the binds would shadow
+    /// each other. Binds that cannot overlap are allowed, so the two halves of a
+    /// dual stack, `(Ipv4Address::UNSPECIFIED, port)` and
+    /// `(Ipv6Address::UNSPECIFIED, port)`, can be served by two sockets.
     ///
     /// Returns `Err(BindError::InvalidState)` if the socket is already bound (see
     /// [is_open](#method.is_open)), `Err(BindError::InUse)` on an overlapping
-    /// bind, and `Err(BindError::NoFreePorts)` if the ephemeral range is
-    /// exhausted.
-    pub fn bind<T: Into<IpListenEndpoint>>(&mut self, endpoint: T) -> Result<(), BindError> {
-        let mut endpoint = endpoint.into();
+    /// bind, `Err(BindError::NoFreePorts)` if the ephemeral range is exhausted,
+    /// and `Err(BindError::Unaddressable)` on an address family mismatch or if
+    /// no local address is available for the given remote.
+    pub fn bind(
+        &mut self,
+        local: impl Into<IpListenEndpoint>,
+        remote: impl Into<IpListenEndpoint>,
+    ) -> Result<(), BindError> {
+        let mut local: IpListenEndpoint = local.into();
+        let remote: IpListenEndpoint = remote.into();
         if self.is_open() {
             return Err(BindError::InvalidState);
         }
 
-        if endpoint.port == 0 {
+        // Neither half may restrict the socket to a family the other excludes.
+        // That includes the per-version wildcards, which restrict without naming
+        // an address.
+        if let (Some(local_version), Some(remote_version)) = (local.version(), remote.version())
+            && local_version != remote_version
+        {
+            return Err(BindError::Unaddressable);
+        }
+
+        // A fully-specified remote resolves a wildcard local address via a route
+        // lookup. A connected socket always has a concrete local address.
+        if let Some(remote_addr) = remote.concrete_addr()
+            && remote.port != 0
+            && local.concrete_addr().is_none()
+        {
+            local.addr = Some(
+                self.tx
+                    .get_source_address(&remote_addr)
+                    .ok_or(BindError::Unaddressable)?,
+            );
+        }
+
+        if local.port == 0 {
             // Skip every port any other UDP socket has bound, regardless of
             // address.
             let (sockets, index) = (&self.sockets, self.index);
-            endpoint.port = alloc_ephemeral_port(self.tx.rand(), |port| {
-                sockets.iter().any(|(i, s)| i != index && s.endpoint.port == port)
+            local.port = alloc_ephemeral_port(self.tx.rand(), |port| {
+                sockets.iter().any(|(i, s)| i != index && s.local.port == port)
             })
             .ok_or(BindError::NoFreePorts)?;
         } else if self
             .sockets
             .iter()
-            .any(|(i, s)| i != self.index && s.endpoint.port == endpoint.port && addrs_overlap(s.endpoint, endpoint))
+            .any(|(i, s)| i != self.index && s.local.port == local.port && addrs_overlap(s.local, local))
         {
             return Err(BindError::InUse);
         }
 
-        self.inner_mut().endpoint = endpoint;
+        let state = self.inner_mut();
+        state.local = local;
+        state.remote = remote;
         Ok(())
     }
 
     /// Close the socket, unbinding it and dropping any queued packets.
     pub fn close(&mut self) {
         let state = self.inner_mut();
-        state.endpoint = IpListenEndpoint::default();
+        state.local = IpListenEndpoint::UNSPECIFIED;
+        state.remote = IpListenEndpoint::UNSPECIFIED;
         state.rx_queue.clear();
     }
 
     /// Check whether the socket is open (bound to a port).
     #[inline]
     pub fn is_open(&self) -> bool {
-        self.inner().endpoint.port != 0
+        self.inner().local.port != 0
     }
 
     /// Check whether the RX queue is not empty.
@@ -410,7 +481,12 @@ impl UdpSocket<'_> {
         })
     }
 
-    /// Send a datagram to the given remote endpoint, building the payload in place.
+    /// Send a datagram, building the payload in place.
+    ///
+    /// The destination is `meta.endpoint`, with unspecified parts defaulted from
+    /// the socket's bound remote endpoint. On a connected socket, sending to
+    /// `IpEndpoint::UNSPECIFIED` sends to the connected remote. An explicitly
+    /// specified destination is honored even on a connected socket.
     ///
     /// The closure gets a `max_size`-byte slice inside a freshly allocated packet
     /// buffer, and returns how many bytes it wrote. The datagram is then sent
@@ -419,8 +495,9 @@ impl UdpSocket<'_> {
     /// successful send.
     ///
     /// Returns `Err(SendError::Unaddressable)` if the socket is not bound, the
-    /// destination address or port is zero, the destination's address family does not
-    /// match the source address, or no source address is available.
+    /// destination address or port is still unspecified after defaulting, the
+    /// destination's address family does not match the source address, or no source
+    /// address is available.
     /// Returns `Err(SendError::BufferFull)` if the payload cannot fit in a packet
     /// buffer.
     pub fn send_with(
@@ -429,19 +506,32 @@ impl UdpSocket<'_> {
         meta: impl Into<UdpMetadata>,
         f: impl FnOnce(&mut [u8]) -> usize,
     ) -> Result<(), SendError> {
-        let meta = meta.into();
-        let endpoint = self.inner().endpoint;
+        let mut meta = meta.into();
+        let local = self.inner().local;
+        let remote = self.inner().remote;
         let hop_limit = self.inner().hop_limit.unwrap_or(64);
 
-        if endpoint.port == 0 {
+        if local.port == 0 {
             return Err(SendError::Unaddressable);
         }
-        if meta.endpoint.addr.is_unspecified() || meta.endpoint.port == 0 {
+
+        // Default unspecified parts of the destination from the bound remote. Only a
+        // concrete remote address is a destination. The per-version wildcards are
+        // filters, and leave the destination unspecified.
+        if meta.endpoint.addr.is_unspecified()
+            && let Some(addr) = remote.concrete_addr()
+        {
+            meta.endpoint.addr = addr;
+        }
+        if meta.endpoint.port == 0 {
+            meta.endpoint.port = remote.port;
+        }
+        if !meta.endpoint.is_specified() {
             return Err(SendError::Unaddressable);
         }
         // A bind scoped to one IP version cannot send over the other: the replies
         // would arrive on a version its own ingress filter drops.
-        if endpoint
+        if local
             .version()
             .is_some_and(|version| version != meta.endpoint.addr.version())
         {
@@ -451,7 +541,7 @@ impl UdpSocket<'_> {
         // Pick the source address: explicit in the metadata, else the socket's bound
         // address (only a concrete one is an address, the wildcards are filters),
         // else one chosen from the destination.
-        let src_addr = match meta.local_address.or(endpoint.concrete_addr()) {
+        let src_addr = match meta.local_address.or(local.concrete_addr()) {
             Some(addr) => addr,
             None => self
                 .tx
@@ -484,13 +574,13 @@ impl UdpSocket<'_> {
         let udp_len = buf.len();
         {
             let mut udp = UdpPacket::new_unchecked(&mut buf);
-            udp.set_src_port(endpoint.port);
+            udp.set_src_port(local.port);
             udp.set_dst_port(meta.endpoint.port);
             udp.set_len(udp_len as u16);
             udp.fill_checksum(&src_addr, &meta.endpoint.addr);
         }
 
-        net_trace!("udp:{}:{}: sending {} octets", endpoint, meta.endpoint, size);
+        net_trace!("udp:{}:{}: sending {} octets", local, meta.endpoint, size);
 
         self.tx
             .transmit_ip(buf, src_addr, meta.endpoint.addr, IpProtocol::Udp, hop_limit);
@@ -541,12 +631,12 @@ impl StackInner {
         let dst_is_bcast = iface.is_broadcast(&dst_addr) || dst_addr.is_multicast();
 
         for (_, socket) in sockets.iter_mut() {
-            if socket.endpoint.port != dst_port {
+            if socket.local.port != dst_port {
                 continue;
             }
             // The broadcast relaxation applies to the address, never to the IP
             // version: a socket bound to any IPv4 address is not an IPv6 socket.
-            match socket.endpoint.addr {
+            match socket.local.addr {
                 None => {}
                 Some(addr) if addr.is_unspecified() => {
                     if addr.version() != dst_addr.version() {
@@ -559,10 +649,17 @@ impl StackInner {
                     }
                 }
             }
+            // Specified parts of the remote half filter the sender.
+            if !addr_matches(&socket.remote, &src_addr) {
+                continue;
+            }
+            if socket.remote.port != 0 && socket.remote.port != src_port {
+                continue;
+            }
 
             net_trace!(
                 "udp:{}: receiving {} octets from {}:{}",
-                socket.endpoint,
+                socket.local,
                 payload_len,
                 src_addr,
                 src_port
@@ -579,8 +676,9 @@ impl StackInner {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::stack::Stack;
-    use crate::wire::{Ipv4Address, Ipv6Address};
+    use crate::iface::{IfaceCapabilities, Interface, Medium};
+    use crate::stack::{Config, Stack};
+    use crate::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv6Address};
 
     fn stack_with_socket() -> (Stack, UdpHandle) {
         let mut stack = Stack::new();
@@ -590,11 +688,49 @@ mod test {
 
     const LOCAL_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
     const REMOTE_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
+    const OTHER_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 3);
     const LOCAL_PORT: u16 = 53;
     const REMOTE_PORT: u16 = 49500;
 
+    /// The fully wildcard remote: an ordinary unconnected bind.
+    const ANY: IpListenEndpoint = IpListenEndpoint::UNSPECIFIED;
+
+    /// A device that swallows every frame the stack transmits.
+    struct TestingDevice;
+
+    impl Interface for TestingDevice {
+        fn capabilities(&self) -> IfaceCapabilities {
+            IfaceCapabilities {
+                medium: Medium::Ip,
+                max_transmission_unit: 1500,
+            }
+        }
+
+        fn receive(&mut self) -> Option<PacketBuf> {
+            None
+        }
+
+        fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
+            Ok(())
+        }
+    }
+
+    /// A stack with one interface owning `LOCAL_ADDR`, so that binds with a
+    /// specified remote can resolve their local address.
+    fn stack_with_iface() -> Stack {
+        let mut stack = Stack::new();
+        stack.add_iface(
+            Box::new(TestingDevice),
+            Config {
+                hardware_addr: EthernetAddress([0x02; 6]),
+                ip_addrs: vec![IpCidr::new(LOCAL_ADDR.into(), 24)],
+            },
+        );
+        stack
+    }
+
     /// Build a queued-datagram buffer the way ingress does, as a full IPv4 + UDP packet.
-    fn queued_packet(payload: &[u8]) -> PacketBuf {
+    fn queued_packet_from(src_addr: Ipv4Address, src_port: u16, payload: &[u8]) -> PacketBuf {
         let udp_len = UDP_HEADER_LEN + payload.len();
         let mut buf = PacketBuf::new();
         buf.set_len(IPV4_HEADER_LEN + udp_len);
@@ -604,18 +740,36 @@ mod test {
             ip.set_header_len(IPV4_HEADER_LEN as u8);
             ip.set_total_len((IPV4_HEADER_LEN + udp_len) as u16);
             ip.set_next_header(IpProtocol::Udp);
-            ip.set_src_addr(REMOTE_ADDR);
+            ip.set_src_addr(src_addr);
             ip.set_dst_addr(LOCAL_ADDR);
         }
         {
             let mut udp = UdpPacket::new_unchecked(&mut buf[IPV4_HEADER_LEN..]);
-            udp.set_src_port(REMOTE_PORT);
+            udp.set_src_port(src_port);
             udp.set_dst_port(LOCAL_PORT);
             udp.set_len(udp_len as u16);
             udp.payload_mut().copy_from_slice(payload);
-            udp.fill_checksum(&REMOTE_ADDR.into(), &LOCAL_ADDR.into());
+            udp.fill_checksum(&src_addr.into(), &LOCAL_ADDR.into());
         }
         buf
+    }
+
+    fn queued_packet(payload: &[u8]) -> PacketBuf {
+        queued_packet_from(REMOTE_ADDR, REMOTE_PORT, payload)
+    }
+
+    /// Run a packet through the stack's UDP ingress demux.
+    fn deliver(stack: &mut Stack, src_addr: Ipv4Address, src_port: u16, payload: &[u8]) {
+        let mut buf = queued_packet_from(src_addr, src_port, payload);
+        buf.pull_front(IPV4_HEADER_LEN);
+        stack.inner.process_udp(
+            stack.ifaces.get(0),
+            &mut stack.sockets.udp,
+            src_addr.into(),
+            LOCAL_ADDR.into(),
+            IPV4_HEADER_LEN,
+            buf,
+        );
     }
 
     #[test]
@@ -623,20 +777,21 @@ mod test {
         let (mut stack, handle) = stack_with_socket();
         let mut socket = stack.udp(handle);
         assert!(!socket.is_open());
-        assert_eq!(socket.bind(LOCAL_PORT), Ok(()));
+        assert_eq!(socket.bind(LOCAL_PORT, ANY), Ok(()));
         assert!(socket.is_open());
-        assert_eq!(socket.bind(LOCAL_PORT), Err(BindError::InvalidState));
+        assert_eq!(socket.bind(LOCAL_PORT, ANY), Err(BindError::InvalidState));
 
         socket.close();
         assert!(!socket.is_open());
-        assert_eq!(socket.bind((LOCAL_ADDR, LOCAL_PORT)), Ok(()));
+        assert_eq!(socket.bind((LOCAL_ADDR, LOCAL_PORT), ANY), Ok(()));
         assert_eq!(
-            socket.endpoint(),
+            socket.local_endpoint(),
             IpListenEndpoint {
                 addr: Some(LOCAL_ADDR.into()),
                 port: LOCAL_PORT
             }
         );
+        assert_eq!(socket.remote_endpoint(), IpListenEndpoint::UNSPECIFIED);
     }
 
     #[test]
@@ -647,41 +802,42 @@ mod test {
         let h1 = stack.add_udp_socket();
         let h2 = stack.add_udp_socket();
 
-        stack.udp(h1).bind(0).unwrap();
-        let p1 = stack.udp(h1).endpoint().port;
+        stack.udp(h1).bind(0, ANY).unwrap();
+        let p1 = stack.udp(h1).local_endpoint().port;
         assert!(p1 >= EPHEMERAL_PORT_MIN);
 
         // The second allocation must avoid the first socket's port.
-        stack.udp(h2).bind(0).unwrap();
-        let p2 = stack.udp(h2).endpoint().port;
+        stack.udp(h2).bind(0, ANY).unwrap();
+        let p2 = stack.udp(h2).local_endpoint().port;
         assert!(p2 >= EPHEMERAL_PORT_MIN);
         assert_ne!(p1, p2);
     }
 
     #[test]
     fn test_bind_conflicts() {
-        const OTHER_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 3);
-
         let mut stack = Stack::new();
         let h1 = stack.add_udp_socket();
         let h2 = stack.add_udp_socket();
 
         // Address-less binds conflict on the port alone.
-        stack.udp(h1).bind(LOCAL_PORT).unwrap();
-        assert_eq!(stack.udp(h2).bind(LOCAL_PORT), Err(BindError::InUse));
+        stack.udp(h1).bind(LOCAL_PORT, ANY).unwrap();
+        assert_eq!(stack.udp(h2).bind(LOCAL_PORT, ANY), Err(BindError::InUse));
         // A specific address conflicts with an address-less bind on the same port.
-        assert_eq!(stack.udp(h2).bind((LOCAL_ADDR, LOCAL_PORT)), Err(BindError::InUse));
+        assert_eq!(stack.udp(h2).bind((LOCAL_ADDR, LOCAL_PORT), ANY), Err(BindError::InUse));
         // A different port is fine.
-        stack.udp(h2).bind(LOCAL_PORT + 1).unwrap();
+        stack.udp(h2).bind(LOCAL_PORT + 1, ANY).unwrap();
 
         // Two different specific addresses may share a port.
         let h3 = stack.add_udp_socket();
         let h4 = stack.add_udp_socket();
         let h5 = stack.add_udp_socket();
-        stack.udp(h3).bind((LOCAL_ADDR, LOCAL_PORT + 2)).unwrap();
-        stack.udp(h4).bind((OTHER_ADDR, LOCAL_PORT + 2)).unwrap();
+        stack.udp(h3).bind((LOCAL_ADDR, LOCAL_PORT + 2), ANY).unwrap();
+        stack.udp(h4).bind((OTHER_ADDR, LOCAL_PORT + 2), ANY).unwrap();
         // ...but the same specific address may not.
-        assert_eq!(stack.udp(h5).bind((LOCAL_ADDR, LOCAL_PORT + 2)), Err(BindError::InUse));
+        assert_eq!(
+            stack.udp(h5).bind((LOCAL_ADDR, LOCAL_PORT + 2), ANY),
+            Err(BindError::InUse)
+        );
     }
 
     #[test]
@@ -694,19 +850,19 @@ mod test {
 
         // The two halves of a dual stack can never match the same datagram, so
         // they may share a port.
-        stack.udp(h1).bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT)).unwrap();
-        stack.udp(h2).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT)).unwrap();
+        stack.udp(h1).bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT), ANY).unwrap();
+        stack.udp(h2).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY).unwrap();
 
         // A concrete address does overlap the wildcard of its own version...
-        assert_eq!(stack.udp(h3).bind((LOCAL_ADDR, LOCAL_PORT)), Err(BindError::InUse));
+        assert_eq!(stack.udp(h3).bind((LOCAL_ADDR, LOCAL_PORT), ANY), Err(BindError::InUse));
         // ...and so does the address-less bind, which matches both versions.
-        assert_eq!(stack.udp(h3).bind(LOCAL_PORT), Err(BindError::InUse));
+        assert_eq!(stack.udp(h3).bind(LOCAL_PORT, ANY), Err(BindError::InUse));
 
         // A different port is fine, and then the address-less bind takes both
         // versions away from anything that would follow it.
-        stack.udp(h3).bind(LOCAL_PORT + 1).unwrap();
+        stack.udp(h3).bind(LOCAL_PORT + 1, ANY).unwrap();
         assert_eq!(
-            stack.udp(h4).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT + 1)),
+            stack.udp(h4).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT + 1), ANY),
             Err(BindError::InUse)
         );
     }
@@ -715,7 +871,7 @@ mod test {
     fn test_send_per_version_bind() {
         let (mut stack, handle) = stack_with_socket();
         let mut socket = stack.udp(handle);
-        socket.bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT)).unwrap();
+        socket.bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY).unwrap();
 
         // The bind scopes the socket to IPv6, so an IPv4 destination contradicts it.
         assert_eq!(
@@ -725,10 +881,132 @@ mod test {
     }
 
     #[test]
+    fn test_demux_per_version() {
+        // A bind to any IPv6 address takes no IPv4 traffic, not even on the port
+        // it holds.
+        let mut stack = stack_with_iface();
+        let handle = stack.add_udp_socket();
+        stack
+            .udp(handle)
+            .bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY)
+            .unwrap();
+
+        deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"no");
+        assert!(!stack.udp(handle).can_recv());
+
+        // The IPv4 half of the same port does take it.
+        let handle = stack.add_udp_socket();
+        stack
+            .udp(handle)
+            .bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT), ANY)
+            .unwrap();
+
+        deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"yes");
+        assert_eq!(&*stack.udp(handle).recv().unwrap(), b"yes");
+    }
+
+    #[test]
+    fn test_bind_connected() {
+        use crate::stack::EPHEMERAL_PORT_MIN;
+
+        let mut stack = stack_with_iface();
+        let handle = stack.add_udp_socket();
+        let mut socket = stack.udp(handle);
+
+        // Local fully wildcard + exact remote: the ordinary connected client.
+        // The local address is resolved from the routing tables, and an
+        // ephemeral port is allocated.
+        socket.bind(0, (REMOTE_ADDR, REMOTE_PORT)).unwrap();
+        let local = socket.local_endpoint();
+        assert_eq!(local.addr, Some(LOCAL_ADDR.into()));
+        assert!(local.port >= EPHEMERAL_PORT_MIN);
+        assert_eq!(
+            socket.remote_endpoint(),
+            IpListenEndpoint {
+                addr: Some(REMOTE_ADDR.into()),
+                port: REMOTE_PORT
+            }
+        );
+    }
+
+    #[test]
+    fn test_bind_connected_unaddressable() {
+        // Without any interface there is no local address for the remote.
+        let (mut stack, handle) = stack_with_socket();
+        assert_eq!(
+            stack.udp(handle).bind(0, (REMOTE_ADDR, REMOTE_PORT)),
+            Err(BindError::Unaddressable)
+        );
+
+        // Mismatched local/remote address families.
+        let mut stack = stack_with_iface();
+        let handle = stack.add_udp_socket();
+        assert_eq!(
+            stack.udp(handle).bind(
+                (LOCAL_ADDR, LOCAL_PORT),
+                (crate::wire::Ipv6Address::LOCALHOST, REMOTE_PORT)
+            ),
+            Err(BindError::Unaddressable)
+        );
+    }
+
+    #[test]
+    fn test_connected_demux_filter() {
+        let mut stack = stack_with_iface();
+        let handle = stack.add_udp_socket();
+        stack.udp(handle).bind(LOCAL_PORT, (REMOTE_ADDR, REMOTE_PORT)).unwrap();
+
+        // Matching the connected remote: delivered.
+        deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"yes");
+        assert_eq!(&*stack.udp(handle).recv().unwrap(), b"yes");
+
+        // Wrong source address or port: filtered out.
+        deliver(&mut stack, OTHER_ADDR, REMOTE_PORT, b"no");
+        deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT + 1, b"no");
+        assert!(!stack.udp(handle).can_recv());
+    }
+
+    #[test]
+    fn test_remote_addr_only_filter() {
+        // A partially specified remote: any port of one peer.
+        let mut stack = stack_with_iface();
+        let handle = stack.add_udp_socket();
+        stack.udp(handle).bind(LOCAL_PORT, (REMOTE_ADDR, 0)).unwrap();
+
+        deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"a");
+        deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT + 1, b"b");
+        deliver(&mut stack, OTHER_ADDR, REMOTE_PORT, b"no");
+        assert_eq!(&*stack.udp(handle).recv().unwrap(), b"a");
+        assert_eq!(&*stack.udp(handle).recv().unwrap(), b"b");
+        assert!(!stack.udp(handle).can_recv());
+    }
+
+    #[test]
+    fn test_send_defaults_to_remote() {
+        let mut stack = stack_with_iface();
+        let handle = stack.add_udp_socket();
+        let mut socket = stack.udp(handle);
+
+        // Unconnected socket: a wildcard destination is unaddressable.
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+        assert_eq!(
+            socket.send_slice(b"hi", IpEndpoint::UNSPECIFIED),
+            Err(SendError::Unaddressable)
+        );
+        socket.close();
+
+        // Connected socket: the destination defaults to the bound remote, and
+        // an explicit destination overrides it.
+        socket.bind(LOCAL_PORT, (REMOTE_ADDR, REMOTE_PORT)).unwrap();
+        assert_eq!(socket.send_slice(b"hi", IpEndpoint::UNSPECIFIED), Ok(()));
+        assert_eq!(socket.send_slice(b"hi", IpEndpoint::new(OTHER_ADDR.into(), 9)), Ok(()));
+    }
+
+    #[test]
     fn test_recv() {
         let (mut stack, handle) = stack_with_socket();
         let mut socket = stack.udp(handle);
-        socket.bind(LOCAL_PORT).unwrap();
+        socket.bind(LOCAL_PORT, ANY).unwrap();
 
         assert!(!socket.can_recv());
         assert_eq!(socket.recv().err(), Some(RecvError::Exhausted));
@@ -753,7 +1031,7 @@ mod test {
     fn test_peek_and_recv_slice() {
         let (mut stack, handle) = stack_with_socket();
         let mut socket = stack.udp(handle);
-        socket.bind(LOCAL_PORT).unwrap();
+        socket.bind(LOCAL_PORT, ANY).unwrap();
         socket.inner_mut().rx_enqueue(queued_packet(b"abcdef"));
 
         let (payload, meta) = socket.peek().unwrap();
@@ -775,7 +1053,7 @@ mod test {
     fn test_recv_slice_truncated() {
         let (mut stack, handle) = stack_with_socket();
         let mut socket = stack.udp(handle);
-        socket.bind(LOCAL_PORT).unwrap();
+        socket.bind(LOCAL_PORT, ANY).unwrap();
         socket.inner_mut().rx_enqueue(queued_packet(b"abcdef"));
 
         let mut slice = [0; 4];
