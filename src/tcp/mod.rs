@@ -2920,7 +2920,7 @@ mod test {
 
     /// A stack with one interface owning `LOCAL_ADDR`.
     fn test_stack() -> Stack {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         stack.add_iface(
             Box::new(TestingDevice),
             Config {
@@ -3707,7 +3707,7 @@ mod test {
     fn test_connect_ephemeral_port() {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let h1 = stack.add_tcp_socket(64, 64);
         let h2 = stack.add_tcp_socket(64, 64);
 
@@ -3732,7 +3732,7 @@ mod test {
             port: REMOTE_PORT,
         };
 
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let h1 = stack.add_tcp_socket(64, 64);
         let h2 = stack.add_tcp_socket(64, 64);
         let h3 = stack.add_tcp_socket(64, 64);
@@ -9503,7 +9503,7 @@ mod stack_test {
 
     fn stack() -> (Stack, Rc<RefCell<Queues>>) {
         let queues = Rc::new(RefCell::new(Queues::default()));
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         stack.add_iface(
             Box::new(QueueDevice(queues.clone())),
             Config {

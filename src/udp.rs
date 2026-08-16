@@ -769,7 +769,7 @@ mod test {
     use crate::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv6Address};
 
     fn stack_with_socket() -> (Stack, UdpHandle) {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_udp_socket();
         (stack, handle)
     }
@@ -806,7 +806,7 @@ mod test {
     /// A stack with one interface owning `LOCAL_ADDR`, so that binds with a
     /// specified remote can resolve their local address.
     fn stack_with_iface() -> Stack {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         stack.add_iface(
             Box::new(TestingDevice),
             Config {
@@ -891,7 +891,7 @@ mod test {
     fn test_bind_ephemeral() {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let h1 = stack.add_udp_socket();
         let h2 = stack.add_udp_socket();
 
@@ -908,7 +908,7 @@ mod test {
 
     #[test]
     fn test_bind_conflicts() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let h1 = stack.add_udp_socket();
         let h2 = stack.add_udp_socket();
 
@@ -958,7 +958,7 @@ mod test {
 
     #[test]
     fn test_bind_conflicts_per_version() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let h1 = stack.add_udp_socket();
         let h2 = stack.add_udp_socket();
         let h3 = stack.add_udp_socket();

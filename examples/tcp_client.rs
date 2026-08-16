@@ -52,7 +52,7 @@ fn main() {
     let device = TunTapInterface::new(name, medium).unwrap();
     let fd = device.as_raw_fd();
 
-    let mut stack = Stack::new();
+    let mut stack = Stack::new(random_seed());
     let iface = stack.add_iface(
         Box::new(device),
         Config {
@@ -120,4 +120,13 @@ fn main() {
         });
         wait(fd, timeout).unwrap();
     }
+}
+
+/// Quick-and-dirty entropy for the example's PRNG seed. Real firmware should
+/// use a hardware RNG or another unpredictable source.
+fn random_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
 }

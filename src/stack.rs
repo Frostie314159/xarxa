@@ -237,13 +237,15 @@ enum NeighborLookup {
 
 impl Stack {
     /// Create a network stack.
-    pub fn new() -> Self {
+    ///
+    /// `random_seed` seeds the stack's PRNG, which picks TCP initial sequence
+    /// numbers and ephemeral ports. This should be random, or at least different
+    /// at every boot.
+    pub fn new(random_seed: u64) -> Self {
         Self {
             inner: StackInner {
                 now: Instant::ZERO,
-                // TODO: let the user seed this. Predictable TCP initial sequence
-                // numbers make connections easier to spoof.
-                rand: Rand::new(0x1234_5678_dead_beef),
+                rand: Rand::new(random_seed),
                 neighbor_cache: NeighborCache::new(),
                 pending: PendingQueue::new(),
                 routes: Routes::new(),
@@ -470,12 +472,6 @@ impl Stack {
             .flatten()
             .chain(tcp_poll_at)
             .min()
-    }
-}
-
-impl Default for Stack {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

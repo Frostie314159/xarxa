@@ -626,7 +626,7 @@ mod test {
 
     #[test]
     fn test_bind_ip() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
         let mut socket = stack.raw(handle);
         assert!(!socket.is_open());
@@ -660,7 +660,7 @@ mod test {
 
     #[test]
     fn test_bind_ethernet() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let (eth_iface, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (ip_iface, _) = add_test_iface(&mut stack, Medium::Ip, vec![]);
 
@@ -686,7 +686,7 @@ mod test {
 
     #[test]
     fn test_recv() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
         let mut socket = stack.raw(handle);
         socket
@@ -712,7 +712,7 @@ mod test {
 
     #[test]
     fn test_peek_and_recv_slice() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
         let mut socket = stack.raw(handle);
         socket
@@ -737,7 +737,7 @@ mod test {
 
     #[test]
     fn test_recv_slice_truncated() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
         let mut socket = stack.raw(handle);
         socket
@@ -759,7 +759,7 @@ mod test {
 
     #[test]
     fn test_demux_ip() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let h_icmp = stack.add_raw_socket();
         let h_any = stack.add_raw_socket();
         stack
@@ -832,7 +832,7 @@ mod test {
 
     #[test]
     fn test_demux_ethernet() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let (iface_a, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (iface_b, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
 
@@ -892,7 +892,7 @@ mod test {
 
     #[test]
     fn test_send_ethernet() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let (iface, tx) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let handle = stack.add_raw_socket();
 
@@ -920,7 +920,7 @@ mod test {
 
     #[test]
     fn test_send_ip() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
         stack
             .raw(handle)
@@ -961,7 +961,7 @@ mod test {
 
     #[test]
     fn test_send_ip_protocol_filter() {
-        let mut stack = Stack::new();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
         let (_iface, tx) = add_test_iface(
             &mut stack,
             Medium::Ip,
