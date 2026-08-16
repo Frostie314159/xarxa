@@ -5,7 +5,9 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
-use crate::iface::{Interface, Medium};
+#[cfg(feature = "icmp-error-handling")]
+use crate::icmp_error::{IcmpError, parse_quoted_packet};
+use crate::iface::{IfaceCapabilities, Interface, Medium};
 use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
 use crate::raw::{RawHandle, RawSocket, RawSocketState};
@@ -50,7 +52,7 @@ pub struct IfaceHandle(pub(crate) usize);
 /// A network stack.
 pub struct Stack {
     pub(crate) inner: StackInner,
-    pub(crate) ifaces: Slab<Iface>,
+    pub(crate) ifaces: Slab<IfaceState>,
     pub(crate) sockets: Sockets,
 }
 
@@ -63,11 +65,140 @@ pub(crate) struct Sockets {
 }
 
 /// An interface added to the stack, with its configuration.
-pub(crate) struct Iface {
+pub(crate) struct IfaceState {
     handle: IfaceHandle,
     dev: Box<dyn Interface>,
     hardware_addr: EthernetAddress,
     pub(crate) ip_addrs: Vec<IpCidr>,
+}
+
+/// An interface borrowed from a [`Stack`], returned by [`Stack::iface`].
+pub struct Iface<'a> {
+    inner: &'a mut StackInner,
+    ifaces: &'a mut Slab<IfaceState>,
+    index: usize,
+}
+
+impl Iface<'_> {
+    #[inline]
+    fn state(&self) -> &IfaceState {
+        self.ifaces.get(self.index)
+    }
+
+    #[inline]
+    fn state_mut(&mut self) -> &mut IfaceState {
+        self.ifaces.get_mut(self.index)
+    }
+
+    /// The capabilities reported by the device.
+    pub fn capabilities(&self) -> IfaceCapabilities {
+        self.state().dev.capabilities()
+    }
+
+    /// The interface's IP-layer MTU: the device MTU minus the link-layer header,
+    /// clamped to what a [`PacketBuf`] can carry.
+    pub fn ip_mtu(&self) -> usize {
+        self.state().ip_mtu()
+    }
+
+    /// The hardware (MAC) address of the interface.
+    ///
+    /// Meaningful on [`Medium::Ethernet`] interfaces only.
+    pub fn hardware_addr(&self) -> EthernetAddress {
+        self.state().hardware_addr
+    }
+
+    /// Set the hardware (MAC) address of the interface.
+    ///
+    /// The stack starts using it for the frames it sends and for ingress filtering
+    /// immediately. It does not announce the change on the link, so peers keep the
+    /// old address in their neighbor caches until it expires. Send a gratuitous ARP
+    /// or unsolicited neighbor advertisement from a raw socket if that matters.
+    pub fn set_hardware_addr(&mut self, addr: EthernetAddress) {
+        self.state_mut().hardware_addr = addr;
+    }
+
+    /// The IP addresses assigned to the interface.
+    pub fn ip_addrs(&self) -> &[IpCidr] {
+        &self.state().ip_addrs
+    }
+
+    /// Check whether the given address is assigned to the interface.
+    pub fn has_ip_addr(&self, addr: impl Into<IpAddress>) -> bool {
+        self.state().has_ip_addr(addr)
+    }
+
+    /// Assign an IP address to the interface.
+    ///
+    /// If the same address is already assigned, its prefix is updated and the
+    /// previous CIDR returned. Otherwise the address is appended and `None` is
+    /// returned. Source address selection prefers the first address matching the
+    /// destination's subnet, so ordering only matters between addresses of the same
+    /// subnet.
+    ///
+    /// # Panics
+    /// Panics if the address is not unicast.
+    pub fn add_ip_addr(&mut self, cidr: IpCidr) -> Option<IpCidr> {
+        assert!(
+            cidr.address().is_unicast(),
+            "only unicast addresses can be assigned to an interface"
+        );
+
+        let ip_addrs = &mut self.state_mut().ip_addrs;
+        match ip_addrs.iter().position(|old| old.address() == cidr.address()) {
+            Some(index) if ip_addrs[index] == cidr => Some(cidr),
+            Some(index) => {
+                let old = core::mem::replace(&mut ip_addrs[index], cidr);
+                self.invalidate();
+                Some(old)
+            }
+            None => {
+                ip_addrs.push(cidr);
+                None
+            }
+        }
+    }
+
+    /// Unassign an IP address from the interface, returning the CIDR it was
+    /// assigned with, or `None` if it was not assigned.
+    pub fn remove_ip_addr(&mut self, addr: impl Into<IpAddress>) -> Option<IpCidr> {
+        let addr = addr.into();
+        let ip_addrs = &mut self.state_mut().ip_addrs;
+        let index = ip_addrs.iter().position(|cidr| cidr.address() == addr)?;
+        let removed = ip_addrs.remove(index);
+        self.invalidate();
+        Some(removed)
+    }
+
+    /// Replace the interface's entire set of IP addresses.
+    ///
+    /// Equivalent to removing every address and adding the given ones, but the
+    /// link state (below) is invalidated once, and only if the set actually
+    /// changed.
+    ///
+    /// # Panics
+    /// Panics if any of the addresses is not unicast.
+    pub fn set_ip_addrs(&mut self, addrs: impl IntoIterator<Item = IpCidr>) {
+        let addrs: Vec<IpCidr> = addrs.into_iter().collect();
+        assert!(
+            addrs.iter().all(|cidr| cidr.address().is_unicast()),
+            "only unicast addresses can be assigned to an interface"
+        );
+
+        let ip_addrs = &mut self.state_mut().ip_addrs;
+        if *ip_addrs == addrs {
+            return;
+        }
+        *ip_addrs = addrs;
+        self.invalidate();
+    }
+
+    /// Purge state associated to this interface.
+    fn invalidate(&mut self) {
+        let handle = IfaceHandle(self.index);
+        self.inner.neighbor_cache.purge_iface(handle);
+        self.inner.pending.purge_iface(handle);
+    }
 }
 
 /// The device-independent part of the stack.
@@ -89,7 +220,7 @@ pub(crate) struct StackInner {
 /// in here, so socket code doesn't have to care about any of it.
 pub(crate) struct TxContext<'a> {
     pub(crate) inner: &'a mut StackInner,
-    pub(crate) ifaces: &'a mut Slab<Iface>,
+    pub(crate) ifaces: &'a mut Slab<IfaceState>,
 }
 
 /// A complete egress routing decision for one destination, produced by
@@ -313,13 +444,26 @@ impl Stack {
     /// Add an interface to the stack with the given configuration, returning a
     /// handle to it.
     pub fn add_iface(&mut self, dev: Box<dyn Interface>, config: Config) -> IfaceHandle {
-        let index = self.ifaces.add_with(|index| Iface {
+        let index = self.ifaces.add_with(|index| IfaceState {
             handle: IfaceHandle(index),
             dev,
             hardware_addr: config.hardware_addr,
             ip_addrs: config.ip_addrs,
         });
         IfaceHandle(index)
+    }
+
+    /// Borrow an interface from the stack.
+    ///
+    /// # Panics
+    /// Panics if the handle is stale (the interface was removed).
+    pub fn iface(&mut self, handle: IfaceHandle) -> Iface<'_> {
+        self.ifaces.get(handle.0); // Stale handles panic here, not on first use.
+        Iface {
+            inner: &mut self.inner,
+            ifaces: &mut self.ifaces,
+            index: handle.0,
+        }
     }
 
     /// Remove an interface from the stack, returning the device.
@@ -526,14 +670,14 @@ impl Stack {
 }
 
 impl StackInner {
-    fn process(&mut self, iface: &mut Iface, sockets: &mut Sockets, buf: PacketBuf) {
+    fn process(&mut self, iface: &mut IfaceState, sockets: &mut Sockets, buf: PacketBuf) {
         match iface.dev.capabilities().medium {
             Medium::Ethernet => self.process_ethernet(iface, sockets, buf),
             Medium::Ip => self.process_ip(iface, sockets, buf),
         }
     }
 
-    fn process_ethernet(&mut self, iface: &mut Iface, sockets: &mut Sockets, mut buf: PacketBuf) {
+    fn process_ethernet(&mut self, iface: &mut IfaceState, sockets: &mut Sockets, mut buf: PacketBuf) {
         let eth_frame = check!(EthernetFrame::new_checked(&mut buf));
 
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
@@ -569,7 +713,7 @@ impl StackInner {
         }
     }
 
-    fn process_ip(&mut self, iface: &mut Iface, sockets: &mut Sockets, buf: PacketBuf) {
+    fn process_ip(&mut self, iface: &mut IfaceState, sockets: &mut Sockets, buf: PacketBuf) {
         if buf.is_empty() {
             return;
         }
@@ -580,7 +724,7 @@ impl StackInner {
         }
     }
 
-    fn process_arp(&mut self, iface: &mut Iface, mut buf: PacketBuf) {
+    fn process_arp(&mut self, iface: &mut IfaceState, mut buf: PacketBuf) {
         let arp_packet = check!(ArpPacket::new_checked(&mut buf));
 
         if arp_packet.hardware_type() != ArpHardware::Ethernet
@@ -646,7 +790,7 @@ impl StackInner {
 
     fn process_ipv4(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         sockets: &mut Sockets,
         eth_src: Option<EthernetAddress>,
         mut buf: PacketBuf,
@@ -706,7 +850,7 @@ impl StackInner {
         buf.pull_front(header_len);
 
         match next_header {
-            IpProtocol::Icmp => self.process_icmpv4(iface, src_addr, dst_addr, buf),
+            IpProtocol::Icmp => self.process_icmpv4(iface, sockets, src_addr, dst_addr, buf),
             IpProtocol::Udp => self.process_udp(
                 iface,
                 &mut sockets.udp,
@@ -751,7 +895,7 @@ impl StackInner {
     /// here. [`Stack::poll`] drives them right after ingress processing.
     fn process_tcp(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         sockets: &mut Slab<TcpSocketState>,
         listeners: &mut Slab<TcpListenerState>,
         src_addr: IpAddress,
@@ -809,7 +953,7 @@ impl StackInner {
     /// Serialize a TCP segment and transmit it on the given interface.
     fn transmit_tcp(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         src_addr: IpAddress,
         dst_addr: IpAddress,
         hop_limit: u8,
@@ -827,15 +971,24 @@ impl StackInner {
         }
     }
 
-    fn process_icmpv4(&mut self, iface: &mut Iface, src_addr: Ipv4Address, dst_addr: Ipv4Address, mut buf: PacketBuf) {
-        let icmp_packet = check!(Icmpv4Packet::new_checked(&mut buf));
+    fn process_icmpv4(
+        &mut self,
+        iface: &mut IfaceState,
+        sockets: &mut Sockets,
+        src_addr: Ipv4Address,
+        dst_addr: Ipv4Address,
+        mut buf: PacketBuf,
+    ) {
+        let mut icmp_packet = check!(Icmpv4Packet::new_checked(&mut buf));
         if !icmp_packet.verify_checksum() {
             trace!("icmpv4: checksum incorrect");
             return;
         }
 
         #[cfg(not(feature = "auto-icmp-echo-reply"))]
-        let _ = (iface, src_addr, dst_addr);
+        let _ = (&iface, src_addr, dst_addr);
+        #[cfg(not(feature = "icmp-error-handling"))]
+        let _ = (&mut icmp_packet, &sockets);
 
         match (icmp_packet.msg_type(), icmp_packet.msg_code()) {
             // Respond to echo requests.
@@ -876,13 +1029,44 @@ impl StackInner {
             // Ignore any echo replies.
             (Icmpv4Message::EchoReply, _) => {}
 
+            // Deliver error messages to the socket whose packet provoked them.
+            #[cfg(feature = "icmp-error-handling")]
+            (msg_type, msg_code) if msg_type.is_error() => {
+                if let Some(error) = IcmpError::from_icmpv4(msg_type, msg_code) {
+                    self.deliver_icmp_error(sockets, error, icmp_packet.data_mut());
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    /// Deliver an ICMP error message to the socket whose packet provoked it.
+    ///
+    /// `quote` is the offending packet quoted in the error, a packet *we sent*, so
+    /// its source identifies the socket's local endpoint and its destination the
+    /// remote. UDP demux scores the sockets like ordinary ingress (most specific
+    /// match wins). TCP demux is by exact 4-tuple, and the socket additionally
+    /// validates the quoted sequence number against its send window, so blindly
+    /// spoofed errors cannot reset connections (RFC 5927).
+    #[cfg(feature = "icmp-error-handling")]
+    fn deliver_icmp_error(&mut self, sockets: &mut Sockets, error: IcmpError, quote: &mut [u8]) {
+        let Some(quoted) = parse_quoted_packet(quote) else {
+            trace!("icmp error: quote too short to identify a flow, ignoring");
+            return;
+        };
+        let local = IpEndpoint::new(quoted.src_addr, quoted.src_port);
+        let remote = IpEndpoint::new(quoted.dst_addr, quoted.dst_port);
+        match quoted.protocol {
+            IpProtocol::Udp => crate::udp::process_icmp_error(&mut sockets.udp, error, local, remote),
+            IpProtocol::Tcp => crate::tcp::process_icmp_error(&mut sockets.tcp, error, local, remote, quoted.tcp_seq),
             _ => {}
         }
     }
 
     fn process_ipv6(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         sockets: &mut Sockets,
         eth_src: Option<EthernetAddress>,
         mut buf: PacketBuf,
@@ -963,7 +1147,7 @@ impl StackInner {
         buf.pull_front(l4_offset);
 
         match next_header {
-            IpProtocol::Icmpv6 => self.process_icmpv6(iface, eth_src, src_addr, dst_addr, hop_limit, buf),
+            IpProtocol::Icmpv6 => self.process_icmpv6(iface, sockets, eth_src, src_addr, dst_addr, hop_limit, buf),
             IpProtocol::Udp => self.process_udp(
                 iface,
                 &mut sockets.udp,
@@ -1002,7 +1186,8 @@ impl StackInner {
 
     fn process_icmpv6(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
+        sockets: &mut Sockets,
         eth_src: Option<EthernetAddress>,
         src_addr: Ipv6Address,
         dst_addr: Ipv6Address,
@@ -1014,6 +1199,9 @@ impl StackInner {
             trace!("icmpv6: checksum incorrect");
             return;
         }
+
+        #[cfg(not(feature = "icmp-error-handling"))]
+        let _ = &sockets;
 
         match icmp_packet.msg_type() {
             // Respond to echo requests.
@@ -1043,6 +1231,14 @@ impl StackInner {
             // Ignore any echo replies.
             Icmpv6Message::EchoReply => {}
 
+            // Deliver error messages to the socket whose packet provoked them.
+            #[cfg(feature = "icmp-error-handling")]
+            msg_type if msg_type.is_error() => {
+                if let Some(error) = IcmpError::from_icmpv6(msg_type, icmp_packet.msg_code()) {
+                    self.deliver_icmp_error(sockets, error, icmp_packet.payload_mut());
+                }
+            }
+
             // NDISC is only processed if the packet arrived with the un-decremented
             // hop limit, and only on Ethernet mediums.
             Icmpv6Message::NeighborSolicit if hop_limit == 0xff && eth_src.is_some() => {
@@ -1059,7 +1255,7 @@ impl StackInner {
 
     fn process_ndisc_solicit(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         src_addr: Ipv6Address,
         dst_addr: Ipv6Address,
         icmp_packet: &mut Icmpv6Packet<'_>,
@@ -1104,7 +1300,12 @@ impl StackInner {
         }
     }
 
-    fn process_ndisc_advert(&mut self, iface: &mut Iface, src_addr: Ipv6Address, icmp_packet: &mut Icmpv6Packet<'_>) {
+    fn process_ndisc_advert(
+        &mut self,
+        iface: &mut IfaceState,
+        src_addr: Ipv6Address,
+        icmp_packet: &mut Icmpv6Packet<'_>,
+    ) {
         if icmp_packet.msg_code() != 0 {
             return;
         }
@@ -1130,7 +1331,10 @@ impl StackInner {
     /// Advance the solicitation retransmission timers of the neighbors being resolved
     /// on this interface, retransmitting solicitations and failing resolutions that
     /// exhausted their probes.
-    fn poll_neighbor_timers(&mut self, iface: &mut Iface, sockets: &mut Sockets) {
+    fn poll_neighbor_timers(&mut self, iface: &mut IfaceState, sockets: &mut Sockets) {
+        #[cfg(not(feature = "icmp-error-handling"))]
+        let _ = &sockets;
+
         for event in self.neighbor_cache.poll_retransmit(iface.handle, self.now) {
             match event {
                 ProbeEvent::Retransmit(addr) => {
@@ -1141,9 +1345,12 @@ impl StackInner {
                     debug!("neighbor {} resolution failed, dropping queued packets", addr);
                     // RFC 4861 §7.3.3: answer each packet queued on the failed
                     // resolution with an ICMP destination unreachable error.
+                    #[cfg(feature = "icmp-error-handling")]
                     for packet in self.pending.take_matching(&(iface.handle, addr)) {
                         self.deliver_neighbor_failure_error(iface, sockets, packet.buf);
                     }
+                    #[cfg(not(feature = "icmp-error-handling"))]
+                    drop(self.pending.take_matching(&(iface.handle, addr)));
                 }
             }
         }
@@ -1154,9 +1361,11 @@ impl StackInner {
     ///
     /// Queued packets are locally generated (nothing is forwarded), so the sender
     /// the error must reach is a local socket. The error is fed into ingress,
-    /// where e.g. a raw-socket ping application receives it, rather than
-    /// transmitted to the wire. `orig` is the queued packet, a whole IP frame.
-    fn deliver_neighbor_failure_error(&mut self, iface: &mut Iface, sockets: &mut Sockets, mut orig: PacketBuf) {
+    /// where the erring TCP/UDP socket, or a raw-socket ping application,
+    /// receives it, rather than transmitted to the wire. `orig` is the queued
+    /// packet, a whole IP frame.
+    #[cfg(feature = "icmp-error-handling")]
+    fn deliver_neighbor_failure_error(&mut self, iface: &mut IfaceState, sockets: &mut Sockets, mut orig: PacketBuf) {
         match IpVersion::of_packet(&orig) {
             Ok(IpVersion::Ipv4) => {
                 let (src_addr, header_len, next_header) = {
@@ -1216,7 +1425,7 @@ impl StackInner {
     }
 
     /// Send a solicitation (ARP request / NDISC neighbor solicit) for the given address.
-    fn solicit_neighbor(&mut self, iface: &mut Iface, addr: IpAddress) {
+    fn solicit_neighbor(&mut self, iface: &mut IfaceState, addr: IpAddress) {
         match addr {
             IpAddress::Ipv4(addr) => self.transmit_arp_request(iface, addr),
             IpAddress::Ipv6(addr) => self.transmit_ndisc_solicit(iface, addr),
@@ -1225,7 +1434,7 @@ impl StackInner {
 
     /// Fill the neighbor cache, and flush any packets that were queued waiting for
     /// this neighbor to resolve.
-    fn fill_neighbor(&mut self, iface: &mut Iface, addr: IpAddress, hardware_addr: EthernetAddress) {
+    fn fill_neighbor(&mut self, iface: &mut IfaceState, addr: IpAddress, hardware_addr: EthernetAddress) {
         let key = (iface.handle, addr);
         self.neighbor_cache.fill(key, hardware_addr, self.now);
 
@@ -1246,7 +1455,7 @@ impl StackInner {
     /// the routing decision. `None` routes here.
     fn lookup_hardware_addr(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         dst_addr: &IpAddress,
         next_hop: Option<IpAddress>,
     ) -> NeighborLookup {
@@ -1293,7 +1502,7 @@ impl StackInner {
         NeighborLookup::Pending { next_hop }
     }
 
-    fn transmit_arp_request(&mut self, iface: &mut Iface, target_addr: Ipv4Address) {
+    fn transmit_arp_request(&mut self, iface: &mut IfaceState, target_addr: Ipv4Address) {
         let Some(source_protocol_addr) = iface.get_source_address_ipv4(&target_addr) else {
             debug!("arp: no source address for request");
             return;
@@ -1317,7 +1526,7 @@ impl StackInner {
         self.transmit_ethernet(iface, EthernetAddress::BROADCAST, buf, EthernetProtocol::Arp);
     }
 
-    fn transmit_ndisc_solicit(&mut self, iface: &mut Iface, target_addr: Ipv6Address) {
+    fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState, target_addr: Ipv6Address) {
         let src_addr = iface.get_source_address_ipv6(&target_addr);
         let dst_addr = target_addr.solicited_node();
 
@@ -1353,7 +1562,7 @@ impl StackInner {
     /// multicast traffic, and none to non-unicast senders.
     pub(crate) fn transmit_icmpv4_error(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         orig: &mut PacketBuf,
         msg_type: Icmpv4Message,
         msg_code: u8,
@@ -1377,7 +1586,7 @@ impl StackInner {
     /// whose type demands the error even then (`allow_multicast_dst`).
     pub(crate) fn transmit_icmpv6_error(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         orig: &mut PacketBuf,
         msg_type: Icmpv6Message,
         msg_code: u8,
@@ -1405,7 +1614,7 @@ impl StackInner {
 
     fn transmit_ipv4(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         mut buf: PacketBuf,
         src_addr: Ipv4Address,
         dst_addr: Ipv4Address,
@@ -1418,7 +1627,7 @@ impl StackInner {
 
     fn transmit_ipv6(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         mut buf: PacketBuf,
         src_addr: Ipv6Address,
         dst_addr: Ipv6Address,
@@ -1440,7 +1649,7 @@ impl StackInner {
     /// pending queue and flushed when resolution completes.
     fn transmit_ip_frame(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         dst_addr: IpAddress,
         next_hop: Option<IpAddress>,
         buf: PacketBuf,
@@ -1463,7 +1672,7 @@ impl StackInner {
 
     fn transmit_ethernet(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         dst_hw: EthernetAddress,
         mut buf: PacketBuf,
         ethertype: EthernetProtocol,
@@ -1476,7 +1685,7 @@ impl StackInner {
         self.transmit_raw(iface, buf);
     }
 
-    fn transmit_raw(&mut self, iface: &mut Iface, buf: PacketBuf) {
+    fn transmit_raw(&mut self, iface: &mut IfaceState, buf: PacketBuf) {
         if iface.dev.transmit(buf).is_err() {
             debug!("iface: cannot transmit, dropping packet");
         }
@@ -1486,7 +1695,7 @@ impl StackInner {
     ///
     /// On-link destinations resolve to themselves. Off-link destinations resolve to a
     /// router from the routing table, but only if the route goes out this interface.
-    fn route(&self, iface: &Iface, addr: &IpAddress) -> Option<IpAddress> {
+    fn route(&self, iface: &IfaceState, addr: &IpAddress) -> Option<IpAddress> {
         if iface.in_same_network(addr) {
             Some(*addr)
         } else {
@@ -1650,7 +1859,7 @@ fn process_hop_by_hop(payload: &[u8]) -> crate::wire::Result<HopByHopAction> {
     })
 }
 
-impl Iface {
+impl IfaceState {
     /// The handle this interface is identified by in the stack.
     pub(crate) fn handle(&self) -> IfaceHandle {
         self.handle
@@ -1917,7 +2126,9 @@ mod test {
     use crate::iface::IfaceCapabilities;
     use crate::neighbor::MAX_MULTICAST_SOLICIT;
     use crate::raw::RawMode;
+    use crate::tcp::State as TcpState;
     use crate::time::Duration;
+    use crate::udp::RecvError as UdpRecvError;
 
     #[test]
     fn test_alloc_ephemeral_port() {
@@ -2352,5 +2563,403 @@ mod test {
         assert_eq!(ip.src_addr(), OUR_V4);
         assert_eq!(ip.dst_addr(), dead);
         assert_eq!(ip.next_header(), IpProtocol::Udp);
+    }
+
+    /// A whole IPv4 packet carrying an ICMPv4 error message quoting `quote`.
+    fn icmpv4_error_packet(
+        src_addr: Ipv4Address,
+        dst_addr: Ipv4Address,
+        msg_type: Icmpv4Message,
+        msg_code: u8,
+        quote: &[u8],
+    ) -> Vec<u8> {
+        let mut icmp = vec![0u8; 8 + quote.len()];
+        {
+            let mut packet = Icmpv4Packet::new_unchecked(&mut icmp[..]);
+            packet.set_msg_type(msg_type);
+            packet.set_msg_code(msg_code);
+            packet.clear_unused();
+            packet.data_mut().copy_from_slice(quote);
+            packet.fill_checksum();
+        }
+        ipv4_packet(src_addr, dst_addr, IpProtocol::Icmp, &icmp)
+    }
+
+    /// A whole IPv6 packet carrying an ICMPv6 error message quoting `quote`.
+    fn icmpv6_error_packet(
+        src_addr: Ipv6Address,
+        dst_addr: Ipv6Address,
+        msg_type: Icmpv6Message,
+        msg_code: u8,
+        quote: &[u8],
+    ) -> Vec<u8> {
+        let mut icmp = vec![0u8; 8 + quote.len()];
+        {
+            let mut packet = Icmpv6Packet::new_unchecked(&mut icmp[..]);
+            packet.set_msg_type(msg_type);
+            packet.set_msg_code(msg_code);
+            packet.clear_reserved();
+            packet.payload_mut().copy_from_slice(quote);
+            packet.fill_checksum(&src_addr, &dst_addr);
+        }
+        ipv6_packet(src_addr, dst_addr, IpProtocol::Icmpv6, &icmp)
+    }
+
+    #[test]
+    fn test_udp_icmp_error_delivery() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let handle = stack.add_udp_socket();
+        stack.udp(handle).bind(5000, (REMOTE_V4, 53)).unwrap();
+        stack.udp(handle).send_slice(b"query", (REMOTE_V4, 53)).unwrap();
+        let sent = tx.borrow().last().unwrap().clone();
+
+        // A port unreachable arrives, quoting the datagram we sent.
+        let error = icmpv4_error_packet(
+            REMOTE_V4,
+            OUR_V4,
+            Icmpv4Message::DstUnreachable,
+            Icmpv4DstUnreachable::PortUnreachable.into(),
+            &sent,
+        );
+        inject(&mut stack, &rx, error);
+
+        // recv reports it once, clearing it.
+        match stack.udp(handle).recv() {
+            Err(UdpRecvError::IcmpError { error, remote }) => {
+                assert_eq!(error, IcmpError::PortUnreachable);
+                assert_eq!(remote, IpEndpoint::new(REMOTE_V4.into(), 53));
+            }
+            other => panic!("expected icmp error, got {:?}", other),
+        }
+        assert_eq!(stack.udp(handle).take_icmp_error(), None);
+        assert!(matches!(stack.udp(handle).recv(), Err(UdpRecvError::Exhausted)));
+    }
+
+    #[test]
+    fn test_udp_icmp_error_no_match() {
+        let (mut stack, rx, _tx) = test_stack(Medium::Ip);
+        let handle = stack.add_udp_socket();
+        stack.udp(handle).bind(5000, IpListenEndpoint::UNSPECIFIED).unwrap();
+
+        // An error quoting a flow from another local port: not for this socket.
+        let quote = ipv4_packet(
+            OUR_V4,
+            REMOTE_V4,
+            IpProtocol::Udp,
+            &udp_datagram(OUR_V4.into(), 6000, REMOTE_V4.into(), 53, b"x"),
+        );
+        let error = icmpv4_error_packet(
+            REMOTE_V4,
+            OUR_V4,
+            Icmpv4Message::DstUnreachable,
+            Icmpv4DstUnreachable::PortUnreachable.into(),
+            &quote,
+        );
+        inject(&mut stack, &rx, error);
+        assert_eq!(stack.udp(handle).take_icmp_error(), None);
+    }
+
+    #[test]
+    fn test_udp_icmp_error_delivery_v6() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let handle = stack.add_udp_socket();
+        stack.udp(handle).bind(5000, (REMOTE_V6, 53)).unwrap();
+        stack.udp(handle).send_slice(b"query", (REMOTE_V6, 53)).unwrap();
+        let sent = tx.borrow().last().unwrap().clone();
+
+        let error = icmpv6_error_packet(
+            REMOTE_V6,
+            OUR_V6,
+            Icmpv6Message::DstUnreachable,
+            Icmpv6DstUnreachable::PortUnreachable.into(),
+            &sent,
+        );
+        inject(&mut stack, &rx, error);
+
+        assert_eq!(
+            stack.udp(handle).take_icmp_error(),
+            Some((IcmpError::PortUnreachable, IpEndpoint::new(REMOTE_V6.into(), 53)))
+        );
+    }
+
+    #[test]
+    fn test_neighbor_failure_reported_to_udp_socket() {
+        let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
+        let dead = Ipv4Address::new(192, 168, 1, 99);
+        let handle = stack.add_udp_socket();
+        stack.udp(handle).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack.udp(handle).send_slice(b"anyone?", (dead, 1000)).unwrap();
+
+        // Let the ARP resolution run out of probes. The local destination
+        // unreachable error lands on the socket, and nothing but the ARP
+        // requests ever reaches the wire.
+        for secs in 1..=4 {
+            stack.poll(Instant::ZERO + Duration::from_secs(secs));
+        }
+        assert_eq!(
+            stack.udp(handle).take_icmp_error(),
+            Some((IcmpError::HostUnreachable, IpEndpoint::new(dead.into(), 1000)))
+        );
+        assert_eq!(tx.borrow().len(), MAX_MULTICAST_SOLICIT as usize);
+    }
+
+    #[test]
+    fn test_tcp_connect_aborted_by_icmp_error() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let handle = stack.add_tcp_socket(4096, 4096);
+        stack.tcp(handle).connect((REMOTE_V4, 80), 0).unwrap();
+        stack.poll(Instant::ZERO);
+        assert_eq!(stack.tcp(handle).state(), TcpState::SynSent);
+        let syn = tx.borrow().last().unwrap().clone();
+
+        // A host unreachable quoting our SYN aborts the nascent connection.
+        let error = icmpv4_error_packet(
+            REMOTE_V4,
+            OUR_V4,
+            Icmpv4Message::DstUnreachable,
+            Icmpv4DstUnreachable::HostUnreachable.into(),
+            &syn,
+        );
+        inject(&mut stack, &rx, error);
+
+        assert_eq!(stack.tcp(handle).state(), TcpState::Closed);
+        assert_eq!(stack.tcp(handle).take_icmp_error(), Some(IcmpError::HostUnreachable));
+    }
+
+    #[test]
+    fn test_tcp_established_icmp_error_is_soft() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let handle = stack.add_tcp_socket(4096, 4096);
+        stack.tcp(handle).connect((REMOTE_V4, 80), 0).unwrap();
+        stack.poll(Instant::ZERO);
+        let syn = tx.borrow().last().unwrap().clone();
+
+        // Complete the handshake with a crafted SYN|ACK.
+        let (local_port, syn_seq) = {
+            let mut bytes = syn.clone();
+            let tcp = TcpPacket::new_checked(&mut bytes[IPV4_HEADER_LEN..]).unwrap();
+            (tcp.src_port(), tcp.seq_number())
+        };
+        let mut segment = vec![0u8; TCP_HEADER_LEN];
+        {
+            let mut tcp = TcpPacket::new_unchecked(&mut segment[..]);
+            tcp.set_src_port(80);
+            tcp.set_dst_port(local_port);
+            tcp.set_seq_number(TcpSeqNumber(10000));
+            tcp.set_ack_number(syn_seq + 1);
+            tcp.set_header_len(TCP_HEADER_LEN as u8);
+            tcp.set_syn(true);
+            tcp.set_ack(true);
+            tcp.set_window_len(64000);
+            tcp.fill_checksum(&REMOTE_V4.into(), &OUR_V4.into());
+        }
+        inject(
+            &mut stack,
+            &rx,
+            ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Tcp, &segment),
+        );
+        assert_eq!(stack.tcp(handle).state(), TcpState::Established);
+
+        // An error quoting an in-flight data segment is soft: recorded, not fatal.
+        stack.tcp(handle).send_slice(b"hello").unwrap();
+        stack.poll(Instant::ZERO);
+        let data_segment = tx.borrow().last().unwrap().clone();
+        let error = icmpv4_error_packet(
+            REMOTE_V4,
+            OUR_V4,
+            Icmpv4Message::DstUnreachable,
+            Icmpv4DstUnreachable::HostUnreachable.into(),
+            &data_segment,
+        );
+        inject(&mut stack, &rx, error);
+        assert_eq!(stack.tcp(handle).state(), TcpState::Established);
+        assert_eq!(stack.tcp(handle).take_icmp_error(), Some(IcmpError::HostUnreachable));
+
+        // An error quoting an out-of-window sequence number is a blind spoof:
+        // ignored entirely.
+        let mut forged = data_segment.clone();
+        {
+            let mut tcp = TcpPacket::new_unchecked(&mut forged[IPV4_HEADER_LEN..]);
+            tcp.set_seq_number(TcpSeqNumber(999_999_999));
+        }
+        let error = icmpv4_error_packet(
+            REMOTE_V4,
+            OUR_V4,
+            Icmpv4Message::DstUnreachable,
+            Icmpv4DstUnreachable::HostUnreachable.into(),
+            &forged,
+        );
+        inject(&mut stack, &rx, error);
+        assert_eq!(stack.tcp(handle).state(), TcpState::Established);
+        assert_eq!(stack.tcp(handle).take_icmp_error(), None);
+    }
+
+    #[test]
+    fn test_neighbor_failure_aborts_tcp_connect() {
+        let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
+        let dead = Ipv4Address::new(192, 168, 1, 99);
+        let handle = stack.add_tcp_socket(4096, 4096);
+        stack.tcp(handle).connect((dead, 80), 0).unwrap();
+
+        // The SYN is queued on the unresolvable neighbor. When resolution fails, the
+        // local destination unreachable error aborts the connect.
+        stack.poll(Instant::ZERO);
+        assert_eq!(stack.tcp(handle).state(), TcpState::SynSent);
+        for secs in 1..=4 {
+            stack.poll(Instant::ZERO + Duration::from_secs(secs));
+        }
+        assert_eq!(stack.tcp(handle).state(), TcpState::Closed);
+        assert_eq!(stack.tcp(handle).take_icmp_error(), Some(IcmpError::HostUnreachable));
+        // Nothing but ARP requests ever reached the wire.
+        for frame in tx.borrow().iter() {
+            let mut bytes = frame.clone();
+            let eth = EthernetFrame::new_checked(&mut bytes[..]).unwrap();
+            assert_eq!(eth.ethertype(), EthernetProtocol::Arp);
+        }
+    }
+
+    /// An ICMPv4 echo request, checksum filled in.
+    fn icmpv4_echo_request(ident: u16, seq_no: u16) -> Vec<u8> {
+        let mut bytes = vec![0; 8];
+        {
+            let mut icmp = Icmpv4Packet::new_unchecked(&mut bytes[..]);
+            icmp.set_msg_type(Icmpv4Message::EchoRequest);
+            icmp.set_msg_code(0);
+            icmp.set_echo_ident(ident);
+            icmp.set_echo_seq_no(seq_no);
+            icmp.fill_checksum();
+        }
+        bytes
+    }
+
+    /// The ethertype of a transmitted Ethernet frame.
+    fn ethertype_of(frame: &[u8]) -> EthernetProtocol {
+        let mut bytes = frame.to_vec();
+        EthernetFrame::new_checked(&mut bytes[..]).unwrap().ethertype()
+    }
+
+    #[test]
+    fn test_iface_ip_addrs() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let iface = IfaceHandle(0);
+        let new_addr = Ipv4Address::new(10, 0, 0, 1);
+
+        assert_eq!(
+            stack.iface(iface).ip_addrs(),
+            [IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)]
+        );
+        assert!(stack.iface(iface).has_ip_addr(OUR_V4));
+        assert!(!stack.iface(iface).has_ip_addr(new_addr));
+
+        // An echo request to an address we don't have is ignored.
+        let echo = ipv4_packet(REMOTE_V4, new_addr, IpProtocol::Icmp, &icmpv4_echo_request(0x1234, 1));
+        inject(&mut stack, &rx, echo.clone());
+        assert!(tx.borrow().is_empty());
+
+        // A new address is appended, and ingress starts accepting it right away.
+        assert_eq!(stack.iface(iface).add_ip_addr(IpCidr::new(new_addr.into(), 8)), None);
+        assert!(stack.iface(iface).has_ip_addr(new_addr));
+        inject(&mut stack, &rx, echo.clone());
+        assert_eq!(tx.borrow().len(), 1);
+        let (msg_type, ..) = parse_icmpv4_reply(&tx.borrow()[0], new_addr, REMOTE_V4);
+        assert_eq!(msg_type, Icmpv4Message::EchoReply);
+
+        // Re-adding an address already assigned updates its prefix in place,
+        // returning the CIDR it had.
+        assert_eq!(
+            stack.iface(iface).add_ip_addr(IpCidr::new(new_addr.into(), 24)),
+            Some(IpCidr::new(new_addr.into(), 8))
+        );
+        assert_eq!(
+            stack.iface(iface).ip_addrs(),
+            [
+                IpCidr::new(OUR_V4.into(), 24),
+                IpCidr::new(OUR_V6.into(), 64),
+                IpCidr::new(new_addr.into(), 24),
+            ]
+        );
+
+        // Removing hands back the CIDR it was assigned with, once.
+        assert_eq!(
+            stack.iface(iface).remove_ip_addr(new_addr),
+            Some(IpCidr::new(new_addr.into(), 24))
+        );
+        assert_eq!(stack.iface(iface).remove_ip_addr(new_addr), None);
+        assert!(!stack.iface(iface).has_ip_addr(new_addr));
+
+        // ...and ingress stops accepting it.
+        tx.borrow_mut().clear();
+        inject(&mut stack, &rx, echo);
+        assert!(tx.borrow().is_empty());
+
+        // Wholesale replacement.
+        stack.iface(iface).set_ip_addrs([IpCidr::new(new_addr.into(), 8)]);
+        assert_eq!(stack.iface(iface).ip_addrs(), [IpCidr::new(new_addr.into(), 8)]);
+        assert!(!stack.iface(iface).has_ip_addr(OUR_V4));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_iface_reject_non_unicast_ip_addr() {
+        let (mut stack, _rx, _tx) = test_stack(Medium::Ip);
+        stack
+            .iface(IfaceHandle(0))
+            .add_ip_addr(IpCidr::new(Ipv4Address::new(224, 0, 0, 1).into(), 24));
+    }
+
+    #[test]
+    fn test_iface_addr_change_invalidates_link_state() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
+        let iface = IfaceHandle(0);
+        let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+
+        // Learn the remote's hardware address from an ARP request for us.
+        let mut request = vec![0; ETHERNET_HEADER_LEN + ARP_BUFFER_LEN];
+        {
+            let mut eth = EthernetFrame::new_unchecked(&mut request[..]);
+            eth.set_dst_addr(EthernetAddress::BROADCAST);
+            eth.set_src_addr(remote_hw);
+            eth.set_ethertype(EthernetProtocol::Arp);
+            let mut arp = ArpPacket::new_unchecked(&mut request[ETHERNET_HEADER_LEN..]);
+            arp.set_hardware_type(ArpHardware::Ethernet);
+            arp.set_protocol_type(EthernetProtocol::Ipv4);
+            arp.set_hardware_len(6);
+            arp.set_protocol_len(4);
+            arp.set_operation(ArpOperation::Request);
+            arp.set_source_hardware_addr(remote_hw.as_bytes());
+            arp.set_source_protocol_addr(&REMOTE_V4.octets());
+            arp.set_target_hardware_addr(&[0; 6]);
+            arp.set_target_protocol_addr(&OUR_V4.octets());
+        }
+        inject(&mut stack, &rx, request);
+        assert_eq!(tx.borrow().len(), 1); // the ARP reply
+        assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
+
+        // The neighbor is now resolved: a datagram to it goes out immediately.
+        let udp = stack.add_udp_socket();
+        stack.udp(udp).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack.udp(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 2);
+        assert_eq!(ethertype_of(&tx.borrow()[1]), EthernetProtocol::Ipv4);
+
+        // Queue a packet on a neighbor that will never answer.
+        let dead = Ipv4Address::new(192, 168, 1, 99);
+        stack.udp(udp).send_slice(b"anyone?", (dead, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 3);
+        assert_eq!(ethertype_of(&tx.borrow()[2]), EthernetProtocol::Arp);
+
+        // Changing the interface's addresses invalidates both: the queued packet
+        // is dropped (no solicitation is ever retransmitted for it)...
+        stack.iface(iface).set_ip_addrs([IpCidr::new(OUR_V4.into(), 24)]);
+        for secs in 1..=4 {
+            stack.poll(Instant::ZERO + Duration::from_secs(secs));
+        }
+        assert_eq!(tx.borrow().len(), 3);
+
+        // ...and the learned mapping is gone, so the next datagram to the remote
+        // has to resolve it again.
+        stack.udp(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 4);
+        assert_eq!(ethertype_of(&tx.borrow()[3]), EthernetProtocol::Arp);
     }
 }

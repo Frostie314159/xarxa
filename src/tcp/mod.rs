@@ -8,6 +8,8 @@ use core::fmt::Display;
 use core::{fmt, mem};
 
 use crate::buf::PacketBuf;
+#[cfg(feature = "icmp-error-handling")]
+use crate::icmp_error::IcmpError;
 use crate::rand::Rand;
 use crate::slab::Slab;
 use crate::stack::{EgressRoute, TxContext, alloc_ephemeral_port};
@@ -502,6 +504,10 @@ pub(crate) struct TcpSocketState {
     hop_limit: Option<u8>,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
+    /// The last ICMP error reported against this connection. A single slot: a
+    /// newer error overwrites an unread older one.
+    #[cfg(feature = "icmp-error-handling")]
+    icmp_error: Option<IcmpError>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
     /// I.e. an ACK(local_seq_no+n) packet removes n bytes from the transmit buffer.
     local_seq_no: TcpSeqNumber,
@@ -611,6 +617,8 @@ impl TcpSocketState {
             keep_alive: None,
             hop_limit: None,
             tuple: None,
+            #[cfg(feature = "icmp-error-handling")]
+            icmp_error: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
             remote_last_seq: TcpSeqNumber::default(),
@@ -679,6 +687,10 @@ impl TcpSocketState {
         self.rx_buffer.clear();
         self.rx_fin_received = false;
         self.tuple = None;
+        #[cfg(feature = "icmp-error-handling")]
+        {
+            self.icmp_error = None;
+        }
         self.local_seq_no = TcpSeqNumber::default();
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
@@ -858,6 +870,46 @@ impl TcpSocketState {
             && repr.dst_port == tuple.local.port
             && *src_addr == tuple.remote.addr
             && repr.src_port == tuple.remote.port
+    }
+
+    /// Process an ICMP error message reported against this connection.
+    ///
+    /// `seq` is the sequence number of the quoted (erring) segment. It must fall
+    /// within the send window, so blindly spoofed errors cannot affect the
+    /// connection (RFC 5927).
+    ///
+    /// During the handshake (SYN-SENT / SYN-RECEIVED) any error aborts the
+    /// connection, which makes a connect to an unreachable destination fail fast
+    /// instead of running out the SYN retransmission timer. On a
+    /// synchronized connection every error is treated as soft and advisory (as
+    /// RFC 5927 recommends, to resist off-path connection-reset attacks): it is
+    /// recorded for [`take_icmp_error`](TcpSocket::take_icmp_error) and the
+    /// connection carries on.
+    #[cfg(feature = "icmp-error-handling")]
+    pub(crate) fn process_icmp_error(&mut self, error: IcmpError, seq: TcpSeqNumber) {
+        // The quoted segment must be one we actually have in flight.
+        if seq < self.local_seq_no || seq > self.remote_last_seq {
+            trace!("icmp error quoting out-of-window seq, ignoring");
+            return;
+        }
+        self.icmp_error = Some(error);
+        match self.state {
+            State::SynSent | State::SynReceived => {
+                debug!("{} during handshake, aborting connection", error);
+                self.set_state(State::Closed);
+                self.tuple = None;
+            }
+            _ => {
+                trace!("icmp error {}, recorded as soft error", error);
+            }
+        }
+    }
+
+    /// Take the pending ICMP error, if one has been reported against this
+    /// connection.
+    #[cfg(feature = "icmp-error-handling")]
+    pub fn take_icmp_error(&mut self) -> Option<IcmpError> {
+        self.icmp_error.take()
     }
 
     pub(crate) fn process(
@@ -2016,6 +2068,30 @@ pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_add
     buf
 }
 
+/// Deliver an ICMP error to the TCP connection whose segment provoked it: exact
+/// 4-tuple match against the flow quoted in the error. `local`/`remote` are the
+/// quoted packet's source and destination, since the quote is a segment this
+/// stack sent.
+#[cfg(feature = "icmp-error-handling")]
+pub(crate) fn process_icmp_error(
+    sockets: &mut Slab<TcpSocketState>,
+    error: IcmpError,
+    local: IpEndpoint,
+    remote: IpEndpoint,
+    seq: TcpSeqNumber,
+) {
+    for (_, socket) in sockets.iter_mut() {
+        if socket.state != State::Closed
+            && let Some(tuple) = &socket.tuple
+            && tuple.local == local
+            && tuple.remote == remote
+        {
+            socket.process_icmp_error(error, seq);
+            return;
+        }
+    }
+}
+
 /// Drive the socket's egress until it has nothing more it wants to transmit right
 /// now: data and flag segments, ACKs, window updates, retransmissions, probes.
 /// Called from [`Stack::poll`](crate::Stack::poll), which is the only place TCP
@@ -2558,6 +2634,21 @@ impl TcpSocket<'_> {
             trace!("tx buffer: enqueueing {} octets (now {})", size, old_length + size);
         }
         Ok(result)
+    }
+
+    /// Take the pending ICMP error, if one has been reported against this
+    /// connection.
+    ///
+    /// When an ICMP error message quoting one of this connection's segments
+    /// arrives, from the network or generated locally when neighbor resolution
+    /// for the remote fails, it is recorded here (a single slot, the newest
+    /// wins), and taking it clears it. During the handshake (SYN-SENT /
+    /// SYN-RECEIVED) the error also aborts the connection, so a connect to an
+    /// unreachable destination fails fast. On an established connection the error
+    /// is advisory only (RFC 5927) and the connection carries on.
+    #[cfg(feature = "icmp-error-handling")]
+    pub fn take_icmp_error(&mut self) -> Option<IcmpError> {
+        self.inner_mut().take_icmp_error()
     }
 
     /// Call `f` with the largest contiguous slice of octets in the transmit buffer,

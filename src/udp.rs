@@ -20,8 +20,10 @@ use core::fmt;
 use core::ops::{Deref, Range};
 
 use crate::buf::PacketBuf;
+#[cfg(feature = "icmp-error-handling")]
+use crate::icmp_error::IcmpError;
 use crate::slab::Slab;
-use crate::stack::{Iface, StackInner, TxContext, addr_score, alloc_ephemeral_port};
+use crate::stack::{IfaceState, StackInner, TxContext, addr_score, alloc_ephemeral_port};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
 use crate::wire::{
@@ -127,6 +129,16 @@ pub enum RecvError {
     /// The provided slice is smaller than the payload. (The packet is dropped by
     /// `recv_slice`, but not by `peek_slice`.)
     Truncated,
+    /// An ICMP error message quoting a packet this socket sent has arrived
+    /// (reported once, taking it clears it). See
+    /// [`take_icmp_error`](UdpSocket::take_icmp_error).
+    #[cfg(feature = "icmp-error-handling")]
+    IcmpError {
+        /// The kind of error.
+        error: IcmpError,
+        /// The remote endpoint the erring packet was sent to.
+        remote: IpEndpoint,
+    },
 }
 
 impl fmt::Display for RecvError {
@@ -134,6 +146,10 @@ impl fmt::Display for RecvError {
         match self {
             RecvError::Exhausted => write!(f, "exhausted"),
             RecvError::Truncated => write!(f, "truncated"),
+            #[cfg(feature = "icmp-error-handling")]
+            RecvError::IcmpError { error, remote } => {
+                write!(f, "icmp error from {}: {}", remote, error)
+            }
         }
     }
 }
@@ -153,6 +169,10 @@ pub(crate) struct UdpSocketState {
     remote: IpListenEndpoint,
     rx_queue: VecDeque<PacketBuf>,
     hop_limit: Option<u8>,
+    /// The last ICMP error reported against this socket, with the remote endpoint
+    /// it is about. A single slot: a newer error overwrites an unread older one.
+    #[cfg(feature = "icmp-error-handling")]
+    pending_error: Option<(IcmpError, IpEndpoint)>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -167,6 +187,8 @@ impl UdpSocketState {
             remote: IpListenEndpoint::UNSPECIFIED,
             rx_queue: VecDeque::new(),
             hop_limit: None,
+            #[cfg(feature = "icmp-error-handling")]
+            pending_error: None,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -468,6 +490,10 @@ impl UdpSocket<'_> {
         state.local = IpListenEndpoint::UNSPECIFIED;
         state.remote = IpListenEndpoint::UNSPECIFIED;
         state.rx_queue.clear();
+        #[cfg(feature = "icmp-error-handling")]
+        {
+            state.pending_error = None;
+        }
         // Wake the tasks waiting, so they can notice the socket is closed.
         #[cfg(feature = "async")]
         {
@@ -529,8 +555,17 @@ impl UdpSocket<'_> {
     /// This is zero-copy: the returned value is the buffer the datagram arrived in.
     ///
     /// Returns `Err(RecvError::Exhausted)` if the RX queue is empty.
+    ///
+    /// With the `icmp-error-handling` feature, a pending ICMP error is reported
+    /// first, as `Err(RecvError::IcmpError { .. })`, once, clearing it, before
+    /// any queued datagrams. See [`take_icmp_error`](Self::take_icmp_error).
     pub fn recv(&mut self) -> Result<RecvPacket, RecvError> {
-        let buf = self.inner_mut().rx_queue.pop_front().ok_or(RecvError::Exhausted)?;
+        let state = self.inner_mut();
+        #[cfg(feature = "icmp-error-handling")]
+        if let Some((error, remote)) = state.pending_error.take() {
+            return Err(RecvError::IcmpError { error, remote });
+        }
+        let buf = state.rx_queue.pop_front().ok_or(RecvError::Exhausted)?;
         Ok(RecvPacket::new(buf))
     }
 
@@ -581,6 +616,24 @@ impl UdpSocket<'_> {
         }
         data[..payload.len()].copy_from_slice(payload);
         Ok((payload.len(), meta))
+    }
+
+    /// Take the pending ICMP error, if one has been reported against this socket:
+    /// the kind of error and the remote endpoint the erring packet was sent to.
+    ///
+    /// When an ICMP error message arrives, from the network (e.g. port
+    /// unreachable) or generated locally when neighbor resolution for a
+    /// destination fails, it is delivered to the most specific socket matching the
+    /// quoted packet's flow, like ordinary ingress demux, and stored here. A single
+    /// error is kept (the newest wins), reported once through either this method or
+    /// [`recv`](Self::recv), whichever is called first, and cleared by the report.
+    /// The RX waker is woken when an error is recorded.
+    ///
+    /// The remote endpoint is attached so that errors on unconnected sockets are
+    /// attributable.
+    #[cfg(feature = "icmp-error-handling")]
+    pub fn take_icmp_error(&mut self) -> Option<(IcmpError, IpEndpoint)> {
+        self.inner_mut().pending_error.take()
     }
 
     /// Send a datagram to the given remote endpoint, copying the payload from a slice.
@@ -709,7 +762,7 @@ impl StackInner {
     /// `recv` can parse the addresses back out of it.
     pub(crate) fn process_udp(
         &mut self,
-        iface: &mut Iface,
+        iface: &mut IfaceState,
         sockets: &mut Slab<UdpSocketState>,
         src_addr: IpAddress,
         dst_addr: IpAddress,
@@ -790,6 +843,37 @@ impl StackInner {
                 ),
             }
         }
+    }
+}
+
+/// Deliver an ICMP error to the UDP socket whose packet provoked it.
+///
+/// `local`/`remote` are the flow parsed from the packet quoted in the error, a
+/// packet this stack sent. Sockets are scored exactly like ordinary ingress demux
+/// (an incoming datagram of this flow travels `remote` → `local`), and the most
+/// specific match gets the error.
+#[cfg(feature = "icmp-error-handling")]
+pub(crate) fn process_icmp_error(
+    sockets: &mut Slab<UdpSocketState>,
+    error: IcmpError,
+    local: IpEndpoint,
+    remote: IpEndpoint,
+) {
+    let mut best: Option<(usize, u8)> = None;
+    for (index, socket) in sockets.iter() {
+        if let Some(score) = socket.match_score(&remote.addr, remote.port, &local.addr, local.port, false)
+            && best.is_none_or(|(_, best_score)| score > best_score)
+        {
+            best = Some((index, score));
+        }
+    }
+
+    if let Some((index, _)) = best {
+        let socket = sockets.get_mut(index);
+        trace!("udp:{}: icmp error from {}: {}", socket.local, remote, error);
+        socket.pending_error = Some((error, remote));
+        #[cfg(feature = "async")]
+        socket.rx_waker.wake();
     }
 }
 

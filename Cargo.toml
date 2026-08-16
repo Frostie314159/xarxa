@@ -4,13 +4,19 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["std", "log", "auto-icmp-echo-reply"]
+default = ["std", "log", "auto-icmp-echo-reply", "icmp-error-handling"]
 std = ["dep:libc"]
 ## Waker registration on sockets, for building `Future`s on top of the stack.
 async = []
 ## Automatically reply to ICMP echo requests. Disable to handle echo requests
 ## yourself through a raw socket.
 auto-icmp-echo-reply = []
+## Deliver ICMP error messages (destination unreachable, packet too big, ...) to
+## the TCP and UDP sockets whose packets provoked them — both errors received
+## from the network and the destination-unreachable errors the stack generates
+## itself when neighbor resolution (ARP/NDISC) fails. Disabling this also
+## disables generating the latter.
+icmp-error-handling = []
 defmt = ["dep:defmt"]
 log = ["dep:log"]
 

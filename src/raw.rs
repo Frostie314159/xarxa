@@ -15,7 +15,7 @@ use core::fmt;
 use crate::buf::PacketBuf;
 use crate::iface::Medium;
 use crate::slab::Slab;
-use crate::stack::{Iface, IfaceHandle, StackInner, TxContext};
+use crate::stack::{IfaceHandle, IfaceState, StackInner, TxContext};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
 use crate::wire::{
@@ -445,7 +445,7 @@ impl StackInner {
     /// the buffer zero-copy and `None` is returned.
     pub(crate) fn process_raw_ethernet(
         &mut self,
-        iface: &Iface,
+        iface: &IfaceState,
         sockets: &mut Slab<RawSocketState>,
         ethertype: EthernetProtocol,
         stack_wants: bool,
