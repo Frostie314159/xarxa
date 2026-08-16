@@ -10,7 +10,7 @@ use core::{fmt, mem};
 use crate::buf::PacketBuf;
 use crate::rand::Rand;
 use crate::slab::Slab;
-use crate::stack::{TxContext, alloc_ephemeral_port};
+use crate::stack::{EgressRoute, TxContext, alloc_ephemeral_port};
 use crate::time::{Duration, Instant};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -32,9 +32,12 @@ pub(crate) use self::repr::TcpRepr;
 pub use self::repr::{TcpTimestampGenerator, TcpTimestampRepr};
 use self::ring_buffer::RingBuffer;
 
-/// Hardcode MTU for now.
-/// TODO: get it from the interface capabilities instead.
-const IP_MTU: usize = 1500;
+/// The IP MTU assumed for TCP segment sizing until the destination has been
+/// routed.
+///
+/// Every `dispatch` refreshes the socket's `ip_mtu` from the routed egress interface
+/// before sizing or sending anything, so this only stands in while there is no route.
+const DEFAULT_IP_MTU: usize = 1500;
 
 /// Gives an indication on the next time the socket should be polled.
 ///
@@ -525,6 +528,11 @@ pub(crate) struct TcpSocketState {
     remote_has_sack: bool,
     /// The maximum number of data octets that the remote side may receive.
     remote_mss: usize,
+    /// The IP MTU of the interface this connection's packets go out of, as of the
+    /// last `dispatch` that routed the destination. Feeds the local MSS: cached
+    /// here because the send decision (`seq_to_transmit`) is also made from
+    /// `poll_at`, which has no access to the stack's routing state.
+    ip_mtu: usize,
     /// The timestamp of the last packet received.
     remote_last_ts: Option<Instant>,
     /// The sequence number of the last packet received, used for sACK
@@ -613,6 +621,7 @@ impl TcpSocketState {
             remote_win_scale: None,
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
+            ip_mtu: DEFAULT_IP_MTU,
             remote_last_ts: None,
             local_rx_last_ack: None,
             local_rx_last_seq: None,
@@ -679,6 +688,7 @@ impl TcpSocketState {
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
         self.remote_mss = DEFAULT_MSS;
+        self.ip_mtu = DEFAULT_IP_MTU;
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
@@ -1478,7 +1488,7 @@ impl TcpSocketState {
         // The effective max segment size, taking into account the options and the local and remote limits.
         let options_len = if self.tsval_generator.is_some() { 12 } else { 0 };
 
-        let local_mss = IP_MTU - ip_header_len - TCP_HEADER_LEN;
+        let local_mss = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
         let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
         // Have we sent data that hasn't been ACKed yet?
@@ -1589,7 +1599,7 @@ impl TcpSocketState {
 
     pub(crate) fn dispatch<F, E>(&mut self, cx: &mut TxContext<'_>, emit: F) -> Result<(), E>
     where
-        F: FnOnce(&mut TxContext<'_>, (IpAddress, IpAddress, u8, TcpRepr)) -> Result<(), E>,
+        F: FnOnce(&mut TxContext<'_>, (Option<EgressRoute>, IpAddress, IpAddress, u8, TcpRepr)) -> Result<(), E>,
     {
         if self.tuple.is_none() {
             return Ok(());
@@ -1661,6 +1671,17 @@ impl TcpSocketState {
 
             // Inform RTTE, so that it can avoid bogus measurements.
             self.rtte.on_retransmit();
+        }
+
+        // Route the destination now, before deciding whether to send: the egress
+        // interface's MTU feeds the MSS, which the send decision and segment
+        // sizing depend on. The decision is handed to `emit` so the packet is
+        // never routed a second time. With no route, keep the last known MTU and
+        // proceed. The segment is built and dropped at emit time, so socket
+        // state still advances and the retransmit timer owns recovery.
+        let route = cx.route(&tuple.remote.addr);
+        if let Some(route) = &route {
+            self.ip_mtu = route.ip_mtu;
         }
 
         // Decide whether we're sending a packet.
@@ -1752,7 +1773,7 @@ impl TcpSocketState {
                 // 3. MSS we can send, determined by our MTU.
                 // 4. Our congestion window
                 let options_len = repr.header_len() - TCP_HEADER_LEN;
-                let local_mss = IP_MTU - ip_header_len - TCP_HEADER_LEN;
+                let local_mss = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
                 let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
                 let offset = if self.pending_fast_retransmit {
@@ -1861,7 +1882,7 @@ impl TcpSocketState {
 
         if repr.control == TcpControl::Syn {
             // Fill the MSS option. See RFC 6691 for an explanation of this calculation.
-            let max_segment_size = IP_MTU - ip_header_len - TCP_HEADER_LEN;
+            let max_segment_size = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
             repr.max_seg_size = Some(max_segment_size as u16);
         }
 
@@ -1872,7 +1893,7 @@ impl TcpSocketState {
         // Bailing out if the packet isn't placed in the device buffer allows us
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
-        emit(cx, (tuple.local.addr, tuple.remote.addr, hop_limit, repr))?;
+        emit(cx, (route, tuple.local.addr, tuple.remote.addr, hop_limit, repr))?;
 
         // We've sent something, whether useful data or a keep-alive packet, so rewind
         // the keep-alive timer.
@@ -2007,10 +2028,15 @@ pub(crate) fn flush(state: &mut TcpSocketState, cx: &mut TxContext<'_>) {
     loop {
         let mut emitted = false;
         let result: Result<(), core::convert::Infallible> =
-            state.dispatch(cx, |cx, (src_addr, dst_addr, hop_limit, repr)| {
+            state.dispatch(cx, |cx, (route, src_addr, dst_addr, hop_limit, repr)| {
                 emitted = true;
-                let buf = build_tcp_packet(&repr, &src_addr, &dst_addr);
-                cx.transmit_ip(buf, src_addr, dst_addr, IpProtocol::Tcp, hop_limit);
+                match route {
+                    Some(route) => {
+                        let buf = build_tcp_packet(&repr, &src_addr, &dst_addr);
+                        cx.transmit_ip_routed(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, hop_limit);
+                    }
+                    None => debug!("no route to {}, dropping packet", dst_addr),
+                }
                 Ok(())
             });
         let Ok(()) = result;
@@ -2820,7 +2846,7 @@ mod test {
         let mut sent = 0;
         let result = socket.sockets.get_mut(0).dispatch(
             &mut socket.stack.tx_context(),
-            |_, (src_addr, dst_addr, _hop_limit, tcp_repr)| {
+            |_, (_route, src_addr, dst_addr, _hop_limit, tcp_repr)| {
                 assert_eq!(src_addr, LOCAL_ADDR.into());
                 assert_eq!(dst_addr, REMOTE_ADDR.into());
 
@@ -5030,6 +5056,102 @@ mod test {
                 timestamp: Some(TcpTimestampRepr::new(1, 0)),
                 ..RECV_TEMPL
             }]
+        );
+    }
+
+    #[test]
+    fn test_mss_derived_from_iface_mtu() {
+        /// A device with an MTU smaller than a packet buffer.
+        struct SmallMtuDevice;
+
+        impl Interface for SmallMtuDevice {
+            fn capabilities(&self) -> IfaceCapabilities {
+                IfaceCapabilities {
+                    medium: Medium::Ip,
+                    max_transmission_unit: 576,
+                }
+            }
+
+            fn receive(&mut self) -> Option<PacketBuf> {
+                None
+            }
+
+            fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
+                Ok(())
+            }
+        }
+
+        const MTU_MSS: usize = 576 - IPV4_HEADER_LEN - TCP_HEADER_LEN;
+
+        let mut s = socket_with_buffer_sizes(2048, 64);
+        s.stack = Stack::new(0x1234_5678_dead_beef);
+        s.stack.add_iface(
+            Box::new(SmallMtuDevice),
+            Config {
+                hardware_addr: EthernetAddress([0x02; 6]),
+                ip_addrs: vec![IpCidr::new(LOCAL_ADDR.into(), 24)],
+            },
+        );
+        s.state = State::SynSent;
+        s.tuple = Some(TUPLE);
+        s.local_seq_no = LOCAL_SEQ;
+        s.remote_last_seq = LOCAL_SEQ;
+
+        // The SYN advertises the MSS derived from the egress interface's MTU.
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(MTU_MSS as u16),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ..RECV_TEMPL
+            }]
+        );
+
+        // Complete the handshake. The remote's MSS and window are no constraint.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(2000),
+                window_scale: Some(0),
+                window_len: 4096,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(s.state, State::Established);
+
+        // Data is segmented at the MTU-derived MSS, not the remote's 2000.
+        s.view().send_slice(&[0; MTU_MSS * 2]).unwrap();
+        recv!(
+            s,
+            [
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &[0; MTU_MSS],
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + MTU_MSS,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    payload: &[0; MTU_MSS],
+                    ..RECV_TEMPL
+                }
+            ]
         );
     }
 
@@ -8401,7 +8523,7 @@ mod test {
         assert_eq!(
             s.sockets
                 .get_mut(0)
-                .dispatch(&mut s.stack.tx_context(), |_, (_, _, hop_limit, _)| {
+                .dispatch(&mut s.stack.tx_context(), |_, (_, _, _, hop_limit, _)| {
                     assert_eq!(hop_limit, 0x2a);
                     Ok::<_, ()>(())
                 }),

@@ -4,7 +4,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::buf::PacketBuf;
+use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
 use crate::iface::{Interface, Medium};
 use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
@@ -92,6 +92,25 @@ pub(crate) struct TxContext<'a> {
     pub(crate) ifaces: &'a mut Slab<Iface>,
 }
 
+/// A complete egress routing decision for one destination, produced by
+/// [`TxContext::route`]: the interface the packet goes out of, the next hop to
+/// resolve on that link, and the interface's IP MTU.
+///
+/// Made once per packet: callers that need routing information before building
+/// the packet (TCP sizes segments by the egress MTU) route first and then
+/// transmit via [`TxContext::transmit_ip_routed`], so the packet is never routed
+/// twice.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EgressRoute {
+    pub(crate) iface: IfaceHandle,
+    /// The address to resolve on the link: the destination itself when on-link
+    /// (or broadcast/multicast), else the gateway from the routing table.
+    pub(crate) next_hop: IpAddress,
+    /// The egress interface's IP-layer MTU.
+    pub(crate) ip_mtu: usize,
+}
+
 impl TxContext<'_> {
     /// The current time, as last set by [`Stack::poll`].
     pub(crate) fn now(&self) -> Instant {
@@ -111,30 +130,40 @@ impl TxContext<'_> {
     /// Get a source address for sending to the given destination, selected from the
     /// interface the packet would go out of.
     pub(crate) fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
-        let handle = self.egress_iface(dst_addr)?;
-        self.ifaces.get(handle.0).get_source_address(dst_addr)
+        let route = self.route(dst_addr)?;
+        self.ifaces.get(route.iface.0).get_source_address(dst_addr)
     }
 
-    /// Pick the egress interface for a destination: the interface the destination is
-    /// on-link for, else the interface named by the matching route.
-    fn egress_iface(&self, dst_addr: &IpAddress) -> Option<IfaceHandle> {
+    /// Make the egress routing decision for a destination: the interface the
+    /// destination is on-link for (next hop: the destination itself), else the
+    /// interface and gateway named by the matching route.
+    pub(crate) fn route(&self, dst_addr: &IpAddress) -> Option<EgressRoute> {
         if !dst_addr.is_unicast() {
             // Broadcast and multicast destinations carry nothing to route on, so
-            // they go out the first interface.
+            // they go out the first interface. The next hop is the destination
+            // itself, resolved to a broadcast/multicast hardware address.
             // TODO: let the send API pick the interface.
-            return self.ifaces.iter().next().map(|(_, iface)| iface.handle);
+            return self.ifaces.iter().next().map(|(_, iface)| EgressRoute {
+                iface: iface.handle,
+                next_hop: *dst_addr,
+                ip_mtu: iface.ip_mtu(),
+            });
         }
 
-        self.ifaces
-            .iter()
-            .find(|(_, iface)| iface.in_same_network(dst_addr))
-            .map(|(_, iface)| iface.handle)
-            .or_else(|| {
-                self.inner
-                    .routes
-                    .lookup(dst_addr, self.inner.now)
-                    .map(|route| route.iface)
-            })
+        if let Some((_, iface)) = self.ifaces.iter().find(|(_, iface)| iface.in_same_network(dst_addr)) {
+            return Some(EgressRoute {
+                iface: iface.handle,
+                next_hop: *dst_addr,
+                ip_mtu: iface.ip_mtu(),
+            });
+        }
+
+        let route = self.inner.routes.lookup(dst_addr, self.inner.now)?;
+        Some(EgressRoute {
+            iface: route.iface,
+            next_hop: route.via_router,
+            ip_mtu: self.ifaces.get(route.iface.0).ip_mtu(),
+        })
     }
 
     /// Transmit a fully-built IP payload, with the L4 header but not the IP header.
@@ -149,22 +178,42 @@ impl TxContext<'_> {
         next_header: IpProtocol,
         hop_limit: u8,
     ) {
-        let Some(handle) = self.egress_iface(&dst_addr) else {
+        let Some(route) = self.route(&dst_addr) else {
             debug!("no route to {}, dropping packet", dst_addr);
             return;
         };
-        let iface = self.ifaces.get_mut(handle.0);
-        match (src_addr, dst_addr) {
+        self.transmit_ip_routed(&route, buf, src_addr, dst_addr, next_header, hop_limit);
+    }
+
+    /// [`transmit_ip`](Self::transmit_ip) for a destination the caller already
+    /// routed: transmit on the decided interface, resolving `route.next_hop`
+    /// instead of routing again.
+    pub(crate) fn transmit_ip_routed(
+        &mut self,
+        route: &EgressRoute,
+        mut buf: PacketBuf,
+        src_addr: IpAddress,
+        dst_addr: IpAddress,
+        next_header: IpProtocol,
+        hop_limit: u8,
+    ) {
+        let iface = self.ifaces.get_mut(route.iface.0);
+        let ethertype = match (src_addr, dst_addr) {
             (IpAddress::Ipv4(src), IpAddress::Ipv4(dst)) => {
-                self.inner.transmit_ipv4(iface, buf, src, dst, next_header, hop_limit)
+                push_ipv4_header(&mut buf, src, dst, next_header, hop_limit);
+                EthernetProtocol::Ipv4
             }
             (IpAddress::Ipv6(src), IpAddress::Ipv6(dst)) => {
-                self.inner.transmit_ipv6(iface, buf, src, dst, next_header, hop_limit)
+                push_ipv6_header(&mut buf, src, dst, next_header, hop_limit);
+                EthernetProtocol::Ipv6
             }
             _ => {
                 debug!("cannot transmit, address family mismatch");
+                return;
             }
-        }
+        };
+        self.inner
+            .transmit_ip_frame(iface, dst_addr, Some(route.next_hop), buf, ethertype);
     }
 
     /// Transmit a fully-built Ethernet frame on the given interface, as-is.
@@ -182,16 +231,17 @@ impl TxContext<'_> {
     ///
     /// Returns `false` if there is no route to the destination.
     pub(crate) fn transmit_raw_ip(&mut self, buf: PacketBuf, dst_addr: IpAddress) -> bool {
-        let Some(handle) = self.egress_iface(&dst_addr) else {
+        let Some(route) = self.route(&dst_addr) else {
             debug!("no route to {}, dropping packet", dst_addr);
             return false;
         };
-        let iface = self.ifaces.get_mut(handle.0);
+        let iface = self.ifaces.get_mut(route.iface.0);
         let ethertype = match dst_addr {
             IpAddress::Ipv4(_) => EthernetProtocol::Ipv4,
             IpAddress::Ipv6(_) => EthernetProtocol::Ipv6,
         };
-        self.inner.transmit_ip_frame(iface, dst_addr, buf, ethertype);
+        self.inner
+            .transmit_ip_frame(iface, dst_addr, Some(route.next_hop), buf, ethertype);
         true
     }
 }
@@ -1191,7 +1241,15 @@ impl StackInner {
 
     /// Look up the destination hardware address for an egress packet, sending a
     /// solicitation (ARP request / NDISC neighbor solicit) if it is not resolved yet.
-    fn lookup_hardware_addr(&mut self, iface: &mut Iface, dst_addr: &IpAddress) -> NeighborLookup {
+    ///
+    /// `next_hop` is the pre-routed address to resolve, if the caller already made
+    /// the routing decision. `None` routes here.
+    fn lookup_hardware_addr(
+        &mut self,
+        iface: &mut Iface,
+        dst_addr: &IpAddress,
+        next_hop: Option<IpAddress>,
+    ) -> NeighborLookup {
         if iface.is_broadcast(dst_addr) {
             return NeighborLookup::Found(EthernetAddress::BROADCAST);
         }
@@ -1211,8 +1269,12 @@ impl StackInner {
             return NeighborLookup::Found(hardware_addr);
         }
 
-        let Some(next_hop) = self.route(iface, dst_addr) else {
-            return NeighborLookup::NoRoute;
+        let next_hop = match next_hop {
+            Some(next_hop) => next_hop,
+            None => match self.route(iface, dst_addr) {
+                Some(next_hop) => next_hop,
+                None => return NeighborLookup::NoRoute,
+            },
         };
 
         match self.neighbor_cache.lookup(&(iface.handle, next_hop), self.now) {
@@ -1351,7 +1413,7 @@ impl StackInner {
         hop_limit: u8,
     ) {
         push_ipv4_header(&mut buf, src_addr, dst_addr, next_header, hop_limit);
-        self.transmit_ip_frame(iface, IpAddress::Ipv4(dst_addr), buf, EthernetProtocol::Ipv4);
+        self.transmit_ip_frame(iface, IpAddress::Ipv4(dst_addr), None, buf, EthernetProtocol::Ipv4);
     }
 
     fn transmit_ipv6(
@@ -1364,11 +1426,15 @@ impl StackInner {
         hop_limit: u8,
     ) {
         push_ipv6_header(&mut buf, src_addr, dst_addr, next_header, hop_limit);
-        self.transmit_ip_frame(iface, IpAddress::Ipv6(dst_addr), buf, EthernetProtocol::Ipv6);
+        self.transmit_ip_frame(iface, IpAddress::Ipv6(dst_addr), None, buf, EthernetProtocol::Ipv6);
     }
 
     /// Transmit a fully-built IP packet, resolving the destination hardware address
     /// on Ethernet mediums.
+    ///
+    /// `next_hop` is the pre-routed address to resolve on the link, from an
+    /// [`EgressRoute`]. `None` means "route here", for the ingress reply paths,
+    /// which transmit on the arrival interface without routing first.
     ///
     /// If the neighbor is not resolved yet, the packet is queued in the interface's
     /// pending queue and flushed when resolution completes.
@@ -1376,12 +1442,13 @@ impl StackInner {
         &mut self,
         iface: &mut Iface,
         dst_addr: IpAddress,
+        next_hop: Option<IpAddress>,
         buf: PacketBuf,
         ethertype: EthernetProtocol,
     ) {
         match iface.dev.capabilities().medium {
             Medium::Ip => self.transmit_raw(iface, buf),
-            Medium::Ethernet => match self.lookup_hardware_addr(iface, &dst_addr) {
+            Medium::Ethernet => match self.lookup_hardware_addr(iface, &dst_addr, next_hop) {
                 NeighborLookup::Found(hardware_addr) => self.transmit_ethernet(iface, hardware_addr, buf, ethertype),
                 NeighborLookup::Pending { next_hop } => {
                     debug!("neighbor {} pending, queing packet", next_hop);
@@ -1592,6 +1659,18 @@ impl Iface {
     /// The interface's medium.
     pub(crate) fn medium(&self) -> Medium {
         self.dev.capabilities().medium
+    }
+
+    /// The interface's IP-layer MTU: the device MTU minus the Ethernet header on
+    /// Ethernet mediums, clamped to what a `PacketBuf` can carry (egress always
+    /// reserves Ethernet headroom, whatever the medium).
+    pub(crate) fn ip_mtu(&self) -> usize {
+        let caps = self.dev.capabilities();
+        let mtu = match caps.medium {
+            Medium::Ethernet => caps.max_transmission_unit - ETHERNET_HEADER_LEN,
+            Medium::Ip => caps.max_transmission_unit,
+        };
+        mtu.min(PACKET_BUF_SIZE - ETHERNET_HEADER_LEN)
     }
 
     fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
