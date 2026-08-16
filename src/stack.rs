@@ -777,8 +777,12 @@ impl StackInner {
             return;
         }
 
+        #[cfg(not(feature = "auto-icmp-echo-reply"))]
+        let _ = (iface, src_addr, dst_addr);
+
         match (icmp_packet.msg_type(), icmp_packet.msg_code()) {
             // Respond to echo requests.
+            #[cfg(feature = "auto-icmp-echo-reply")]
             (Icmpv4Message::EchoRequest, 0) => {
                 // Do not send ICMP replies to non-unicast sources.
                 if !iface.is_unicast_v4(src_addr) {
@@ -911,6 +915,7 @@ impl StackInner {
 
         match icmp_packet.msg_type() {
             // Respond to echo requests.
+            #[cfg(feature = "auto-icmp-echo-reply")]
             Icmpv6Message::EchoRequest => {
                 let reply_src = if dst_addr.x_is_unicast() {
                     dst_addr
@@ -1301,6 +1306,7 @@ impl Iface {
     }
 
     /// Get the first IPv4 address of the interface.
+    #[cfg(feature = "auto-icmp-echo-reply")]
     fn ipv4_addr(&self) -> Option<Ipv4Address> {
         self.ip_addrs.iter().find_map(|addr| match *addr {
             IpCidr::Ipv4(cidr) => Some(cidr.address()),

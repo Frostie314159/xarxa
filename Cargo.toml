@@ -4,10 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["std", "log"]
+default = ["std", "log", "auto-icmp-echo-reply"]
 std = ["dep:libc"]
 ## Waker registration on sockets, for building `Future`s on top of the stack.
 async = []
+## Automatically reply to ICMP echo requests. Disable to handle echo requests
+## yourself through a raw socket.
+auto-icmp-echo-reply = []
 defmt = ["dep:defmt"]
 log = ["dep:log"]
 
