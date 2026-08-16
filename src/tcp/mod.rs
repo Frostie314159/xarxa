@@ -2790,7 +2790,7 @@ impl fmt::Write for TcpSocket<'_> {
 mod test {
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface, Medium};
-    use crate::stack::{Config, Stack};
+    use crate::stack::Stack;
     use crate::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv6Address};
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
@@ -3038,16 +3038,14 @@ mod test {
     /// A stack with one interface owning `LOCAL_ADDR`.
     fn test_stack() -> Stack {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        stack.add_iface(
+        let handle = stack.add_iface(
             Box::new(TestingDevice),
-            Config {
-                hardware_addr: EthernetAddress([0x02, 0x02, 0x02, 0x02, 0x02, 0x02]),
-                ip_addrs: vec![
-                    IpCidr::new(LOCAL_ADDR.into(), 24),
-                    IpCidr::new(Ipv4Address::new(127, 0, 0, 1).into(), 8),
-                ],
-            },
+            EthernetAddress([0x02, 0x02, 0x02, 0x02, 0x02, 0x02]),
         );
+        stack.iface(handle).set_ip_addrs([
+            IpCidr::new(LOCAL_ADDR.into(), 24),
+            IpCidr::new(Ipv4Address::new(127, 0, 0, 1).into(), 8),
+        ]);
         stack
     }
 
@@ -5176,13 +5174,8 @@ mod test {
 
         let mut s = socket_with_buffer_sizes(2048, 64);
         s.stack = Stack::new(0x1234_5678_dead_beef);
-        s.stack.add_iface(
-            Box::new(SmallMtuDevice),
-            Config {
-                hardware_addr: EthernetAddress([0x02; 6]),
-                ip_addrs: vec![IpCidr::new(LOCAL_ADDR.into(), 24)],
-            },
-        );
+        let handle = s.stack.add_iface(Box::new(SmallMtuDevice), EthernetAddress([0x02; 6]));
+        s.stack.iface(handle).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
         s.state = State::SynSent;
         s.tuple = Some(TUPLE);
         s.local_seq_no = LOCAL_SEQ;
@@ -9657,7 +9650,7 @@ mod stack_test {
 
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface, Medium};
-    use crate::stack::{Config, Stack};
+    use crate::stack::Stack;
     use crate::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Packet};
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -9717,13 +9710,8 @@ mod stack_test {
     fn stack() -> (Stack, Rc<RefCell<Queues>>) {
         let queues = Rc::new(RefCell::new(Queues::default()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        stack.add_iface(
-            Box::new(QueueDevice(queues.clone())),
-            Config {
-                hardware_addr: EthernetAddress([0x02; 6]),
-                ip_addrs: vec![IpCidr::new(LOCAL_ADDR.into(), 24)],
-            },
-        );
+        let handle = stack.add_iface(Box::new(QueueDevice(queues.clone())), EthernetAddress([0x02; 6]));
+        stack.iface(handle).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
         (stack, queues)
     }
 

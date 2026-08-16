@@ -881,7 +881,7 @@ pub(crate) fn process_icmp_error(
 mod test {
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface, Medium};
-    use crate::stack::{Config, Stack};
+    use crate::stack::Stack;
     use crate::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv6Address};
 
     fn stack_with_socket() -> (Stack, UdpHandle) {
@@ -923,13 +923,8 @@ mod test {
     /// specified remote can resolve their local address.
     fn stack_with_iface() -> Stack {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        stack.add_iface(
-            Box::new(TestingDevice),
-            Config {
-                hardware_addr: EthernetAddress([0x02; 6]),
-                ip_addrs: vec![IpCidr::new(LOCAL_ADDR.into(), 24)],
-            },
-        );
+        let handle = stack.add_iface(Box::new(TestingDevice), EthernetAddress([0x02; 6]));
+        stack.iface(handle).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
         stack
     }
 

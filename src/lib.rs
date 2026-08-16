@@ -31,6 +31,6 @@ pub use buf::{PACKET_BUF_SIZE, PacketBuf};
 pub use icmp_error::IcmpError;
 pub use raw::{RawHandle, RawMode, RawSocket};
 pub use route::{Route, Routes};
-pub use stack::{Config, Iface, IfaceHandle, Stack};
+pub use stack::{Iface, IfaceHandle, Stack};
 pub use tcp::{TcpHandle, TcpListener, TcpListenerHandle, TcpSocket};
 pub use udp::{UdpHandle, UdpSocket};

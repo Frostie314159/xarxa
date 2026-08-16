@@ -532,7 +532,7 @@ mod test {
 
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface};
-    use crate::stack::{Config, Stack};
+    use crate::stack::Stack;
     use crate::wire::{EthernetAddress, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpCidr, Ipv4Address, Ipv6Address};
 
     /// A mock device: never receives, records transmitted frames.
@@ -565,11 +565,9 @@ mod test {
         let tx = Rc::new(RefCell::new(Vec::new()));
         let handle = stack.add_iface(
             Box::new(TestDevice { medium, tx: tx.clone() }),
-            Config {
-                hardware_addr: EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
-                ip_addrs,
-            },
+            EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
         );
+        stack.iface(handle).set_ip_addrs(ip_addrs);
         (handle, tx)
     }
 

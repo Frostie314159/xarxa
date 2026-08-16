@@ -33,17 +33,6 @@ macro_rules! check {
     };
 }
 
-/// Configuration for an interface added to a [`Stack`].
-pub struct Config {
-    /// Hardware (MAC) address of the interface.
-    ///
-    /// Used on [`Medium::Ethernet`] interfaces, ignored on [`Medium::Ip`] interfaces.
-    pub hardware_addr: EthernetAddress,
-
-    /// IP addresses of the interface.
-    pub ip_addrs: Vec<IpCidr>,
-}
-
 /// A handle to an interface added to a [`Stack`].
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -172,9 +161,7 @@ impl Iface<'_> {
 
     /// Replace the interface's entire set of IP addresses.
     ///
-    /// Equivalent to removing every address and adding the given ones, but the
-    /// link state (below) is invalidated once, and only if the set actually
-    /// changed.
+    /// Equivalent to removing every address and adding the given ones.
     ///
     /// # Panics
     /// Panics if any of the addresses is not unicast.
@@ -441,14 +428,26 @@ impl Stack {
         }
     }
 
-    /// Add an interface to the stack with the given configuration, returning a
-    /// handle to it.
-    pub fn add_iface(&mut self, dev: Box<dyn Interface>, config: Config) -> IfaceHandle {
+    /// Add an interface to the stack, returning a handle to it.
+    ///
+    /// Configure the interface after adding it. At minimum, you will want to
+    /// add an IP address to it.
+    ///
+    /// ```no_run
+    /// # use xarxa::{Stack, iface::Interface, wire::{EthernetAddress, IpCidr, Ipv4Address}};
+    /// # fn configure(stack: &mut Stack, dev: Box<dyn Interface>) {
+    /// let handle = stack.add_iface(dev, EthernetAddress([0x02, 0, 0, 0, 0, 0x01]));
+    /// stack
+    ///     .iface(handle)
+    ///     .add_ip_addr(IpCidr::new(Ipv4Address::new(192, 168, 1, 1).into(), 24));
+    /// # }
+    /// ```
+    pub fn add_iface(&mut self, dev: Box<dyn Interface>, hardware_addr: EthernetAddress) -> IfaceHandle {
         let index = self.ifaces.add_with(|index| IfaceState {
             handle: IfaceHandle(index),
             dev,
-            hardware_addr: config.hardware_addr,
-            ip_addrs: config.ip_addrs,
+            hardware_addr,
+            ip_addrs: Vec::new(),
         });
         IfaceHandle(index)
     }
@@ -2187,17 +2186,17 @@ mod test {
         let rx = Rc::new(RefCell::new(VecDeque::new()));
         let tx = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        stack.add_iface(
+        let handle = stack.add_iface(
             Box::new(TestDevice {
                 medium,
                 rx: rx.clone(),
                 tx: tx.clone(),
             }),
-            Config {
-                hardware_addr: EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
-                ip_addrs: vec![IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)],
-            },
+            EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
         );
+        stack
+            .iface(handle)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)]);
         (stack, rx, tx)
     }
 
