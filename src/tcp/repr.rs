@@ -10,6 +10,7 @@ use core::fmt;
 use crate::wire::{Error, IpAddress, Result, TCP_HEADER_LEN, TcpControl, TcpOption, TcpPacket, TcpSeqNumber};
 
 /// A high-level representation of a Transmission Control Protocol packet.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) struct TcpRepr<'a> {
     pub src_port: u16,
@@ -30,6 +31,7 @@ pub(crate) struct TcpRepr<'a> {
 pub type TcpTimestampGenerator = fn() -> u32;
 
 /// The TCP timestamp option value (RFC 7323).
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct TcpTimestampRepr {
     pub tsval: u32,
@@ -101,7 +103,7 @@ impl<'a> TcpRepr<'a> {
                     // value exceeding 14, the TCP should log the error but use 14 instead of the
                     // specified value.
                     window_scale = if value > 14 {
-                        net_debug!(
+                        debug!(
                             "{}:{}:{}:{}: parsed window scaling factor >14, setting to 14",
                             src_addr,
                             packet.src_port(),

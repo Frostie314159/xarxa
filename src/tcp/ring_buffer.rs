@@ -10,10 +10,12 @@ use alloc::vec::Vec;
 use core::cmp;
 
 /// Error returned when enqueuing into a full buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Full;
 
 /// Error returned when dequeuing from an empty buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Empty;
 
@@ -31,6 +33,7 @@ pub struct Empty;
 ///
 /// This implementation is suitable for both simple uses such as a FIFO queue
 /// of UDP packets, and advanced ones such as a TCP reassembly buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct RingBuffer<T> {
     storage: Vec<T>,

@@ -118,6 +118,7 @@ open_enum! {
 }
 
 /// A read/write wrapper around an Internet Control Message Protocol version 6 packet buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Packet<'a> {
     pub(super) buffer: &'a mut [u8],
@@ -354,7 +355,7 @@ impl<'a> Packet<'a> {
             Message::MldReport => {
                 NetworkEndian::write_u16(&mut self.buffer[field::RECORD_RESV], 0);
             }
-            ty => panic!("Message type `{ty}` does not have any reserved fields."),
+            ty => panic!("Message type `{}` does not have any reserved fields.", ty),
         }
     }
 

@@ -30,10 +30,6 @@ pub(crate) use self::repr::TcpRepr;
 pub use self::repr::{TcpTimestampGenerator, TcpTimestampRepr};
 use self::ring_buffer::RingBuffer;
 
-macro_rules! tcp_trace {
-    ($($arg:expr),*) => (net_log!(trace, $($arg),*));
-}
-
 /// The IP MTU assumed for TCP segment sizing: a full packet buffer minus the
 /// Ethernet header. (Per-interface MTUs below this are not consulted yet.)
 const IP_MTU: usize = PACKET_BUF_SIZE - ETHERNET_HEADER_LEN;
@@ -41,6 +37,7 @@ const IP_MTU: usize = PACKET_BUF_SIZE - ETHERNET_HEADER_LEN;
 /// Gives an indication on the next time the socket should be polled.
 ///
 /// The variant order is meaningful: `Now < Time(_) < Ingress`.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum PollAt {
     /// The socket needs to be polled immediately.
@@ -54,10 +51,12 @@ pub(crate) enum PollAt {
 /// A handle to a TCP socket added to a [`Stack`].
 ///
 /// [`Stack`]: crate::Stack
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TcpHandle(pub(crate) usize);
 
 /// Error returned by [`TcpListener::listen`]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ListenError {
     InvalidState,
@@ -79,6 +78,7 @@ impl Display for ListenError {
 impl core::error::Error for ListenError {}
 
 /// Error returned by [`TcpSocket::connect`]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ConnectError {
     InvalidState,
@@ -104,6 +104,7 @@ impl Display for ConnectError {
 impl core::error::Error for ConnectError {}
 
 /// Error returned by [`TcpSocket::send`]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SendError {
     InvalidState,
@@ -120,6 +121,7 @@ impl Display for SendError {
 impl core::error::Error for SendError {}
 
 /// Error returned by [`TcpSocket::recv`]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RecvError {
     InvalidState,
@@ -147,6 +149,7 @@ pub(crate) type SocketBuffer = RingBuffer<u8>;
 /// set from the start).
 ///
 /// [RFC 793]: https://tools.ietf.org/html/rfc793
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum State {
     Closed,
@@ -198,6 +201,7 @@ const RTTE_MIN_RTO: u32 = 1000;
 // seconds
 const RTTE_MAX_RTO: u32 = 60_000;
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 struct RttEstimator {
     /// true if we have made at least one rtt measurement.
@@ -256,12 +260,9 @@ impl RttEstimator {
 
         self.rto_count = 0;
 
-        tcp_trace!(
+        trace!(
             "rtte: sample={:?} srtt={:?} rttvar={:?} rto={:?}",
-            new_rtt,
-            self.srtt,
-            self.rttvar,
-            self.rto
+            new_rtt, self.srtt, self.rttvar, self.rto
         );
     }
 
@@ -270,7 +271,7 @@ impl RttEstimator {
             self.max_seq_sent = Some(seq);
             if self.timestamp.is_none() {
                 self.timestamp = Some((timestamp, seq));
-                tcp_trace!("rtte: sampling at seq={:?}", seq);
+                trace!("rtte: sampling at seq={:?}", seq);
             }
         }
     }
@@ -289,7 +290,7 @@ impl RttEstimator {
         // maximum value discussed in (2.5) above may be used to provide
         // an upper bound to this doubling operation.
         self.rto = (self.rto * 2).min(RTTE_MAX_RTO);
-        tcp_trace!("rtte: doubling rto to {:?}", self.rto);
+        trace!("rtte: doubling rto to {:?}", self.rto);
 
         // RFC 6298: a TCP implementation MAY clear SRTT and RTTVAR after
         // backing off the timer multiple times as it is likely that the current
@@ -300,18 +301,19 @@ impl RttEstimator {
         if self.rto_count >= 3 {
             self.rto_count = 0;
             self.have_measurement = false;
-            tcp_trace!("rtte: too many retransmissions, clearing srtt, rttvar.");
+            trace!("rtte: too many retransmissions, clearing srtt, rttvar.");
         }
     }
 
     fn on_retransmit(&mut self) {
         if self.timestamp.is_some() {
-            tcp_trace!("rtte: abort sampling due to retransmit");
+            trace!("rtte: abort sampling due to retransmit");
         }
         self.timestamp = None;
     }
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Timer {
     Idle { keep_alive_at: Option<Instant> },
@@ -444,6 +446,7 @@ impl Timer {
     }
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum AckDelayTimer {
     Idle,
@@ -451,6 +454,7 @@ enum AckDelayTimer {
     Immediate,
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 struct Tuple {
     local: IpEndpoint,
@@ -464,6 +468,7 @@ impl Display for Tuple {
 }
 
 /// A congestion control algorithm.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum CongestionControl {
     None,
@@ -692,7 +697,7 @@ impl TcpSocketState {
 
     fn set_state(&mut self, state: State) {
         if self.state != state {
-            tcp_trace!("state={}=>{}", self.state, state);
+            trace!("state={}=>{}", self.state, state);
         }
 
         self.state = state;
@@ -754,7 +759,7 @@ impl TcpSocketState {
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
         if self.remote_has_sack {
-            net_debug!("sending sACK option with current assembler ranges");
+            debug!("sending sACK option with current assembler ranges");
 
             // RFC 2018: The first SACK block (i.e., the one immediately following the kind and
             // length fields in the option) MUST specify the contiguous block of data containing
@@ -845,12 +850,12 @@ impl TcpSocketState {
             // An RST received in response to initial SYN is acceptable if it acknowledges
             // the initial SYN.
             (State::SynSent, TcpControl::Rst, None) => {
-                net_debug!("unacceptable RST (expecting RST|ACK) in response to initial SYN");
+                debug!("unacceptable RST (expecting RST|ACK) in response to initial SYN");
                 return None;
             }
             (State::SynSent, TcpControl::Rst, Some(ack_number)) => {
                 if ack_number != self.local_seq_no + 1 {
-                    net_debug!("unacceptable RST|ACK in response to initial SYN");
+                    debug!("unacceptable RST|ACK in response to initial SYN");
                     return None;
                 }
             }
@@ -859,7 +864,7 @@ impl TcpSocketState {
             // SYN|ACK in the SYN-SENT state must have the exact ACK number.
             (State::SynSent, TcpControl::Syn, Some(ack_number)) => {
                 if ack_number != self.local_seq_no + 1 {
-                    net_debug!("unacceptable SYN|ACK in response to initial SYN");
+                    debug!("unacceptable SYN|ACK in response to initial SYN");
                     return Some(Self::rst_reply(repr));
                 }
             }
@@ -874,27 +879,27 @@ impl TcpSocketState {
                 // servers, or a defense against reordering. Either way, if Linux
                 // does it, we do too.
                 if ack_number == self.local_seq_no + 1 {
-                    net_debug!("expecting a SYN|ACK, received an ACK with the right ack_number, ignoring.");
+                    debug!("expecting a SYN|ACK, received an ACK with the right ack_number, ignoring.");
                     return None;
                 }
 
-                net_debug!("expecting a SYN|ACK, received an ACK with the wrong ack_number, sending RST.");
+                debug!("expecting a SYN|ACK, received an ACK with the wrong ack_number, sending RST.");
                 return Some(Self::rst_reply(repr));
             }
             // Anything else in the SYN-SENT state is invalid.
             (State::SynSent, _, _) => {
-                net_debug!("expecting a SYN|ACK");
+                debug!("expecting a SYN|ACK");
                 return None;
             }
             // Every packet after the initial SYN must be an acknowledgement.
             (_, _, None) => {
-                net_debug!("expecting an ACK");
+                debug!("expecting an ACK");
                 return None;
             }
             // ACK in the SYN-RECEIVED state must have the exact ACK number, or we RST it.
             (State::SynReceived, _, Some(ack_number)) => {
                 if ack_number != self.local_seq_no + 1 {
-                    net_debug!("unacceptable ACK in response to SYN|ACK");
+                    debug!("unacceptable ACK in response to SYN|ACK");
                     return Some(Self::rst_reply(repr));
                 }
             }
@@ -912,12 +917,12 @@ impl TcpSocketState {
                 }
 
                 if ack_number < ack_min {
-                    net_debug!("duplicate ACK ({} not in {}...{})", ack_number, ack_min, ack_max);
+                    debug!("duplicate ACK ({} not in {}...{})", ack_number, ack_min, ack_max);
                     return None;
                 }
 
                 if ack_number > ack_max {
-                    net_debug!("unacceptable ACK ({} not in {}...{})", ack_number, ack_min, ack_max);
+                    debug!("unacceptable ACK ({} not in {}...{})", ack_number, ack_min, ack_max);
                     return self.challenge_ack_reply(now, repr);
                 }
             }
@@ -939,14 +944,14 @@ impl TcpSocketState {
                 // https://www.rfc-editor.org/rfc/rfc9293.html#name-segment-acceptability-tests
                 let segment_in_window = match (segment_start == segment_end, window_start == window_end) {
                     (true, _) if segment_end == window_start - 1 => {
-                        net_debug!("received a keep-alive or window probe packet, will send an ACK");
+                        debug!("received a keep-alive or window probe packet, will send an ACK");
                         false
                     }
                     (true, true) => {
                         if window_start == segment_start {
                             true
                         } else {
-                            net_debug!("zero-length segment not inside zero-length window, will send an ACK.");
+                            debug!("zero-length segment not inside zero-length window, will send an ACK.");
                             false
                         }
                     }
@@ -954,12 +959,12 @@ impl TcpSocketState {
                         if window_start <= segment_start && segment_start < window_end {
                             true
                         } else {
-                            net_debug!("zero-length segment not inside window, will send an ACK.");
+                            debug!("zero-length segment not inside window, will send an ACK.");
                             false
                         }
                     }
                     (false, true) => {
-                        net_debug!("non-zero-length segment with zero receive window, will only send an ACK");
+                        debug!("non-zero-length segment with zero receive window, will only send an ACK");
                         false
                     }
                     (false, false) => {
@@ -968,12 +973,9 @@ impl TcpSocketState {
                         {
                             true
                         } else {
-                            net_debug!(
+                            debug!(
                                 "segment not in receive window ({}..{} not intersecting {}..{}), will send challenge ACK",
-                                segment_start,
-                                segment_end,
-                                window_start,
-                                window_end
+                                segment_start, segment_end, window_start, window_end
                             );
                             false
                         }
@@ -999,7 +1001,7 @@ impl TcpSocketState {
                     // TIME-WAIT timer below is not refreshed. RST senders don't
                     // need a reply to make progress.
                     if repr.control == TcpControl::Rst {
-                        net_debug!("dropping out-of-window RST");
+                        debug!("dropping out-of-window RST");
                         return None;
                     }
 
@@ -1060,7 +1062,7 @@ impl TcpSocketState {
                 // space if all of that data is acknowledged.
                 if sent_fin && self.tx_buffer.len() + 1 == ack_len {
                     ack_len -= 1;
-                    tcp_trace!("received ACK of FIN");
+                    trace!("received ACK of FIN");
                     ack_of_fin = true;
                 }
 
@@ -1075,10 +1077,9 @@ impl TcpSocketState {
         // If a FIN is received at the end of the current segment, but
         // we have a hole in the assembler before the current segment, disregard this FIN.
         if control == TcpControl::Fin && window_start < segment_start {
-            tcp_trace!(
+            trace!(
                 "ignoring FIN because we don't have full data yet. window_start={} segment_start={}",
-                window_start,
-                segment_start
+                window_start, segment_start
             );
             control = TcpControl::None;
         }
@@ -1087,7 +1088,7 @@ impl TcpSocketState {
         match (self.state, control) {
             // RSTs close the socket.
             (_, TcpControl::Rst) => {
-                tcp_trace!("received RST");
+                trace!("received RST");
                 self.set_state(State::Closed);
                 self.tuple = None;
                 return None;
@@ -1111,9 +1112,9 @@ impl TcpSocketState {
             // SYN packets in the SYN-SENT state change it to SYN-RECEIVED.
             (State::SynSent, TcpControl::Syn) => {
                 if repr.ack_number.is_some() {
-                    tcp_trace!("received SYN|ACK");
+                    trace!("received SYN|ACK");
                 } else {
-                    tcp_trace!("received SYN");
+                    trace!("received SYN");
                 }
                 if let Some(max_seg_size) = repr.max_seg_size {
                     // Treat a zero MSS as if the option were absent, like Linux does.
@@ -1209,7 +1210,7 @@ impl TcpSocketState {
             }
 
             _ => {
-                net_debug!("unexpected packet {}", repr);
+                debug!("unexpected packet {}", repr);
                 return None;
             }
         }
@@ -1234,7 +1235,7 @@ impl TcpSocketState {
         if ack_len > 0 {
             // Dequeue acknowledged octets.
             debug_assert!(self.tx_buffer.len() >= ack_len);
-            tcp_trace!(
+            trace!(
                 "tx buffer: dequeueing {} octets (now {})",
                 ack_len,
                 self.tx_buffer.len() - ack_len
@@ -1259,7 +1260,7 @@ impl TcpSocketState {
                     // Increment duplicate ACK count
                     self.local_rx_dup_acks = self.local_rx_dup_acks.saturating_add(1);
 
-                    net_debug!(
+                    debug!(
                         "received duplicate ACK for seq {} (duplicate nr {}{})",
                         ack_number,
                         self.local_rx_dup_acks,
@@ -1268,7 +1269,7 @@ impl TcpSocketState {
 
                     if self.local_rx_dup_acks == 3 {
                         self.timer.set_for_fast_retransmit();
-                        net_debug!("started fast retransmit");
+                        debug!("started fast retransmit");
                     }
 
                     // Notify of duplicate ACK
@@ -1283,7 +1284,7 @@ impl TcpSocketState {
                 _ => {
                     if self.local_rx_dup_acks > 0 {
                         self.local_rx_dup_acks = 0;
-                        net_debug!("reset duplicate ACK count");
+                        debug!("reset duplicate ACK count");
                     }
                     self.local_rx_last_ack = Some(ack_number);
 
@@ -1337,11 +1338,11 @@ impl TcpSocketState {
         // start/stop the Zero Window Probe timer.
         if self.remote_win_len == 0 && !self.tx_buffer.is_empty() && (self.timer.is_idle() || ack_len > 0) {
             let delay = self.rtte.retransmission_timeout();
-            tcp_trace!("starting zero-window-probe timer for t+{}", delay);
+            trace!("starting zero-window-probe timer for t+{}", delay);
             self.timer.set_for_zero_window_probe(now, delay);
         }
         if self.remote_win_len != 0 && self.timer.is_zero_window_probe() {
-            tcp_trace!("stopping zero-window-probe timer");
+            trace!("stopping zero-window-probe timer");
             self.timer.set_for_idle(now, self.keep_alive);
         }
 
@@ -1354,26 +1355,24 @@ impl TcpSocketState {
 
         // Try adding payload octets to the assembler.
         let Ok(contig_len) = self.assembler.add_then_remove_front(payload_offset, payload_len) else {
-            net_debug!(
+            debug!(
                 "assembler: too many holes to add {} octets at offset {}",
-                payload_len,
-                payload_offset
+                payload_len, payload_offset
             );
             return None;
         };
 
         // Place payload octets into the buffer.
-        tcp_trace!(
+        trace!(
             "rx buffer: receiving {} octets at offset {}",
-            payload_len,
-            payload_offset
+            payload_len, payload_offset
         );
         let len_written = self.rx_buffer.write_unallocated(payload_offset, payload);
         debug_assert!(len_written == payload_len);
 
         if contig_len != 0 {
             // Enqueue the contiguous data octets in front of the buffer.
-            tcp_trace!(
+            trace!(
                 "rx buffer: enqueueing {} octets (now {})",
                 contig_len,
                 self.rx_buffer.len() + contig_len
@@ -1383,7 +1382,7 @@ impl TcpSocketState {
 
         if !self.assembler.is_empty() {
             // Print the ranges recorded in the assembler.
-            tcp_trace!("assembler: {}", self.assembler);
+            trace!("assembler: {}", self.assembler);
         }
 
         // Handle delayed acks
@@ -1392,19 +1391,19 @@ impl TcpSocketState {
         {
             self.ack_delay_timer = match self.ack_delay_timer {
                 AckDelayTimer::Idle => {
-                    tcp_trace!("starting delayed ack timer");
+                    trace!("starting delayed ack timer");
                     AckDelayTimer::Waiting(now + ack_delay)
                 }
                 AckDelayTimer::Waiting(_) if self.immediate_ack_to_transmit() => {
-                    tcp_trace!("delayed ack timer already started, forcing expiry");
+                    trace!("delayed ack timer already started, forcing expiry");
                     AckDelayTimer::Immediate
                 }
                 timer @ AckDelayTimer::Waiting(_) => {
-                    tcp_trace!("waiting until delayed ack timer expires");
+                    trace!("waiting until delayed ack timer expires");
                     timer
                 }
                 AckDelayTimer::Immediate => {
-                    tcp_trace!("delayed ack timer already force-expired");
+                    trace!("delayed ack timer already force-expired");
                     AckDelayTimer::Immediate
                 }
             };
@@ -1417,7 +1416,7 @@ impl TcpSocketState {
             // Note that we change the transmitter state here.
             // This is fine because xarxa assumes that it can always transmit zero or one
             // packets for every packet it receives.
-            tcp_trace!("ACKing incoming segment");
+            trace!("ACKing incoming segment");
             Some(self.ack_reply(repr))
         } else {
             None
@@ -1570,7 +1569,7 @@ impl TcpSocketState {
         // We use reset() instead of set_state(Closed) to avoid sending
         // an RST packet with the now-invalid source IP.
         if !cx.has_ip_addr(tuple.local.addr) {
-            net_debug!("source IP address no longer available, closing socket");
+            debug!("source IP address no longer available, closing socket");
             self.reset();
             return Ok(());
         }
@@ -1591,12 +1590,12 @@ impl TcpSocketState {
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
             // If a timeout expires, we should abort the connection.
-            net_debug!("timeout exceeded");
+            debug!("timeout exceeded");
             self.set_state(State::Closed);
         } else if self.timer.should_retransmit(cx.now()) {
             if let Timer::Retransmit { .. } = self.timer {
                 // If a retransmit timer expired, we should resend data starting at the last ACK.
-                net_debug!("retransmitting after rto");
+                debug!("retransmitting after rto");
 
                 // Inform the congestion controller that we're retransmitting and should enter the slow start state
                 let in_flight = self.flight_size();
@@ -1611,7 +1610,7 @@ impl TcpSocketState {
                 self.rtte.on_rto();
             } else {
                 // If a fast rentrasmit timer expired, we should resend only the earliest unAcked segment
-                net_debug!("retransmitting for fast-retransmit");
+                debug!("retransmitting for fast-retransmit");
 
                 // Inform the congestion controller that we're doing a fast retransmit and should enter the fast recovery state
                 let in_flight = self.flight_size();
@@ -1633,24 +1632,24 @@ impl TcpSocketState {
         // Decide whether we're sending a packet.
         if self.seq_to_transmit() {
             // If we have data to transmit and it fits into partner's window, do it.
-            tcp_trace!("outgoing segment will send data or flags");
+            trace!("outgoing segment will send data or flags");
         } else if self.ack_to_transmit() && self.delayed_ack_expired(cx.now()) {
             // If we have data to acknowledge, do it.
-            tcp_trace!("outgoing segment will acknowledge");
+            trace!("outgoing segment will acknowledge");
         } else if self.window_to_update() {
             // If we have window length increase to advertise, do it.
-            tcp_trace!("outgoing segment will update window");
+            trace!("outgoing segment will update window");
         } else if self.state == State::Closed {
             // If we need to abort the connection, do it.
-            tcp_trace!("outgoing segment will abort connection");
+            trace!("outgoing segment will abort connection");
         } else if self.timer.should_keep_alive(cx.now()) {
             // If we need to transmit a keep-alive packet, do it.
-            tcp_trace!("keep-alive timer expired");
+            trace!("keep-alive timer expired");
         } else if self.timer.should_zero_window_probe(cx.now()) {
-            tcp_trace!("sending zero-window probe");
+            trace!("sending zero-window probe");
         } else if self.timer.should_close(cx.now()) {
             // If we have spent enough time in the TIME-WAIT state, close the socket.
-            tcp_trace!("TIME-WAIT timer expired");
+            trace!("TIME-WAIT timer expired");
             self.reset();
             return Ok(());
         } else {
@@ -1805,9 +1804,9 @@ impl TcpSocketState {
 
         // Trace a summary of what will be sent.
         if is_keep_alive {
-            tcp_trace!("sending a keep-alive");
+            trace!("sending a keep-alive");
         } else if !repr.payload.is_empty() {
-            tcp_trace!(
+            trace!(
                 "tx buffer: sending {} octets at offset {}",
                 repr.payload.len(),
                 self.flight_size()
@@ -1823,7 +1822,7 @@ impl TcpSocketState {
                 (TcpControl::None, Some(_)) => "ACK",
                 _ => "<unreachable>",
             };
-            tcp_trace!("sending {}", flags);
+            trace!("sending {}", flags);
         }
 
         if repr.control == TcpControl::Syn {
@@ -1849,10 +1848,10 @@ impl TcpSocketState {
         match self.ack_delay_timer {
             AckDelayTimer::Idle => {}
             AckDelayTimer::Waiting(_) => {
-                tcp_trace!("stop delayed ack timer")
+                trace!("stop delayed ack timer")
             }
             AckDelayTimer::Immediate => {
-                tcp_trace!("stop delayed ack timer (was force-expired)")
+                trace!("stop delayed ack timer (was force-expired)")
             }
         }
         self.ack_delay_timer = AckDelayTimer::Idle;
@@ -2449,14 +2448,14 @@ impl TcpSocket<'_> {
             // send, start the zero window probe timer.
             if s.remote_win_len == 0 && s.timer.is_idle() {
                 let delay = s.rtte.retransmission_timeout();
-                tcp_trace!("starting zero-window-probe timer for t+{}", delay);
+                trace!("starting zero-window-probe timer for t+{}", delay);
 
                 // We don't have access to the current time here, so use Instant::ZERO instead.
                 // this will cause the first ZWP to be sent immediately, but that's okay.
                 s.timer.set_for_zero_window_probe(Instant::ZERO, delay);
             }
 
-            tcp_trace!("tx buffer: enqueueing {} octets (now {})", size, old_length + size);
+            trace!("tx buffer: enqueueing {} octets (now {})", size, old_length + size);
         }
         Ok(result)
     }
@@ -2511,7 +2510,7 @@ impl TcpSocket<'_> {
         let (size, result) = f(&mut s.rx_buffer);
         s.remote_seq_no += size;
         if size > 0 {
-            tcp_trace!("rx buffer: dequeueing {} octets (now {})", size, _old_length - size);
+            trace!("rx buffer: dequeueing {} octets (now {})", size, _old_length - size);
         }
         Ok(result)
     }
@@ -2555,7 +2554,7 @@ impl TcpSocket<'_> {
 
         let buffer = self.inner_mut().rx_buffer.get_allocated(0, size);
         if !buffer.is_empty() {
-            tcp_trace!("rx buffer: peeking at {} octets", buffer.len());
+            trace!("rx buffer: peeking at {} octets", buffer.len());
         }
         Ok(buffer)
     }
@@ -2724,13 +2723,13 @@ mod test {
 
         let src_addr = IpAddress::from(REMOTE_ADDR);
         let dst_addr = IpAddress::from(LOCAL_ADDR);
-        net_trace!("send: {}", repr);
+        trace!("send: {}", repr);
 
         assert!(socket.sockets.get_mut(0).accepts(&src_addr, &dst_addr, repr));
 
         match socket.sockets.get_mut(0).process(timestamp, &src_addr, &dst_addr, repr) {
             Some(repr) => {
-                net_trace!("recv: {}", repr);
+                trace!("recv: {}", repr);
                 Some(repr)
             }
             None => None,
@@ -2751,7 +2750,7 @@ mod test {
                 assert_eq!(src_addr, LOCAL_ADDR.into());
                 assert_eq!(dst_addr, REMOTE_ADDR.into());
 
-                net_trace!("recv: {}", tcp_repr);
+                trace!("recv: {}", tcp_repr);
                 sent += 1;
                 f(Ok(tcp_repr));
                 Ok(())

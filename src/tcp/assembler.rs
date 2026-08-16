@@ -7,6 +7,7 @@ use core::fmt;
 /// Maximum number of contiguous data ranges (and thus holes) tracked by an [`Assembler`].
 pub const ASSEMBLER_MAX_SEGMENT_COUNT: usize = 4;
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TooManyHolesError;
 
@@ -19,6 +20,7 @@ impl fmt::Display for TooManyHolesError {
 impl core::error::Error for TooManyHolesError {}
 
 /// A contiguous chunk of absent data, followed by a contiguous chunk of present data.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Contig {
     hole_size: usize,
@@ -80,6 +82,7 @@ impl Contig {
 /// A buffer (re)assembler.
 ///
 /// Currently, up to a hardcoded limit of 4 or 32 holes can be tracked in the buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub struct Assembler {
     contigs: [Contig; ASSEMBLER_MAX_SEGMENT_COUNT],

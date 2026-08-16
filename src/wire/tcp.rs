@@ -9,6 +9,7 @@ use crate::wire::{IpAddress, IpProtocol};
 ///
 /// A sequence number is a monotonically advancing integer modulo 2<sup>32</sup>.
 /// Sequence numbers do not have a discontiguity when compared pairwise across a signed overflow.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub struct SeqNumber(pub i32);
 
@@ -75,6 +76,7 @@ impl cmp::PartialOrd for SeqNumber {
 }
 
 /// A read/write wrapper around a Transmission Control Protocol packet buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Packet<'a> {
     buffer: &'a mut [u8],
@@ -460,6 +462,7 @@ impl<'a> AsRef<[u8]> for Packet<'a> {
 }
 
 /// A representation of a single TCP option.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TcpOption<'a> {
     EndOfList,
@@ -509,7 +512,7 @@ impl<'a> TcpOption<'a> {
                             // maximum of 4 blocks.  It is expected that SACK will often be used in
                             // conjunction with the Timestamp option used for RTTM [...] thus a
                             // maximum of 3 SACK blocks will be allowed in this case.
-                            net_debug!("sACK with >3 blocks, truncating to 3");
+                            debug!("sACK with >3 blocks, truncating to 3");
                         }
                         let mut sack_ranges: [Option<(u32, u32)>; 3] = [None; 3];
 
@@ -611,6 +614,7 @@ impl<'a> TcpOption<'a> {
 }
 
 /// The possible control flags of a Transmission Control Protocol packet.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Control {
     None,

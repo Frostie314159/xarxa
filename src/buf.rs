@@ -140,6 +140,13 @@ impl fmt::Debug for PacketBuf {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for PacketBuf {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(f, "PacketBuf {{ headroom: {}, len: {} }}", self.headroom(), self.len());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

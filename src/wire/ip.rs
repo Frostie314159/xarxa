@@ -6,6 +6,7 @@ use crate::wire::{Ipv4Address, Ipv4AddressExt, Ipv4Cidr};
 use crate::wire::{Ipv6Address, Ipv6AddressExt, Ipv6Cidr};
 
 /// Internet protocol version.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum Version {
     Ipv4,
@@ -54,6 +55,7 @@ open_enum! {
 }
 
 /// An internetworking address.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum Address {
     /// An IPv4 address.
@@ -165,6 +167,7 @@ impl fmt::Display for Address {
 
 /// A specification of a CIDR block, containing an address and a variable-length
 /// subnet masking prefix length.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub enum Cidr {
     Ipv4(Ipv4Cidr),
@@ -253,6 +256,7 @@ impl fmt::Display for Cidr {
 ///
 /// See also [`ListenEndpoint`], the endpoint of a *bind*, whose address is
 /// optional so that it can match more than one of our addresses.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct Endpoint {
     pub addr: Address,
@@ -324,6 +328,7 @@ impl fmt::Display for Endpoint {
 /// is `None`, and from an (address, port) pair, in which case it is `Some`. So
 /// `(Ipv4Address::UNSPECIFIED, 80)` is the "any IPv4 address" bind, and
 /// `(Ipv6Address::UNSPECIFIED, 80)` the IPv6 one.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
 pub struct ListenEndpoint {
     pub addr: Option<Address>,

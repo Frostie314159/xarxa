@@ -104,6 +104,7 @@ open_enum! {
 }
 
 /// A read/write wrapper around an Internet Control Message Protocol version 4 packet buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Packet<'a> {
     buffer: &'a mut [u8],

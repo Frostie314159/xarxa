@@ -154,3 +154,17 @@ mod test {
         assert_eq!(packet.payload(), &SOURCE_LINK_LAYER_OPT[..]);
     }
 }
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for RouterFlags {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(f, "RouterFlags({=u8:#010b})", self.bits());
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for NeighborFlags {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(f, "NeighborFlags({=u8:#010b})", self.bits());
+    }
+}

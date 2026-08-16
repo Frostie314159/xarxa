@@ -20,6 +20,7 @@ open_enum! {
 }
 
 /// A read/write wrapper around an Address Resolution Protocol packet buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Packet<'a> {
     buffer: &'a mut [u8],

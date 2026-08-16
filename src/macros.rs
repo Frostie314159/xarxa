@@ -1,27 +1,3 @@
-#[cfg(not(test))]
-#[collapse_debuginfo(yes)]
-macro_rules! net_log {
-    (trace, $($arg:expr),*) => { log::trace!($($arg),*) };
-    (debug, $($arg:expr),*) => { log::debug!($($arg),*) };
-}
-
-#[cfg(test)]
-#[collapse_debuginfo(yes)]
-macro_rules! net_log {
-    (trace, $($arg:expr),*) => { println!($($arg),*) };
-    (debug, $($arg:expr),*) => { println!($($arg),*) };
-}
-
-#[collapse_debuginfo(yes)]
-macro_rules! net_trace {
-    ($($arg:expr),*) => (net_log!(trace, $($arg),*));
-}
-
-#[collapse_debuginfo(yes)]
-macro_rules! net_debug {
-    ($($arg:expr),*) => (net_log!(debug, $($arg),*));
-}
-
 macro_rules! open_enum {
     (
         $( #[$enum_attr:meta] )*
@@ -56,6 +32,31 @@ macro_rules! open_enum {
         impl ::core::fmt::Display for $name {
             fn fmt(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
                 ::core::fmt::Debug::fmt(self, f)
+            }
+        }
+
+        #[cfg(feature = "defmt")]
+        impl ::defmt::Format for $name {
+            fn format(&self, f: ::defmt::Formatter) {
+                // The variant names are interned into the ELF (never sent over the
+                // wire) by deriving `Format` on a fieldless mirror enum. `intern!`
+                // itself can't be used here: it's a proc macro that requires a
+                // string literal, and `stringify!($variant)` isn't one yet at the
+                // point it would see it.
+                #[derive(::defmt::Format)]
+                #[allow(non_camel_case_types)]
+                enum Names {
+                    $( $variant, )*
+                }
+
+                let name = match *self {
+                    $( Self::$variant => Names::$variant, )*
+                    Self(other) => {
+                        ::defmt::write!(f, "{:#x}", other);
+                        return;
+                    }
+                };
+                ::defmt::write!(f, "{}", name);
             }
         }
 

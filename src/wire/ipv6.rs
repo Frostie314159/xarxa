@@ -31,6 +31,7 @@ pub const LINK_LOCAL_ALL_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 
 ///
 /// [scope]: https://www.rfc-editor.org/rfc/rfc4291#section-2.7
 #[repr(u8)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MulticastScope {
     /// Interface Local scope
@@ -197,6 +198,7 @@ impl AddressExt for Address {
 
 /// A specification of an IPv6 CIDR block, containing an address and a variable-length
 /// subnet masking prefix length.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct Cidr {
     address: Address,
@@ -223,7 +225,7 @@ impl Cidr {
     /// # Panics
     /// This function panics if the prefix length is larger than 128.
     pub const fn new(address: Address, prefix_len: u8) -> Cidr {
-        assert!(prefix_len <= 128);
+        core::assert!(prefix_len <= 128);
         Cidr { address, prefix_len }
     }
 
@@ -263,6 +265,7 @@ impl fmt::Display for Cidr {
 }
 
 /// A read/write wrapper around an Internet Protocol version 6 packet buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Packet<'a> {
     buffer: &'a mut [u8],

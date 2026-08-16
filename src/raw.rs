@@ -23,10 +23,12 @@ use crate::wire::{
 /// A handle to a raw socket added to a [`Stack`].
 ///
 /// [`Stack`]: crate::Stack
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RawHandle(pub(crate) usize);
 
 /// The mode of a raw socket, set by [`RawSocket::bind`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawMode {
     /// Send and receive whole Ethernet frames on one interface.
@@ -50,6 +52,7 @@ pub enum RawMode {
 }
 
 /// Error returned by [`RawSocket::bind`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum BindError {
     /// The socket is already bound.
@@ -70,6 +73,7 @@ impl fmt::Display for BindError {
 impl core::error::Error for BindError {}
 
 /// Error returned by [`RawSocket::send_slice`] and [`RawSocket::send_with`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SendError {
     /// The socket is not bound, or (IP mode) there is no route to the packet's
@@ -96,6 +100,7 @@ impl fmt::Display for SendError {
 impl core::error::Error for SendError {}
 
 /// Error returned by [`RawSocket::recv`] and the peek methods.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RecvError {
     /// The RX queue is empty.
@@ -348,7 +353,7 @@ impl RawSocket<'_> {
                         return Err(SendError::Malformed);
                     }
                 }
-                net_trace!("raw: sending {} octet frame", buf.len());
+                trace!("raw: sending {} octet frame", buf.len());
                 self.tx.transmit_ethernet_frame(iface, buf);
                 Ok(())
             }
@@ -359,7 +364,7 @@ impl RawSocket<'_> {
                 if version.is_some_and(|v| v != dst_addr.version()) || protocol.is_some_and(|p| p != next_header) {
                     return Err(SendError::Malformed);
                 }
-                net_trace!("raw: sending {} octets to {}", buf.len(), dst_addr);
+                trace!("raw: sending {} octets to {}", buf.len(), dst_addr);
                 if !self.tx.transmit_raw_ip(buf, dst_addr) {
                     return Err(SendError::Unaddressable);
                 }
@@ -401,7 +406,7 @@ impl StackInner {
                 continue;
             }
 
-            net_trace!("raw: receiving {} octet frame (ethertype {})", buf.len(), ethertype);
+            trace!("raw: receiving {} octet frame (ethertype {})", buf.len(), ethertype);
             if stack_wants {
                 socket.rx_enqueue(copy_packet(&buf));
                 return Some(buf);
@@ -443,7 +448,7 @@ impl StackInner {
                 continue;
             }
 
-            net_trace!("raw: receiving {} octets ({} {})", buf.len(), version, protocol);
+            trace!("raw: receiving {} octets ({} {})", buf.len(), version, protocol);
             if stack_wants {
                 socket.rx_enqueue(copy_packet(&buf));
                 return Some(buf);

@@ -11,6 +11,7 @@ const ALPHA_CUBIC: f64 = 3.0 * (1.0 - BETA_CUBIC) / (1.0 + BETA_CUBIC);
 
 const DEFAULT_MSS: usize = 1024;
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct Cubic {
     w_max: usize, // window size prior to loss

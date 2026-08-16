@@ -16,11 +16,13 @@ use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 /// A handle to a TCP listener added to a [`Stack`].
 ///
 /// [`Stack`]: crate::Stack
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TcpListenerHandle(pub(crate) usize);
 
 /// A SYN recorded in a listener's accept queue: the parsed handshake state
 /// needed to create the connection socket at accept time.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 struct PendingSyn {
     tuple: Tuple,
@@ -102,7 +104,7 @@ impl TcpListenerState {
         if let Some(entry) = self.queue.iter_mut().find(|s| s.tuple == tuple) {
             *entry = syn;
         } else {
-            net_trace!("listener:{}: SYN from {}", self.local, tuple.remote);
+            trace!("listener:{}: SYN from {}", self.local, tuple.remote);
             self.queue.push_back(syn);
         }
     }
@@ -122,7 +124,7 @@ impl TcpListenerState {
             .iter()
             .position(|s| s.tuple == tuple && repr.seq_number == s.remote_seq_no)
         {
-            net_trace!("listener: queued SYN {} reset by remote", tuple);
+            trace!("listener: queued SYN {} reset by remote", tuple);
             self.queue.remove(index);
             true
         } else {
@@ -268,7 +270,7 @@ impl TcpListener<'_> {
     pub fn accept(&mut self, rx_capacity: usize, tx_capacity: usize) -> Option<TcpHandle> {
         let state = self.listeners.get_mut(self.index);
         let syn = state.queue.pop_front()?;
-        net_trace!("listener:{}: accepting {}", state.local, syn.tuple);
+        trace!("listener:{}: accepting {}", state.local, syn.tuple);
 
         // The SYN-RECEIVED socket continuing the recorded SYN. This mirrors
         // what the SYN would have set up in a LISTEN-state socket: the SYN|ACK

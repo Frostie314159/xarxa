@@ -24,7 +24,7 @@ macro_rules! check {
         match $e {
             Ok(x) => x,
             Err(_) => {
-                net_trace!("iface: malformed ingress packet");
+                trace!("iface: malformed ingress packet");
                 return Default::default();
             }
         }
@@ -43,6 +43,7 @@ pub struct Config {
 }
 
 /// A handle to an interface added to a [`Stack`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct IfaceHandle(pub(crate) usize);
 
@@ -149,7 +150,7 @@ impl TxContext<'_> {
         hop_limit: u8,
     ) {
         let Some(handle) = self.egress_iface(&dst_addr) else {
-            net_debug!("no route to {}, dropping packet", dst_addr);
+            debug!("no route to {}, dropping packet", dst_addr);
             return;
         };
         let iface = self.ifaces.get_mut(handle.0);
@@ -161,7 +162,7 @@ impl TxContext<'_> {
                 self.inner.transmit_ipv6(iface, buf, src, dst, next_header, hop_limit)
             }
             _ => {
-                net_debug!("cannot transmit, address family mismatch");
+                debug!("cannot transmit, address family mismatch");
             }
         }
     }
@@ -182,7 +183,7 @@ impl TxContext<'_> {
     /// Returns `false` if there is no route to the destination.
     pub(crate) fn transmit_raw_ip(&mut self, buf: PacketBuf, dst_addr: IpAddress) -> bool {
         let Some(handle) = self.egress_iface(&dst_addr) else {
-            net_debug!("no route to {}, dropping packet", dst_addr);
+            debug!("no route to {}, dropping packet", dst_addr);
             return false;
         };
         let iface = self.ifaces.get_mut(handle.0);
@@ -556,18 +557,18 @@ impl StackInner {
 
         // Only process REQUEST and RESPONSE.
         if !matches!(operation, ArpOperation::Request | ArpOperation::Reply) {
-            net_debug!("arp: unknown operation code");
+            debug!("arp: unknown operation code");
             return;
         }
 
         // Discard packets with non-unicast source addresses.
         if !source_protocol_addr.x_is_unicast() || !source_hardware_addr.is_unicast() {
-            net_debug!("arp: non-unicast source address");
+            debug!("arp: non-unicast source address");
             return;
         }
 
         if !iface.in_same_network(&IpAddress::Ipv4(source_protocol_addr)) {
-            net_debug!("arp: source IP address not in same network as us");
+            debug!("arp: source IP address not in same network as us");
             return;
         }
 
@@ -610,11 +611,11 @@ impl StackInner {
             return;
         }
         if !ipv4_packet.verify_checksum() {
-            net_trace!("ipv4: header checksum incorrect");
+            trace!("ipv4: header checksum incorrect");
             return;
         }
         if ipv4_packet.more_frags() || ipv4_packet.frag_offset() != 0 {
-            net_trace!("ipv4: fragmented packets not supported yet");
+            trace!("ipv4: fragmented packets not supported yet");
             return;
         }
 
@@ -626,13 +627,13 @@ impl StackInner {
 
         if !iface.is_unicast_v4(src_addr) && !src_addr.is_unspecified() {
             // Discard packets with non-unicast source addresses but allow unspecified
-            net_debug!("non-unicast or unspecified source address");
+            debug!("non-unicast or unspecified source address");
             return;
         }
 
         if !iface.has_ip_addr(dst_addr) && !iface.is_broadcast_v4(dst_addr) {
             // Ignore IP packets not directed at us, or broadcast.
-            net_trace!("Rejecting IPv4 packet; not for us");
+            trace!("Rejecting IPv4 packet; not for us");
             return;
         }
 
@@ -676,7 +677,7 @@ impl StackInner {
                 buf,
             ),
             _ => {
-                net_trace!("ipv4: protocol {} not supported", next_header);
+                trace!("ipv4: protocol {} not supported", next_header);
             }
         }
     }
@@ -708,15 +709,15 @@ impl StackInner {
         }
 
         let Ok(tcp_packet) = TcpPacket::new_checked(&mut buf) else {
-            net_trace!("tcp: malformed packet");
+            trace!("tcp: malformed packet");
             return;
         };
         if !tcp_packet.verify_checksum(&src_addr, &dst_addr) {
-            net_trace!("tcp: checksum incorrect");
+            trace!("tcp: checksum incorrect");
             return;
         }
         let Ok(tcp_repr) = TcpRepr::parse(&tcp_packet, &src_addr, &dst_addr) else {
-            net_trace!("tcp: malformed packet");
+            trace!("tcp: malformed packet");
             return;
         };
 
@@ -772,7 +773,7 @@ impl StackInner {
     fn process_icmpv4(&mut self, iface: &mut Iface, src_addr: Ipv4Address, dst_addr: Ipv4Address, mut buf: PacketBuf) {
         let icmp_packet = check!(Icmpv4Packet::new_checked(&mut buf));
         if !icmp_packet.verify_checksum() {
-            net_trace!("icmpv4: checksum incorrect");
+            trace!("icmpv4: checksum incorrect");
             return;
         }
 
@@ -839,12 +840,12 @@ impl StackInner {
 
         if !src_addr.x_is_unicast() {
             // Discard packets with non-unicast source addresses.
-            net_debug!("non-unicast source address");
+            debug!("non-unicast source address");
             return;
         }
 
         if !iface.has_ip_addr(dst_addr) && !iface.has_multicast_group(dst_addr) && !dst_addr.is_loopback() {
-            net_trace!("Rejecting IPv6 packet; not for us");
+            trace!("Rejecting IPv6 packet; not for us");
             return;
         }
 
@@ -888,7 +889,7 @@ impl StackInner {
                 buf,
             ),
             _ => {
-                net_trace!("ipv6: protocol {} not supported", next_header);
+                trace!("ipv6: protocol {} not supported", next_header);
             }
         }
     }
@@ -904,7 +905,7 @@ impl StackInner {
     ) {
         let mut icmp_packet = check!(Icmpv6Packet::new_checked(&mut buf));
         if !icmp_packet.verify_checksum(&src_addr, &dst_addr) {
-            net_trace!("icmpv6: checksum incorrect");
+            trace!("icmpv6: checksum incorrect");
             return;
         }
 
@@ -1026,11 +1027,11 @@ impl StackInner {
         for event in self.neighbor_cache.poll_retransmit(iface.handle, self.now) {
             match event {
                 ProbeEvent::Retransmit(addr) => {
-                    net_debug!("neighbor {} still unresolved, retransmitting solicitation", addr);
+                    debug!("neighbor {} still unresolved, retransmitting solicitation", addr);
                     self.solicit_neighbor(iface, addr);
                 }
                 ProbeEvent::Failed(addr) => {
-                    net_debug!("neighbor {} resolution failed, dropping queued packets", addr);
+                    debug!("neighbor {} resolution failed, dropping queued packets", addr);
                     // Dropping the queued packets is all there is to do.
                     // TODO: RFC 4861 says to send an ICMP destination unreachable
                     // error for each of them.
@@ -1055,7 +1056,7 @@ impl StackInner {
         self.neighbor_cache.fill(key, hardware_addr, self.now);
 
         for packet in self.pending.take_matching(&key) {
-            net_trace!("neighbor: {} resolved, flushing queued packet", addr);
+            trace!("neighbor: {} resolved, flushing queued packet", addr);
             let ethertype = match packet.key.1 {
                 IpAddress::Ipv4(_) => EthernetProtocol::Ipv4,
                 IpAddress::Ipv6(_) => EthernetProtocol::Ipv6,
@@ -1099,7 +1100,7 @@ impl StackInner {
         }
 
         // Start resolving: create the INCOMPLETE entry and send the first solicitation.
-        net_debug!("address {} not in neighbor cache, sending solicitation", next_hop);
+        debug!("address {} not in neighbor cache, sending solicitation", next_hop);
         self.neighbor_cache.start_resolution((iface.handle, next_hop), self.now);
         self.solicit_neighbor(iface, next_hop);
 
@@ -1108,7 +1109,7 @@ impl StackInner {
 
     fn transmit_arp_request(&mut self, iface: &mut Iface, target_addr: Ipv4Address) {
         let Some(source_protocol_addr) = iface.get_source_address_ipv4(&target_addr) else {
-            net_debug!("arp: no source address for request");
+            debug!("arp: no source address for request");
             return;
         };
 
@@ -1232,11 +1233,11 @@ impl StackInner {
             Medium::Ethernet => match self.lookup_hardware_addr(iface, &dst_addr) {
                 NeighborLookup::Found(hardware_addr) => self.transmit_ethernet(iface, hardware_addr, buf, ethertype),
                 NeighborLookup::Pending { next_hop } => {
-                    net_debug!("neighbor {} pending, queing packet", next_hop);
+                    debug!("neighbor {} pending, queing packet", next_hop);
                     self.pending.push((iface.handle, next_hop), buf, self.now);
                 }
                 NeighborLookup::NoRoute => {
-                    net_debug!("no route to {}, dropping packet", dst_addr);
+                    debug!("no route to {}, dropping packet", dst_addr);
                 }
             },
         }
@@ -1259,7 +1260,7 @@ impl StackInner {
 
     fn transmit_raw(&mut self, iface: &mut Iface, buf: PacketBuf) {
         if iface.dev.transmit(buf).is_err() {
-            net_debug!("iface: cannot transmit, dropping packet");
+            debug!("iface: cannot transmit, dropping packet");
         }
     }
 
@@ -1512,7 +1513,7 @@ fn ndisc_lladdr_option(
         let opt = NdiscOption::new_checked(&mut options[offset..])?;
         let opt_len = opt.data_len() as usize * 8;
         if opt_len == 0 {
-            net_trace!("ndisc: option with zero length");
+            trace!("ndisc: option with zero length");
             return Err(crate::wire::Error);
         }
         if opt.option_type() == option_type {

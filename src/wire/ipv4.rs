@@ -70,6 +70,7 @@ impl AddressExt for Address {
 
 /// A specification of an IPv4 CIDR block, containing an address and a variable-length
 /// subnet masking prefix length.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct Cidr {
     address: Address,
@@ -82,7 +83,7 @@ impl Cidr {
     /// # Panics
     /// This function panics if the prefix length is larger than 32.
     pub const fn new(address: Address, prefix_len: u8) -> Cidr {
-        assert!(prefix_len <= 32);
+        core::assert!(prefix_len <= 32);
         Cidr { address, prefix_len }
     }
 
@@ -160,6 +161,7 @@ impl fmt::Display for Cidr {
 }
 
 /// A read/write wrapper around an Internet Protocol version 4 packet buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Packet<'a> {
     buffer: &'a mut [u8],

@@ -30,10 +30,13 @@ use crate::wire::{
 /// A handle to a UDP socket added to a [`Stack`].
 ///
 /// [`Stack`]: crate::Stack
+/// [`Stack::remove_udp_socket`]: crate::Stack::remove_udp_socket
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UdpHandle(pub(crate) usize);
 
 /// Metadata for a sent or received UDP datagram.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct UdpMetadata {
     /// The remote endpoint: the sender of an incoming datagram, or the destination of
@@ -62,6 +65,7 @@ impl fmt::Display for UdpMetadata {
 }
 
 /// Error returned by [`UdpSocket::bind`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum BindError {
     /// The socket is already bound.
@@ -90,6 +94,7 @@ impl fmt::Display for BindError {
 impl core::error::Error for BindError {}
 
 /// Error returned by [`UdpSocket::send_slice`] and [`UdpSocket::send_with`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SendError {
     /// The socket is not bound, the destination address or port is unspecified, or
@@ -111,6 +116,7 @@ impl fmt::Display for SendError {
 impl core::error::Error for SendError {}
 
 /// Error returned by [`UdpSocket::recv`] and the peek methods.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RecvError {
     /// The RX queue is empty.
@@ -204,6 +210,11 @@ impl UdpSocketState {
 }
 
 /// A received UDP datagram.
+///
+/// Returned by [`UdpSocket::recv`]. Derefs to the UDP payload.
+///
+/// This is zero-copy, it contains the owned buffer the packet arrived in. Dropping it frees the buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct RecvPacket {
     buf: PacketBuf,
@@ -611,7 +622,7 @@ impl UdpSocket<'_> {
             udp.fill_checksum(&src_addr, &meta.endpoint.addr);
         }
 
-        net_trace!("udp:{}:{}: sending {} octets", local, meta.endpoint, size);
+        trace!("udp:{}:{}: sending {} octets", local, meta.endpoint, size);
 
         self.tx
             .transmit_ip(buf, src_addr, meta.endpoint.addr, IpProtocol::Udp, hop_limit);
@@ -636,11 +647,11 @@ impl StackInner {
         mut buf: PacketBuf,
     ) {
         let Ok(udp_packet) = UdpPacket::new_checked(&mut buf) else {
-            net_trace!("udp: malformed packet");
+            trace!("udp: malformed packet");
             return;
         };
         if !udp_packet.verify_checksum(&src_addr, &dst_addr) {
-            net_trace!("udp: checksum incorrect");
+            trace!("udp: checksum incorrect");
             return;
         }
 
@@ -677,18 +688,15 @@ impl StackInner {
 
         if let Some((index, _)) = best {
             let socket = sockets.get_mut(index);
-            net_trace!(
+            trace!(
                 "udp:{}: receiving {} octets from {}:{}",
-                socket.local,
-                payload_len,
-                src_addr,
-                src_port
+                socket.local, payload_len, src_addr, src_port
             );
             socket.rx_enqueue(buf);
             return;
         }
 
-        net_trace!("udp: no socket bound to port {}, dropping", dst_port);
+        trace!("udp: no socket bound to port {}, dropping", dst_port);
         // TODO: send an ICMP port unreachable error.
     }
 }

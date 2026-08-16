@@ -24,6 +24,7 @@ const IPV4_DEFAULT: IpCidr = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(0, 0, 0
 const IPV6_DEFAULT: IpCidr = IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 0), 0));
 
 /// A prefix of addresses that should be routed via a router, out of an interface.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 pub struct Route {
     pub cidr: IpCidr,
@@ -289,5 +290,12 @@ mod test {
         routes.purge_iface(IF_0);
         assert_eq!(lookup(&routes, ADDR_1A, 0), None);
         assert_eq!(lookup(&routes, ADDR_2A, 0), Some((ADDR_2A.into(), IF_1)));
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Routes {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(f, "Routes({=[?]})", self.storage.as_slice());
     }
 }

@@ -13,6 +13,7 @@ open_enum! {
 }
 
 /// A six-octet Ethernet II address.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Default)]
 pub struct Address(pub [u8; 6]);
 
@@ -79,6 +80,7 @@ impl fmt::Display for Address {
 }
 
 /// A read/write wrapper around an Ethernet II frame buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct Frame<'a> {
     buffer: &'a mut [u8],

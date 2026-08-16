@@ -96,6 +96,7 @@ pub use self::udp::{HEADER_LEN as UDP_HEADER_LEN, Packet as UdpPacket};
 /// Parsing a packet failed.
 ///
 /// Either it is malformed, or it is not supported by xarxa.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Error;
 
@@ -114,6 +115,7 @@ pub const MAX_HARDWARE_ADDRESS_LEN: usize = 6;
 /// Unparsed hardware address.
 ///
 /// Used to make NDISC parsing agnostic of the hardware medium in use.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct RawHardwareAddress {
     len: u8,

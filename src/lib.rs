@@ -2,6 +2,10 @@
 
 extern crate alloc;
 
+// Must go first so other modules see its macros.
+#[macro_use]
+mod fmt;
+
 #[macro_use]
 mod macros;
 

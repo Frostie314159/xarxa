@@ -30,6 +30,7 @@ const IFF_TAP: libc::c_int = 0x0002;
 const IFF_NO_PI: libc::c_int = 0x1000;
 
 #[repr(C)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 struct ifreq {
     ifr_name: [libc::c_char; libc::IF_NAMESIZE],
@@ -59,6 +60,7 @@ fn ifreq_ioctl(lower: libc::c_int, ifreq: &mut ifreq, cmd: libc::c_ulong) -> io:
 }
 
 /// A virtual TUN (IP) or TAP (Ethernet) interface.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub struct TunTapInterface {
     lower: libc::c_int,
@@ -185,7 +187,7 @@ impl Interface for TunTapInterface {
                 Some(buf)
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => None,
-            Err(err) => panic!("{}", err),
+            Err(err) => core::panic!("{}", err),
         }
     }
 
@@ -193,10 +195,10 @@ impl Interface for TunTapInterface {
         match self.send(&buf) {
             Ok(_) => Ok(()),
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
-                net_debug!("phy: tx failed due to WouldBlock");
+                debug!("phy: tx failed due to WouldBlock");
                 Err(buf)
             }
-            Err(err) => panic!("{}", err),
+            Err(err) => core::panic!("{}", err),
         }
     }
 }

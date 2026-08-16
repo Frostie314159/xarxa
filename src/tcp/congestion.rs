@@ -35,6 +35,7 @@ pub(super) trait Controller {
     fn set_mss(&mut self, mss: usize) {}
 }
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub(super) enum AnyController {
     None(no_control::NoControl),

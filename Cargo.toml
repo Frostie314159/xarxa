@@ -4,14 +4,17 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["std"]
+default = ["std", "log"]
 std = ["dep:libc"]
+defmt = ["dep:defmt"]
+log = ["dep:log"]
 
 [dependencies]
 bitflags = { version = "2", default-features = false }
 byteorder = { version = "1", default-features = false }
 libc = { version = "0.2", optional = true }
-log = "0.4"
+defmt = { version = "1", optional = true, features = ["ip_in_core"] }
+log = { version = "0.4", optional = true }
 
 [dev-dependencies]
 env_logger = "0.11"
@@ -19,15 +22,15 @@ rand = "0.8"
 
 [[example]]
 name = "tuntap"
-required-features = ["std"]
+required-features = ["std", "log"]
 
 [[example]]
 name = "tcp_server"
-required-features = ["std"]
+required-features = ["std", "log"]
 
 [[example]]
 name = "tcp_client"
-required-features = ["std"]
+required-features = ["std", "log"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

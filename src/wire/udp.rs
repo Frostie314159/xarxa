@@ -5,6 +5,7 @@ use crate::wire::ip::checksum;
 use crate::wire::{IpAddress, IpProtocol};
 
 /// A read/write wrapper around an User Datagram Protocol packet buffer.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub struct Packet<'a> {
     buffer: &'a mut [u8],

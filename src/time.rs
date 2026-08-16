@@ -21,6 +21,7 @@ use core::{fmt, ops};
 /// * A value of `0` is inherently arbitrary.
 /// * A value less than `0` indicates a time before the starting
 ///   point.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Instant {
     micros: i64,
@@ -169,6 +170,7 @@ impl ops::Sub<Instant> for Instant {
 }
 
 /// A relative amount of time.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Duration {
     micros: u64,

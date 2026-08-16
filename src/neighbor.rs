@@ -31,6 +31,7 @@ pub(crate) const MAX_MULTICAST_SOLICIT: u8 = 3;
 pub(crate) const RETRANS_TIMER: Duration = Duration::from_millis(1_000);
 
 /// State of a neighbor cache entry, in the style of RFC 4861 § 7.3.2.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
 enum State {
     /// Address resolution is in progress: solicitations are being sent, no answer
@@ -51,6 +52,7 @@ enum State {
 }
 
 /// An answer to a neighbor cache lookup.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Answer {
     /// The neighbor address is in the cache and not expired.
@@ -72,6 +74,7 @@ impl Answer {
 }
 
 /// A resolution timer event, returned by [Cache::poll_retransmit].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeEvent {
     /// Another solicitation should be sent to the neighbor.
@@ -200,14 +203,14 @@ impl Cache {
                 hardware_addr: old_hardware_addr,
                 ..
             }) if old_hardware_addr != hardware_addr => {
-                net_trace!("replaced {} => {} (was {})", key.1, hardware_addr, old_hardware_addr);
+                trace!("replaced {} => {} (was {})", key.1, hardware_addr, old_hardware_addr);
             }
             Some(State::Reachable { .. }) => {}
             Some(State::Incomplete { .. }) => {
-                net_trace!("filled {} => {} (was incomplete)", key.1, hardware_addr);
+                trace!("filled {} => {} (was incomplete)", key.1, hardware_addr);
             }
             None => {
-                net_trace!("filled {} => {} (was empty)", key.1, hardware_addr);
+                trace!("filled {} => {} (was empty)", key.1, hardware_addr);
             }
         }
 
@@ -252,7 +255,7 @@ impl Cache {
                 .0;
 
             let (_old_key, _) = self.storage[index];
-            net_trace!("neighbor cache full, evicted {}", _old_key.1);
+            trace!("neighbor cache full, evicted {}", _old_key.1);
             self.storage[index] = (key, state);
         }
     }
@@ -306,7 +309,7 @@ impl PendingQueue {
     /// Queue a packet waiting for `key` to resolve.
     pub fn push(&mut self, key: Key, buf: PacketBuf, timestamp: Instant) {
         if self.packets.len() >= PENDING_QUEUE_COUNT {
-            net_trace!("neighbor: pending queue full, dropping oldest packet");
+            trace!("neighbor: pending queue full, dropping oldest packet");
             self.packets.remove(0);
         }
         self.packets.push(PendingPacket {
@@ -325,7 +328,7 @@ impl PendingQueue {
     pub fn purge_expired(&mut self, timestamp: Instant) {
         self.packets.retain(|packet| {
             if timestamp >= packet.expires_at {
-                net_trace!(
+                trace!(
                     "neighbor: dropping queued packet for {}, resolution timed out",
                     packet.key.1
                 );
@@ -581,5 +584,12 @@ mod test {
         queue.purge_iface(IF_0);
         assert!(queue.take_matching(&(IF_0, MOCK_IP_ADDR_1.into())).is_empty());
         assert_eq!(queue.take_matching(&(IF_1, MOCK_IP_ADDR_1.into())).len(), 1);
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Cache {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(f, "Cache({=[?]})", self.storage.as_slice());
     }
 }

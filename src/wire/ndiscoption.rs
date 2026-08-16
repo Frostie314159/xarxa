@@ -33,6 +33,7 @@ bitflags! {
 /// A read/write wrapper around an [NDISC Option].
 ///
 /// [NDISC Option]: https://tools.ietf.org/html/rfc4861#section-4.6
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq)]
 pub struct NdiscOption<'a> {
     buffer: &'a mut [u8],
@@ -339,5 +340,12 @@ mod test {
         assert_eq!(NdiscOption::new_checked(&mut [0x00, 0x00]), Err(Error));
         let mut bytes = [0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         assert_eq!(NdiscOption::new_checked(&mut bytes), Err(Error));
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for PrefixInfoFlags {
+    fn format(&self, f: defmt::Formatter<'_>) {
+        defmt::write!(f, "PrefixInfoFlags({=u8:#010b})", self.bits());
     }
 }

@@ -8,6 +8,7 @@
 // PRNG unused.
 #![cfg_attr(test, allow(dead_code))]
 
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub(crate) struct Rand {
     state: u64,

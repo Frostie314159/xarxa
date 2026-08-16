@@ -20,6 +20,7 @@ mod tuntap;
 pub use self::tuntap::TunTapInterface;
 
 /// Type of medium of an interface.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum Medium {
     /// Ethernet medium. Devices of this type send and receive Ethernet frames.
@@ -31,6 +32,7 @@ pub enum Medium {
 }
 
 /// A description of iface capabilities.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct IfaceCapabilities {
