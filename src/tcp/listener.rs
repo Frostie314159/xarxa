@@ -11,6 +11,8 @@ use crate::rand::Rand;
 use crate::slab::Slab;
 use crate::stack::addr_score;
 use crate::tcp::TcpSeqNumber;
+#[cfg(feature = "async")]
+use crate::waker::WakerRegistration;
 use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
 /// A handle to a TCP listener added to a [`Stack`].
@@ -49,6 +51,8 @@ pub(crate) struct TcpListenerState {
     local: IpListenEndpoint,
     /// The accept queue: SYNs waiting to be accepted, deduplicated by 4-tuple.
     queue: VecDeque<PendingSyn>,
+    #[cfg(feature = "async")]
+    accept_waker: WakerRegistration,
 }
 
 impl TcpListenerState {
@@ -56,6 +60,8 @@ impl TcpListenerState {
         TcpListenerState {
             local: IpListenEndpoint::UNSPECIFIED,
             queue: VecDeque::new(),
+            #[cfg(feature = "async")]
+            accept_waker: WakerRegistration::new(),
         }
     }
 
@@ -106,6 +112,9 @@ impl TcpListenerState {
         } else {
             trace!("listener:{}: SYN from {}", self.local, tuple.remote);
             self.queue.push_back(syn);
+            // There's a connection attempt to accept, notify the waiting task if any.
+            #[cfg(feature = "async")]
+            self.accept_waker.wake();
         }
     }
 
@@ -241,6 +250,9 @@ impl TcpListener<'_> {
         let state = self.inner_mut();
         state.local = IpListenEndpoint::UNSPECIFIED;
         state.queue.clear();
+        // Wake the task waiting, so it can notice the listener is closed.
+        #[cfg(feature = "async")]
+        state.accept_waker.wake();
     }
 
     /// Whether the listener is listening.
@@ -254,6 +266,24 @@ impl TcpListener<'_> {
     #[inline]
     pub fn local_endpoint(&self) -> IpListenEndpoint {
         self.inner().local
+    }
+
+    /// Register a waker for [`accept`](Self::accept).
+    ///
+    /// The waker is woken on state changes that might affect the return value of
+    /// `accept` calls, such as a SYN being queued, or the listener closing.
+    ///
+    /// Notes:
+    ///
+    /// - Only one waker can be registered at a time. If another waker was previously
+    ///   registered, it is overwritten and will no longer be woken.
+    /// - The Waker is woken only once. Once woken, you must register it again before
+    ///   it may be woken again.
+    /// - "Spurious wakes" are allowed: a wake doesn't guarantee the result of
+    ///   `accept` has changed.
+    #[cfg(feature = "async")]
+    pub fn register_accept_waker(&mut self, waker: &core::task::Waker) {
+        self.inner_mut().accept_waker.register(waker)
     }
 
     /// Whether a connection attempt is waiting to be [`accept`](Self::accept)ed.

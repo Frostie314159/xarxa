@@ -12,6 +12,8 @@ use crate::rand::Rand;
 use crate::slab::Slab;
 use crate::stack::{TxContext, alloc_ephemeral_port};
 use crate::time::{Duration, Instant};
+#[cfg(feature = "async")]
+use crate::waker::WakerRegistration;
 use crate::wire::{
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
     TCP_HEADER_LEN, TcpControl, TcpPacket, TcpSeqNumber,
@@ -555,6 +557,11 @@ pub(crate) struct TcpSocketState {
 
     /// 0 if not seen or timestamp not enabled
     last_remote_tsval: u32,
+
+    #[cfg(feature = "async")]
+    rx_waker: WakerRegistration,
+    #[cfg(feature = "async")]
+    tx_waker: WakerRegistration,
 }
 
 const DEFAULT_MSS: usize = 536;
@@ -618,6 +625,10 @@ impl TcpSocketState {
             tsval_generator: None,
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
+            #[cfg(feature = "async")]
+            rx_waker: WakerRegistration::new(),
+            #[cfg(feature = "async")]
+            tx_waker: WakerRegistration::new(),
         }
     }
 
@@ -671,6 +682,12 @@ impl TcpSocketState {
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
+
+        #[cfg(feature = "async")]
+        {
+            self.rx_waker.wake();
+            self.tx_waker.wake();
+        }
     }
 
     #[cfg(test)]
@@ -701,6 +718,15 @@ impl TcpSocketState {
         }
 
         self.state = state;
+
+        #[cfg(feature = "async")]
+        {
+            // Wake all tasks waiting. Even if we haven't received/sent data, this
+            // is needed because return values of functions may change depending on the state.
+            // For example, a pending read has to fail with an error if the socket is closed.
+            self.rx_waker.wake();
+            self.tx_waker.wake();
+        }
     }
 
     fn reply(repr: &TcpRepr) -> TcpRepr<'static> {
@@ -1241,6 +1267,10 @@ impl TcpSocketState {
                 self.tx_buffer.len() - ack_len
             );
             self.tx_buffer.dequeue_allocated(ack_len);
+
+            // There's new room available in tx_buffer, wake the waiting task if any.
+            #[cfg(feature = "async")]
+            self.tx_waker.wake();
         }
 
         if let Some(ack_number) = repr.ack_number {
@@ -1378,6 +1408,10 @@ impl TcpSocketState {
                 self.rx_buffer.len() + contig_len
             );
             self.rx_buffer.enqueue_unallocated(contig_len);
+
+            // There's new data in rx_buffer, notify waiting task if any.
+            #[cfg(feature = "async")]
+            self.rx_waker.wake();
         }
 
         if !self.assembler.is_empty() {
@@ -1893,6 +1927,9 @@ impl TcpSocketState {
         if self.state == State::Closed {
             // When aborting a connection, forget about it after sending a single RST packet.
             self.tuple = None;
+            // Wake tx now so that async users can wait for the RST to be sent.
+            #[cfg(feature = "async")]
+            self.tx_waker.wake();
         }
 
         Ok(())
@@ -2009,6 +2046,43 @@ impl TcpSocket<'_> {
     #[inline]
     fn inner_mut(&mut self) -> &mut TcpSocketState {
         self.sockets.get_mut(self.index)
+    }
+
+    /// Register a waker for receive operations.
+    ///
+    /// The waker is woken on state changes that might affect the return value of
+    /// `recv` calls, such as receiving data, or the socket closing.
+    ///
+    /// Notes:
+    ///
+    /// - Only one waker can be registered at a time. If another waker was previously
+    ///   registered, it is overwritten and will no longer be woken.
+    /// - The Waker is woken only once. Once woken, you must register it again before
+    ///   incoming data may wake it again.
+    /// - "Spurious wakes" are allowed: a wake doesn't guarantee the result of `recv`
+    ///   has changed.
+    #[cfg(feature = "async")]
+    pub fn register_recv_waker(&mut self, waker: &core::task::Waker) {
+        self.inner_mut().rx_waker.register(waker)
+    }
+
+    /// Register a waker for send operations.
+    ///
+    /// The waker is woken on state changes that might affect the return value of
+    /// `send` calls, such as space becoming available in the transmit buffer, or
+    /// the socket closing.
+    ///
+    /// Notes:
+    ///
+    /// - Only one waker can be registered at a time. If another waker was previously
+    ///   registered, it is overwritten and will no longer be woken.
+    /// - The Waker is woken only once. Once woken, you must register it again before
+    ///   it may be woken again.
+    /// - "Spurious wakes" are allowed: a wake doesn't guarantee the result of `send`
+    ///   has changed.
+    #[cfg(feature = "async")]
+    pub fn register_send_waker(&mut self, waker: &core::task::Waker) {
+        self.inner_mut().tx_waker.register(waker)
     }
 
     /// Enable or disable TCP Timestamp.

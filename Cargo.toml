@@ -6,6 +6,8 @@ edition = "2024"
 [features]
 default = ["std", "log"]
 std = ["dep:libc"]
+## Waker registration on sockets, for building `Future`s on top of the stack.
+async = []
 defmt = ["dep:defmt"]
 log = ["dep:log"]
 

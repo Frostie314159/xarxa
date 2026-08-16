@@ -20,6 +20,8 @@ pub mod stack;
 pub mod tcp;
 pub mod time;
 pub mod udp;
+#[cfg(feature = "async")]
+mod waker;
 pub mod wire;
 
 pub use buf::{PACKET_BUF_SIZE, PacketBuf};

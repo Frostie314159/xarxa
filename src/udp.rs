@@ -22,6 +22,8 @@ use core::ops::{Deref, Range};
 use crate::buf::PacketBuf;
 use crate::slab::Slab;
 use crate::stack::{Iface, StackInner, TxContext, addr_score, alloc_ephemeral_port};
+#[cfg(feature = "async")]
+use crate::waker::WakerRegistration;
 use crate::wire::{
     ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
     IpVersion, Ipv4Packet, Ipv6Packet, UDP_HEADER_LEN, UdpPacket,
@@ -150,6 +152,10 @@ pub(crate) struct UdpSocketState {
     remote: IpListenEndpoint,
     rx_queue: VecDeque<PacketBuf>,
     hop_limit: Option<u8>,
+    #[cfg(feature = "async")]
+    rx_waker: WakerRegistration,
+    #[cfg(feature = "async")]
+    tx_waker: WakerRegistration,
 }
 
 impl UdpSocketState {
@@ -160,6 +166,10 @@ impl UdpSocketState {
             remote: IpListenEndpoint::UNSPECIFIED,
             rx_queue: VecDeque::new(),
             hop_limit: None,
+            #[cfg(feature = "async")]
+            rx_waker: WakerRegistration::new(),
+            #[cfg(feature = "async")]
+            tx_waker: WakerRegistration::new(),
         }
     }
 
@@ -167,6 +177,8 @@ impl UdpSocketState {
     /// included), truncated to the UDP length.
     pub(crate) fn rx_enqueue(&mut self, buf: PacketBuf) {
         self.rx_queue.push_back(buf);
+        #[cfg(feature = "async")]
+        self.rx_waker.wake();
     }
 
     /// Score this socket against an ingress datagram.
@@ -431,6 +443,12 @@ impl UdpSocket<'_> {
         let state = self.inner_mut();
         state.local = local;
         state.remote = remote;
+        // Sends are possible now, and receives can start failing differently.
+        #[cfg(feature = "async")]
+        {
+            state.rx_waker.wake();
+            state.tx_waker.wake();
+        }
         Ok(())
     }
 
@@ -440,12 +458,54 @@ impl UdpSocket<'_> {
         state.local = IpListenEndpoint::UNSPECIFIED;
         state.remote = IpListenEndpoint::UNSPECIFIED;
         state.rx_queue.clear();
+        // Wake the tasks waiting, so they can notice the socket is closed.
+        #[cfg(feature = "async")]
+        {
+            state.rx_waker.wake();
+            state.tx_waker.wake();
+        }
     }
 
     /// Check whether the socket is open (bound to a port).
     #[inline]
     pub fn is_open(&self) -> bool {
         self.inner().local.port != 0
+    }
+
+    /// Register a waker for receive operations.
+    ///
+    /// The waker is woken on state changes that might affect the return value of
+    /// `recv` calls, such as receiving data, or the socket closing.
+    ///
+    /// Notes:
+    ///
+    /// - Only one waker can be registered at a time. If another waker was previously
+    ///   registered, it is overwritten and will no longer be woken.
+    /// - The Waker is woken only once. Once woken, you must register it again before
+    ///   incoming data may wake it again.
+    /// - "Spurious wakes" are allowed: a wake doesn't guarantee the result of `recv`
+    ///   has changed.
+    #[cfg(feature = "async")]
+    pub fn register_recv_waker(&mut self, waker: &core::task::Waker) {
+        self.inner_mut().rx_waker.register(waker)
+    }
+
+    /// Register a waker for send operations.
+    ///
+    /// The waker is woken on state changes that might affect the return value of
+    /// `send` calls, such as the socket being bound or closed.
+    ///
+    /// Notes:
+    ///
+    /// - Only one waker can be registered at a time. If another waker was previously
+    ///   registered, it is overwritten and will no longer be woken.
+    /// - The Waker is woken only once. Once woken, you must register it again before
+    ///   it may be woken again.
+    /// - "Spurious wakes" are allowed: a wake doesn't guarantee the result of `send`
+    ///   has changed.
+    #[cfg(feature = "async")]
+    pub fn register_send_waker(&mut self, waker: &core::task::Waker) {
+        self.inner_mut().tx_waker.register(waker)
     }
 
     /// Check whether the RX queue is not empty.
