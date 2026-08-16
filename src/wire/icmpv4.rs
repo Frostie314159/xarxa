@@ -10,6 +10,8 @@ open_enum! {
         EchoReply      =  0,
         /// Destination unreachable
         DstUnreachable =  3,
+        /// Source quench (deprecated)
+        SourceQuench   =  4,
         /// Message redirect
         Redirect       =  5,
         /// Echo request
@@ -26,6 +28,24 @@ open_enum! {
         Timestamp      = 13,
         /// Timestamp reply
         TimestampReply = 14
+    }
+}
+
+impl Message {
+    /// Whether this message type is an error message.
+    ///
+    /// RFC 1122 §3.2.2 lists the error message types. Everything else is a query or
+    /// informational message. Error messages must never be sent in response to
+    /// another error message.
+    pub fn is_error(&self) -> bool {
+        matches!(
+            *self,
+            Message::DstUnreachable
+                | Message::SourceQuench
+                | Message::Redirect
+                | Message::TimeExceeded
+                | Message::ParamProblem
+        )
     }
 }
 
@@ -251,6 +271,13 @@ impl<'a> Packet<'a> {
     #[inline]
     pub fn set_echo_seq_no(&mut self, value: u16) {
         NetworkEndian::write_u16(&mut self.buffer[field::ECHO_SEQNO], value)
+    }
+
+    /// Zero the unused field of an error message (destination unreachable, time
+    /// exceeded) header.
+    #[inline]
+    pub fn clear_unused(&mut self) {
+        NetworkEndian::write_u32(&mut self.buffer[field::UNUSED], 0);
     }
 
     /// Compute and fill in the header checksum.

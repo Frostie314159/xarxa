@@ -485,6 +485,10 @@ impl StackInner {
     /// `stack_wants` is set (the stack itself processes this protocol), the socket
     /// receives a copy and the original is returned for further processing.
     /// Otherwise the socket takes the buffer zero-copy and `None` is returned.
+    ///
+    /// The returned flag records whether a socket received (a copy of) the packet.
+    /// The stack suppresses its own error replies (ICMP port unreachable) for
+    /// packets an application is handling through a raw socket.
     pub(crate) fn process_raw_ip(
         &mut self,
         sockets: &mut Slab<RawSocketState>,
@@ -492,7 +496,7 @@ impl StackInner {
         protocol: IpProtocol,
         stack_wants: bool,
         buf: PacketBuf,
-    ) -> Option<PacketBuf> {
+    ) -> Option<(PacketBuf, bool)> {
         for (_, socket) in sockets.iter_mut() {
             let Some(RawMode::Ip {
                 version: bound_version,
@@ -511,13 +515,13 @@ impl StackInner {
             trace!("raw: receiving {} octets ({} {})", buf.len(), version, protocol);
             if stack_wants {
                 socket.rx_enqueue(copy_packet(&buf));
-                return Some(buf);
+                return Some((buf, true));
             } else {
                 socket.rx_enqueue(buf);
                 return None;
             }
         }
-        Some(buf)
+        Some((buf, false))
     }
 }
 
@@ -800,7 +804,9 @@ mod test {
             true,
             buf_from(&packet),
         );
-        assert_eq!(&*res.unwrap(), &packet[..]);
+        let (res_buf, handled) = res.unwrap();
+        assert_eq!(&*res_buf, &packet[..]);
+        assert!(handled);
         assert_eq!(&*stack.raw(h_icmp).recv().unwrap(), &packet[..]);
         assert!(!stack.raw(h_any).can_recv());
 
@@ -827,7 +833,9 @@ mod test {
             false,
             buf_from(&packet),
         );
-        assert_eq!(&*res.unwrap(), &packet[..]);
+        let (res_buf, handled) = res.unwrap();
+        assert_eq!(&*res_buf, &packet[..]);
+        assert!(!handled);
     }
 
     #[test]

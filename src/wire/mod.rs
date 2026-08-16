@@ -37,6 +37,7 @@ mod icmpv6;
 pub(crate) mod ip;
 pub(crate) mod ipv4;
 pub(crate) mod ipv6;
+mod ipv6ext;
 mod ndisc;
 mod ndiscoption;
 mod tcp;
@@ -72,6 +73,11 @@ pub use self::ipv6::{
     MIN_MTU as IPV6_MIN_MTU, Packet as Ipv6Packet,
 };
 pub(crate) use self::ipv6::{AddressExt as Ipv6AddressExt, MulticastScope as Ipv6MulticastScope};
+
+pub use self::ipv6ext::{
+    ExtHeader as Ipv6ExtHeader, OptionFailureAction as Ipv6OptionFailureAction, OptionType as Ipv6OptionType,
+    OptionsIter as Ipv6OptionsIter,
+};
 
 pub use self::icmpv4::{
     DstUnreachable as Icmpv4DstUnreachable, Message as Icmpv4Message, Packet as Icmpv4Packet,

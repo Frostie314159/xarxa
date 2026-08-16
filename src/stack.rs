@@ -439,7 +439,7 @@ impl Stack {
         self.inner.pending.purge_expired(timestamp);
 
         for (_, iface) in self.ifaces.iter_mut() {
-            self.inner.poll_neighbor_timers(iface);
+            self.inner.poll_neighbor_timers(iface, &mut self.sockets);
 
             while let Some(buf) = iface.dev.receive() {
                 self.inner.process(iface, &mut self.sockets, buf);
@@ -646,7 +646,8 @@ impl StackInner {
         // Offer the whole packet to IP-mode raw sockets. Protocols the stack itself
         // processes are copied to the socket, everything else is consumed by it.
         let stack_wants = matches!(next_header, IpProtocol::Icmp | IpProtocol::Udp | IpProtocol::Tcp);
-        let Some(mut buf) = self.process_raw_ip(&mut sockets.raw, IpVersion::Ipv4, next_header, stack_wants, buf)
+        let Some((mut buf, handled_by_raw)) =
+            self.process_raw_ip(&mut sockets.raw, IpVersion::Ipv4, next_header, stack_wants, buf)
         else {
             return;
         };
@@ -662,6 +663,7 @@ impl StackInner {
                 IpAddress::Ipv4(src_addr),
                 IpAddress::Ipv4(dst_addr),
                 header_len,
+                handled_by_raw,
                 buf,
             ),
             IpProtocol::Tcp => self.process_tcp(
@@ -674,6 +676,15 @@ impl StackInner {
             ),
             _ => {
                 trace!("ipv4: protocol {} not supported", next_header);
+                // ICMP protocol unreachable (RFC 792): restore the IP header so the
+                // whole offending packet can be quoted.
+                buf.push_front(header_len);
+                self.transmit_icmpv4_error(
+                    iface,
+                    &mut buf,
+                    Icmpv4Message::DstUnreachable,
+                    Icmpv4DstUnreachable::ProtoUnreachable.into(),
+                );
             }
         }
     }
@@ -859,16 +870,47 @@ impl StackInner {
         // Strip any trailing padding added by the link layer.
         buf.set_len(IPV6_HEADER_LEN + payload_len);
 
+        // Hop-by-hop options (RFC 8200 §4.3): walk the options, then continue at the
+        // upper-layer header behind the extension header. `l4_offset` is where that
+        // header starts, `nh_offset` is the offset of the field naming it, quoted in
+        // the "unrecognized next header" error pointer.
+        let (next_header, l4_offset, nh_offset) = if next_header == IpProtocol::HopByHop {
+            match check!(process_hop_by_hop(&buf[IPV6_HEADER_LEN..])) {
+                HopByHopAction::Continue { next_header, ext_len } => {
+                    (next_header, IPV6_HEADER_LEN + ext_len, IPV6_HEADER_LEN)
+                }
+                HopByHopAction::Discard => return,
+                HopByHopAction::DiscardSendError {
+                    pointer,
+                    allow_multicast_dst,
+                } => {
+                    self.transmit_icmpv6_error(
+                        iface,
+                        &mut buf,
+                        Icmpv6Message::ParamProblem,
+                        Icmpv6ParamProblem::UnrecognizedOption.into(),
+                        pointer,
+                        allow_multicast_dst,
+                    );
+                    return;
+                }
+            }
+        } else {
+            // 6 is the offset of the fixed header's next header field.
+            (next_header, IPV6_HEADER_LEN, 6)
+        };
+
         // Offer the whole packet to IP-mode raw sockets. Protocols the stack itself
         // processes are copied to the socket, everything else is consumed by it.
         let stack_wants = matches!(next_header, IpProtocol::Icmpv6 | IpProtocol::Udp | IpProtocol::Tcp);
-        let Some(mut buf) = self.process_raw_ip(&mut sockets.raw, IpVersion::Ipv6, next_header, stack_wants, buf)
+        let Some((mut buf, handled_by_raw)) =
+            self.process_raw_ip(&mut sockets.raw, IpVersion::Ipv6, next_header, stack_wants, buf)
         else {
             return;
         };
 
-        // Strip the IP header.
-        buf.pull_front(IPV6_HEADER_LEN);
+        // Strip the IP header (and any extension headers).
+        buf.pull_front(l4_offset);
 
         match next_header {
             IpProtocol::Icmpv6 => self.process_icmpv6(iface, eth_src, src_addr, dst_addr, hop_limit, buf),
@@ -877,7 +919,8 @@ impl StackInner {
                 &mut sockets.udp,
                 IpAddress::Ipv6(src_addr),
                 IpAddress::Ipv6(dst_addr),
-                IPV6_HEADER_LEN,
+                l4_offset,
+                handled_by_raw,
                 buf,
             ),
             IpProtocol::Tcp => self.process_tcp(
@@ -890,6 +933,19 @@ impl StackInner {
             ),
             _ => {
                 trace!("ipv6: protocol {} not supported", next_header);
+                // ICMPv6 parameter problem, unrecognized next header (RFC 4443
+                // §3.4): restore the headers so the whole offending packet can be
+                // quoted. The pointer names the next header field that held the
+                // unrecognized value.
+                buf.push_front(l4_offset);
+                self.transmit_icmpv6_error(
+                    iface,
+                    &mut buf,
+                    Icmpv6Message::ParamProblem,
+                    Icmpv6ParamProblem::UnrecognizedNxtHdr.into(),
+                    nh_offset as u32,
+                    false,
+                );
             }
         }
     }
@@ -1024,7 +1080,7 @@ impl StackInner {
     /// Advance the solicitation retransmission timers of the neighbors being resolved
     /// on this interface, retransmitting solicitations and failing resolutions that
     /// exhausted their probes.
-    fn poll_neighbor_timers(&mut self, iface: &mut Iface) {
+    fn poll_neighbor_timers(&mut self, iface: &mut Iface, sockets: &mut Sockets) {
         for event in self.neighbor_cache.poll_retransmit(iface.handle, self.now) {
             match event {
                 ProbeEvent::Retransmit(addr) => {
@@ -1033,12 +1089,79 @@ impl StackInner {
                 }
                 ProbeEvent::Failed(addr) => {
                     debug!("neighbor {} resolution failed, dropping queued packets", addr);
-                    // Dropping the queued packets is all there is to do.
-                    // TODO: RFC 4861 says to send an ICMP destination unreachable
-                    // error for each of them.
-                    drop(self.pending.take_matching(&(iface.handle, addr)));
+                    // RFC 4861 §7.3.3: answer each packet queued on the failed
+                    // resolution with an ICMP destination unreachable error.
+                    for packet in self.pending.take_matching(&(iface.handle, addr)) {
+                        self.deliver_neighbor_failure_error(iface, sockets, packet.buf);
+                    }
                 }
             }
+        }
+    }
+
+    /// Build an ICMP destination unreachable error for a packet whose neighbor
+    /// resolution failed, and deliver it back through local ingress processing.
+    ///
+    /// Queued packets are locally generated (nothing is forwarded), so the sender
+    /// the error must reach is a local socket. The error is fed into ingress,
+    /// where e.g. a raw-socket ping application receives it, rather than
+    /// transmitted to the wire. `orig` is the queued packet, a whole IP frame.
+    fn deliver_neighbor_failure_error(&mut self, iface: &mut Iface, sockets: &mut Sockets, mut orig: PacketBuf) {
+        match IpVersion::of_packet(&orig) {
+            Ok(IpVersion::Ipv4) => {
+                let (src_addr, header_len, next_header) = {
+                    let packet = Ipv4Packet::new_unchecked(&mut orig);
+                    (packet.src_addr(), packet.header_len() as usize, packet.next_header())
+                };
+                // Never generate an ICMP error about an ICMP error (RFC 1122 §3.2.2).
+                if next_header == IpProtocol::Icmp
+                    && orig.get(header_len).is_some_and(|&t| Icmpv4Message::from(t).is_error())
+                {
+                    return;
+                }
+                if !iface.is_unicast_v4(src_addr) {
+                    return;
+                }
+                let Some(reply_src) = iface.get_source_address_ipv4(&src_addr) else {
+                    return;
+                };
+                let mut reply = build_icmpv4_error(
+                    &orig,
+                    Icmpv4Message::DstUnreachable,
+                    Icmpv4DstUnreachable::HostUnreachable.into(),
+                );
+                push_ipv4_header(&mut reply, reply_src, src_addr, IpProtocol::Icmp, 64);
+                self.process_ipv4(iface, sockets, None, reply);
+            }
+            Ok(IpVersion::Ipv6) => {
+                let (src_addr, next_header) = {
+                    let packet = Ipv6Packet::new_unchecked(&mut orig);
+                    (packet.src_addr(), packet.next_header())
+                };
+                // Never generate an ICMP error about an ICMP error (RFC 4443 §2.4).
+                if next_header == IpProtocol::Icmpv6
+                    && orig
+                        .get(IPV6_HEADER_LEN)
+                        .is_some_and(|&t| Icmpv6Message::from(t).is_error())
+                {
+                    return;
+                }
+                if !src_addr.x_is_unicast() {
+                    return;
+                }
+                let reply_src = iface.get_source_address_ipv6(&src_addr);
+                let mut reply = build_icmpv6_error(
+                    &orig,
+                    &reply_src,
+                    &src_addr,
+                    Icmpv6Message::DstUnreachable,
+                    Icmpv6DstUnreachable::AddrUnreachable.into(),
+                    0,
+                );
+                push_ipv6_header(&mut reply, reply_src, src_addr, IpProtocol::Icmpv6, 64);
+                self.process_ipv6(iface, sockets, None, reply);
+            }
+            Err(_) => {}
         }
     }
 
@@ -1160,6 +1283,64 @@ impl StackInner {
         self.transmit_ipv6(iface, buf, src_addr, dst_addr, IpProtocol::Icmpv6, 0xff);
     }
 
+    /// Transmit an ICMPv4 error message in reply to the ingress packet in `orig`
+    /// (a whole IP packet, starting at the IP header, quoted in the error).
+    ///
+    /// Errors are only sent when both the source and the destination of the
+    /// offending packet are unicast (RFC 1122 §3.2.2): none about broadcast or
+    /// multicast traffic, and none to non-unicast senders.
+    pub(crate) fn transmit_icmpv4_error(
+        &mut self,
+        iface: &mut Iface,
+        orig: &mut PacketBuf,
+        msg_type: Icmpv4Message,
+        msg_code: u8,
+    ) {
+        let (src_addr, dst_addr) = {
+            let packet = Ipv4Packet::new_unchecked(orig);
+            (packet.src_addr(), packet.dst_addr())
+        };
+        if !iface.is_unicast_v4(src_addr) || !iface.is_unicast_v4(dst_addr) {
+            return;
+        }
+        let reply = build_icmpv4_error(orig, msg_type, msg_code);
+        self.transmit_ipv4(iface, reply, dst_addr, src_addr, IpProtocol::Icmp, 64);
+    }
+
+    /// Transmit an ICMPv6 error message in reply to the ingress packet in `orig`
+    /// (a whole IP packet, starting at the IP header, quoted in the error).
+    ///
+    /// Errors are never sent to non-unicast sources, nor about multicast-destined
+    /// packets (RFC 4443 §2.4). The exception is an unrecognized hop-by-hop option
+    /// whose type demands the error even then (`allow_multicast_dst`).
+    pub(crate) fn transmit_icmpv6_error(
+        &mut self,
+        iface: &mut Iface,
+        orig: &mut PacketBuf,
+        msg_type: Icmpv6Message,
+        msg_code: u8,
+        pointer: u32,
+        allow_multicast_dst: bool,
+    ) {
+        let (src_addr, dst_addr) = {
+            let packet = Ipv6Packet::new_unchecked(orig);
+            (packet.src_addr(), packet.dst_addr())
+        };
+        if !src_addr.x_is_unicast() {
+            return;
+        }
+        if dst_addr.is_multicast() && !allow_multicast_dst {
+            return;
+        }
+        let reply_src = if dst_addr.x_is_unicast() {
+            dst_addr
+        } else {
+            iface.get_source_address_ipv6(&src_addr)
+        };
+        let reply = build_icmpv6_error(orig, &reply_src, &src_addr, msg_type, msg_code, pointer);
+        self.transmit_ipv6(iface, reply, reply_src, src_addr, IpProtocol::Icmpv6, 64);
+    }
+
     fn transmit_ipv4(
         &mut self,
         iface: &mut Iface,
@@ -1169,26 +1350,7 @@ impl StackInner {
         next_header: IpProtocol,
         hop_limit: u8,
     ) {
-        let payload_len = buf.len();
-        buf.push_front(IPV4_HEADER_LEN);
-        {
-            let mut packet = Ipv4Packet::new_unchecked(&mut buf);
-            packet.set_version(4);
-            packet.set_header_len(IPV4_HEADER_LEN as u8);
-            packet.set_dscp(0);
-            packet.set_ecn(0);
-            packet.set_total_len((IPV4_HEADER_LEN + payload_len) as u16);
-            packet.set_ident(0);
-            packet.clear_flags();
-            packet.set_more_frags(false);
-            packet.set_dont_frag(true);
-            packet.set_frag_offset(0);
-            packet.set_hop_limit(hop_limit);
-            packet.set_next_header(next_header);
-            packet.set_src_addr(src_addr);
-            packet.set_dst_addr(dst_addr);
-            packet.fill_checksum();
-        }
+        push_ipv4_header(&mut buf, src_addr, dst_addr, next_header, hop_limit);
         self.transmit_ip_frame(iface, IpAddress::Ipv4(dst_addr), buf, EthernetProtocol::Ipv4);
     }
 
@@ -1201,19 +1363,7 @@ impl StackInner {
         next_header: IpProtocol,
         hop_limit: u8,
     ) {
-        let payload_len = buf.len();
-        buf.push_front(IPV6_HEADER_LEN);
-        {
-            let mut packet = Ipv6Packet::new_unchecked(&mut buf);
-            packet.set_version(6);
-            packet.set_traffic_class(0);
-            packet.set_flow_label(0);
-            packet.set_payload_len(payload_len as u16);
-            packet.set_next_header(next_header);
-            packet.set_hop_limit(hop_limit);
-            packet.set_src_addr(src_addr);
-            packet.set_dst_addr(dst_addr);
-        }
+        push_ipv6_header(&mut buf, src_addr, dst_addr, next_header, hop_limit);
         self.transmit_ip_frame(iface, IpAddress::Ipv6(dst_addr), buf, EthernetProtocol::Ipv6);
     }
 
@@ -1279,6 +1429,158 @@ impl StackInner {
                 .map(|route| route.via_router)
         }
     }
+}
+
+/// Prepend an IPv4 header to a fully-built L4 payload.
+fn push_ipv4_header(
+    buf: &mut PacketBuf,
+    src_addr: Ipv4Address,
+    dst_addr: Ipv4Address,
+    next_header: IpProtocol,
+    hop_limit: u8,
+) {
+    let payload_len = buf.len();
+    buf.push_front(IPV4_HEADER_LEN);
+    let mut packet = Ipv4Packet::new_unchecked(buf);
+    packet.set_version(4);
+    packet.set_header_len(IPV4_HEADER_LEN as u8);
+    packet.set_dscp(0);
+    packet.set_ecn(0);
+    packet.set_total_len((IPV4_HEADER_LEN + payload_len) as u16);
+    packet.set_ident(0);
+    packet.clear_flags();
+    packet.set_more_frags(false);
+    packet.set_dont_frag(true);
+    packet.set_frag_offset(0);
+    packet.set_hop_limit(hop_limit);
+    packet.set_next_header(next_header);
+    packet.set_src_addr(src_addr);
+    packet.set_dst_addr(dst_addr);
+    packet.fill_checksum();
+}
+
+/// Prepend an IPv6 header to a fully-built L4 payload.
+fn push_ipv6_header(
+    buf: &mut PacketBuf,
+    src_addr: Ipv6Address,
+    dst_addr: Ipv6Address,
+    next_header: IpProtocol,
+    hop_limit: u8,
+) {
+    let payload_len = buf.len();
+    buf.push_front(IPV6_HEADER_LEN);
+    let mut packet = Ipv6Packet::new_unchecked(buf);
+    packet.set_version(6);
+    packet.set_traffic_class(0);
+    packet.set_flow_label(0);
+    packet.set_payload_len(payload_len as u16);
+    packet.set_next_header(next_header);
+    packet.set_hop_limit(hop_limit);
+    packet.set_src_addr(src_addr);
+    packet.set_dst_addr(dst_addr);
+}
+
+/// ICMP error messages have a fixed 8-byte header (type, code, checksum, and a
+/// 4-byte type-specific field), followed by the quoted packet.
+const ICMP_ERROR_HEADER_LEN: usize = 8;
+
+/// Build an ICMPv4 error message, quoting as much of `orig` (a whole IP packet)
+/// as fits within the minimum MTU (RFC 1812 §4.3.2.3).
+fn build_icmpv4_error(orig: &[u8], msg_type: Icmpv4Message, msg_code: u8) -> PacketBuf {
+    let quote_len = orig.len().min(IPV4_MIN_MTU - IPV4_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
+    let mut reply = PacketBuf::new();
+    reply.reserve(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN);
+    reply.set_len(ICMP_ERROR_HEADER_LEN + quote_len);
+    {
+        let mut icmp = Icmpv4Packet::new_unchecked(&mut reply);
+        icmp.set_msg_type(msg_type);
+        icmp.set_msg_code(msg_code);
+        icmp.clear_unused();
+        icmp.data_mut().copy_from_slice(&orig[..quote_len]);
+        icmp.fill_checksum();
+    }
+    reply
+}
+
+/// Build an ICMPv6 error message, quoting as much of `orig` (a whole IP packet)
+/// as fits within the minimum MTU (RFC 4443 §2.4). `src_addr` and `dst_addr` are
+/// the addresses the error will be sent between, for the checksum. `pointer` is
+/// written for parameter problem messages.
+fn build_icmpv6_error(
+    orig: &[u8],
+    src_addr: &Ipv6Address,
+    dst_addr: &Ipv6Address,
+    msg_type: Icmpv6Message,
+    msg_code: u8,
+    pointer: u32,
+) -> PacketBuf {
+    let quote_len = orig.len().min(IPV6_MIN_MTU - IPV6_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
+    let mut reply = PacketBuf::new();
+    reply.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
+    reply.set_len(ICMP_ERROR_HEADER_LEN + quote_len);
+    {
+        let mut icmp = Icmpv6Packet::new_unchecked(&mut reply);
+        icmp.set_msg_type(msg_type);
+        icmp.set_msg_code(msg_code);
+        if msg_type == Icmpv6Message::ParamProblem {
+            icmp.set_param_problem_ptr(pointer);
+        } else {
+            icmp.clear_reserved();
+        }
+        icmp.payload_mut().copy_from_slice(&orig[..quote_len]);
+        icmp.fill_checksum(src_addr, dst_addr);
+    }
+    reply
+}
+
+/// The outcome of processing a hop-by-hop options header.
+enum HopByHopAction {
+    /// All options accepted, continue at the upper-layer header.
+    Continue { next_header: IpProtocol, ext_len: usize },
+    /// An unrecognized option requires the packet to be discarded silently.
+    Discard,
+    /// An unrecognized option requires the packet to be discarded and a parameter
+    /// problem error sent, pointing at the offending option.
+    DiscardSendError { pointer: u32, allow_multicast_dst: bool },
+}
+
+/// Walk a hop-by-hop options header (`payload` starts at the extension header).
+///
+/// Recognized options (padding, router alert) are skipped. Unrecognized ones are
+/// acted on per the two high bits of their type (RFC 8200 §4.2).
+fn process_hop_by_hop(payload: &[u8]) -> crate::wire::Result<HopByHopAction> {
+    let ext = Ipv6ExtHeader::new_checked(payload)?;
+    for option in Ipv6OptionsIter::new(ext.data()) {
+        let (offset, option_type, _data) = option?;
+        match option_type {
+            Ipv6OptionType::Pad1 | Ipv6OptionType::PadN | Ipv6OptionType::RouterAlert => {}
+            unrecognized => {
+                // The option sits 2 bytes into the extension header, which itself
+                // starts right after the fixed IPv6 header.
+                let pointer = (IPV6_HEADER_LEN + 2 + offset) as u32;
+                match unrecognized.failure_action() {
+                    Ipv6OptionFailureAction::Skip => {}
+                    Ipv6OptionFailureAction::Discard => return Ok(HopByHopAction::Discard),
+                    Ipv6OptionFailureAction::DiscardSendError => {
+                        return Ok(HopByHopAction::DiscardSendError {
+                            pointer,
+                            allow_multicast_dst: true,
+                        });
+                    }
+                    Ipv6OptionFailureAction::DiscardSendErrorIfUnicast => {
+                        return Ok(HopByHopAction::DiscardSendError {
+                            pointer,
+                            allow_multicast_dst: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(HopByHopAction::Continue {
+        next_header: ext.next_header(),
+        ext_len: ext.header_len(),
+    })
 }
 
 impl Iface {
@@ -1528,7 +1830,15 @@ fn ndisc_lladdr_option(
 
 #[cfg(test)]
 mod test {
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::rc::Rc;
+
     use super::*;
+    use crate::iface::IfaceCapabilities;
+    use crate::neighbor::MAX_MULTICAST_SOLICIT;
+    use crate::raw::RawMode;
+    use crate::time::Duration;
 
     #[test]
     fn test_alloc_ephemeral_port() {
@@ -1544,5 +1854,424 @@ mod test {
 
         // Every port in use: allocation fails.
         assert_eq!(alloc_ephemeral_port(&mut rand, |_| true), None);
+    }
+
+    /// A mock device: receives injected packets, records transmitted frames.
+    struct TestDevice {
+        medium: Medium,
+        rx: Rc<RefCell<VecDeque<Vec<u8>>>>,
+        tx: Rc<RefCell<Vec<Vec<u8>>>>,
+    }
+
+    impl Interface for TestDevice {
+        fn capabilities(&self) -> IfaceCapabilities {
+            IfaceCapabilities {
+                medium: self.medium,
+                max_transmission_unit: 1500,
+            }
+        }
+        fn receive(&mut self) -> Option<PacketBuf> {
+            let bytes = self.rx.borrow_mut().pop_front()?;
+            let mut buf = PacketBuf::new();
+            buf.set_len(bytes.len());
+            buf.copy_from_slice(&bytes);
+            Some(buf)
+        }
+        fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
+            self.tx.borrow_mut().push(buf.to_vec());
+            Ok(())
+        }
+    }
+
+    const OUR_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
+    const REMOTE_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
+    const OUR_V6: Ipv6Address = Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 1);
+    const REMOTE_V6: Ipv6Address = Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 2);
+
+    type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
+    type Sent = Rc<RefCell<Vec<Vec<u8>>>>;
+
+    /// A stack with one interface of the given medium, owning [`OUR_V4`]/24 and
+    /// [`OUR_V6`]/64.
+    fn test_stack(medium: Medium) -> (Stack, Queue, Sent) {
+        let rx = Rc::new(RefCell::new(VecDeque::new()));
+        let tx = Rc::new(RefCell::new(Vec::new()));
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        stack.add_iface(
+            Box::new(TestDevice {
+                medium,
+                rx: rx.clone(),
+                tx: tx.clone(),
+            }),
+            Config {
+                hardware_addr: EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
+                ip_addrs: vec![IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)],
+            },
+        );
+        (stack, rx, tx)
+    }
+
+    /// Inject a packet into the device and poll the stack to process it.
+    fn inject(stack: &mut Stack, rx: &Queue, bytes: Vec<u8>) {
+        rx.borrow_mut().push_back(bytes);
+        stack.poll(Instant::ZERO);
+    }
+
+    /// A whole IPv4 packet, header checksum filled in.
+    fn ipv4_packet(src_addr: Ipv4Address, dst_addr: Ipv4Address, protocol: IpProtocol, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; IPV4_HEADER_LEN + payload.len()];
+        {
+            let mut ip = Ipv4Packet::new_unchecked(&mut bytes[..]);
+            ip.set_version(4);
+            ip.set_header_len(IPV4_HEADER_LEN as u8);
+            ip.set_total_len((IPV4_HEADER_LEN + payload.len()) as u16);
+            ip.set_next_header(protocol);
+            ip.set_hop_limit(64);
+            ip.set_src_addr(src_addr);
+            ip.set_dst_addr(dst_addr);
+            ip.fill_checksum();
+        }
+        bytes[IPV4_HEADER_LEN..].copy_from_slice(payload);
+        bytes
+    }
+
+    /// A whole IPv6 packet.
+    fn ipv6_packet(src_addr: Ipv6Address, dst_addr: Ipv6Address, protocol: IpProtocol, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; IPV6_HEADER_LEN + payload.len()];
+        {
+            let mut ip = Ipv6Packet::new_unchecked(&mut bytes[..]);
+            ip.set_version(6);
+            ip.set_payload_len(payload.len() as u16);
+            ip.set_next_header(protocol);
+            ip.set_hop_limit(64);
+            ip.set_src_addr(src_addr);
+            ip.set_dst_addr(dst_addr);
+        }
+        bytes[IPV6_HEADER_LEN..].copy_from_slice(payload);
+        bytes
+    }
+
+    /// A UDP datagram (UDP header + payload), checksum filled in.
+    fn udp_datagram(src_addr: IpAddress, src_port: u16, dst_addr: IpAddress, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; UDP_HEADER_LEN + payload.len()];
+        {
+            let mut udp = UdpPacket::new_unchecked(&mut bytes[..]);
+            udp.set_src_port(src_port);
+            udp.set_dst_port(dst_port);
+            udp.set_len((UDP_HEADER_LEN + payload.len()) as u16);
+            udp.payload_mut().copy_from_slice(payload);
+            udp.fill_checksum(&src_addr, &dst_addr);
+        }
+        bytes
+    }
+
+    /// Parse a transmitted IPv4 frame as an ICMPv4 message, verifying addresses and
+    /// both checksums, and return `(type, code, quoted packet)`.
+    fn parse_icmpv4_reply(frame: &[u8], src_addr: Ipv4Address, dst_addr: Ipv4Address) -> (Icmpv4Message, u8, Vec<u8>) {
+        let mut bytes = frame.to_vec();
+        let ip = Ipv4Packet::new_checked(&mut bytes[..]).unwrap();
+        assert!(ip.verify_checksum());
+        assert_eq!(ip.src_addr(), src_addr);
+        assert_eq!(ip.dst_addr(), dst_addr);
+        assert_eq!(ip.next_header(), IpProtocol::Icmp);
+        let header_len = ip.header_len() as usize;
+        let mut icmp_bytes = bytes[header_len..].to_vec();
+        let icmp = Icmpv4Packet::new_checked(&mut icmp_bytes[..]).unwrap();
+        assert!(icmp.verify_checksum());
+        (icmp.msg_type(), icmp.msg_code(), icmp.data().to_vec())
+    }
+
+    /// Parse a transmitted IPv6 frame as an ICMPv6 message, verifying addresses and
+    /// the checksum, and return `(type, code, pointer, quoted packet)`.
+    fn parse_icmpv6_reply(
+        frame: &[u8],
+        src_addr: Ipv6Address,
+        dst_addr: Ipv6Address,
+    ) -> (Icmpv6Message, u8, u32, Vec<u8>) {
+        let mut bytes = frame.to_vec();
+        let ip = Ipv6Packet::new_checked(&mut bytes[..]).unwrap();
+        assert_eq!(ip.src_addr(), src_addr);
+        assert_eq!(ip.dst_addr(), dst_addr);
+        assert_eq!(ip.next_header(), IpProtocol::Icmpv6);
+        let mut icmp_bytes = bytes[IPV6_HEADER_LEN..].to_vec();
+        let icmp = Icmpv6Packet::new_checked(&mut icmp_bytes[..]).unwrap();
+        assert!(icmp.verify_checksum(&src_addr, &dst_addr));
+        (
+            icmp.msg_type(),
+            icmp.msg_code(),
+            icmp.param_problem_ptr(),
+            icmp.payload().to_vec(),
+        )
+    }
+
+    #[test]
+    fn test_icmpv4_proto_unreachable() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol(99), b"hello");
+        inject(&mut stack, &rx, packet.clone());
+
+        let tx = tx.borrow();
+        assert_eq!(tx.len(), 1);
+        let (msg_type, msg_code, quote) = parse_icmpv4_reply(&tx[0], OUR_V4, REMOTE_V4);
+        assert_eq!(msg_type, Icmpv4Message::DstUnreachable);
+        assert_eq!(msg_code, Icmpv4DstUnreachable::ProtoUnreachable.into());
+        assert_eq!(quote, packet);
+    }
+
+    #[test]
+    fn test_icmpv4_no_error_to_broadcast() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        // Unknown protocol on a broadcast-destined packet: no error may be sent.
+        let bcast = Ipv4Address::new(192, 168, 1, 255);
+        let packet = ipv4_packet(REMOTE_V4, bcast, IpProtocol(99), b"hello");
+        inject(&mut stack, &rx, packet);
+        assert!(tx.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_icmpv4_port_unreachable() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let datagram = udp_datagram(REMOTE_V4.into(), 4000, OUR_V4.into(), 7, b"echo?");
+        let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram);
+        inject(&mut stack, &rx, packet.clone());
+
+        {
+            let tx = tx.borrow();
+            assert_eq!(tx.len(), 1);
+            let (msg_type, msg_code, quote) = parse_icmpv4_reply(&tx[0], OUR_V4, REMOTE_V4);
+            assert_eq!(msg_type, Icmpv4Message::DstUnreachable);
+            assert_eq!(msg_code, Icmpv4DstUnreachable::PortUnreachable.into());
+            assert_eq!(quote, packet);
+        }
+
+        // With a socket bound to the port, the datagram is delivered instead.
+        let handle = stack.add_udp_socket();
+        stack.udp(handle).bind(7, IpListenEndpoint::UNSPECIFIED).unwrap();
+        inject(&mut stack, &rx, packet.clone());
+        assert_eq!(tx.borrow().len(), 1);
+        assert_eq!(&*stack.udp(handle).recv().unwrap(), b"echo?");
+    }
+
+    #[test]
+    fn test_icmpv4_port_unreachable_suppressed_by_raw_socket() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        // An application handling UDP through a raw socket suppresses the error.
+        let handle = stack.add_raw_socket();
+        stack
+            .raw(handle)
+            .bind(RawMode::Ip {
+                version: Some(IpVersion::Ipv4),
+                protocol: Some(IpProtocol::Udp),
+            })
+            .unwrap();
+
+        let datagram = udp_datagram(REMOTE_V4.into(), 4000, OUR_V4.into(), 7, b"echo?");
+        let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram);
+        inject(&mut stack, &rx, packet.clone());
+
+        assert!(tx.borrow().is_empty());
+        assert_eq!(&*stack.raw(handle).recv().unwrap(), &packet[..]);
+    }
+
+    #[test]
+    fn test_icmpv6_unknown_next_header() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let packet = ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol(99), b"hello");
+        inject(&mut stack, &rx, packet.clone());
+
+        let tx = tx.borrow();
+        assert_eq!(tx.len(), 1);
+        let (msg_type, msg_code, pointer, quote) = parse_icmpv6_reply(&tx[0], OUR_V6, REMOTE_V6);
+        assert_eq!(msg_type, Icmpv6Message::ParamProblem);
+        assert_eq!(msg_code, Icmpv6ParamProblem::UnrecognizedNxtHdr.into());
+        // The pointer names the fixed header's next header field.
+        assert_eq!(pointer, 6);
+        assert_eq!(quote, packet);
+    }
+
+    #[test]
+    fn test_icmpv6_no_error_to_multicast() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        // Unknown protocol on a multicast-destined packet: no error may be sent.
+        let packet = ipv6_packet(REMOTE_V6, IPV6_LINK_LOCAL_ALL_NODES, IpProtocol(99), b"hello");
+        inject(&mut stack, &rx, packet);
+        assert!(tx.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_icmpv6_port_unreachable() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let datagram = udp_datagram(REMOTE_V6.into(), 4000, OUR_V6.into(), 7, b"echo?");
+        let packet = ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol::Udp, &datagram);
+        inject(&mut stack, &rx, packet.clone());
+
+        let tx = tx.borrow();
+        assert_eq!(tx.len(), 1);
+        let (msg_type, msg_code, _, quote) = parse_icmpv6_reply(&tx[0], OUR_V6, REMOTE_V6);
+        assert_eq!(msg_type, Icmpv6Message::DstUnreachable);
+        assert_eq!(msg_code, Icmpv6DstUnreachable::PortUnreachable.into());
+        assert_eq!(quote, packet);
+    }
+
+    /// A hop-by-hop options header carrying the given options (padded to a
+    /// multiple of 8 by the caller), followed by the given payload.
+    fn hbh_payload(next_header: IpProtocol, options: &[u8], payload: &[u8]) -> Vec<u8> {
+        assert_eq!((options.len() + 2) % 8, 0);
+        let mut bytes = vec![u8::from(next_header), ((options.len() + 2) / 8 - 1) as u8];
+        bytes.extend_from_slice(options);
+        bytes.extend_from_slice(payload);
+        bytes
+    }
+
+    #[test]
+    fn test_icmpv6_hop_by_hop_passthrough() {
+        let (mut stack, rx, _tx) = test_stack(Medium::Ip);
+        let handle = stack.add_udp_socket();
+        stack.udp(handle).bind(7, IpListenEndpoint::UNSPECIFIED).unwrap();
+
+        // PadN + an unknown option whose action is "skip" (high bits 00): the
+        // packet continues to UDP and is delivered, headers intact.
+        let datagram = udp_datagram(REMOTE_V6.into(), 4000, OUR_V6.into(), 7, b"echo?");
+        let options = [0x01, 0x01, 0x00, 0x02, 0x01, 0x00];
+        let packet = ipv6_packet(
+            REMOTE_V6,
+            OUR_V6,
+            IpProtocol::HopByHop,
+            &hbh_payload(IpProtocol::Udp, &options, &datagram),
+        );
+        inject(&mut stack, &rx, packet);
+
+        let mut socket = stack.udp(handle);
+        let recv = socket.recv().unwrap();
+        assert_eq!(&*recv, b"echo?");
+        assert_eq!(recv.meta().endpoint, IpEndpoint::new(REMOTE_V6.into(), 4000));
+    }
+
+    #[test]
+    fn test_icmpv6_hop_by_hop_unrecognized_option() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+
+        // High bits 01: discard silently.
+        let options = [0x41, 0x04, 0x00, 0x00, 0x00, 0x00];
+        let packet = ipv6_packet(
+            REMOTE_V6,
+            OUR_V6,
+            IpProtocol::HopByHop,
+            &hbh_payload(IpProtocol::Udp, &options, b""),
+        );
+        inject(&mut stack, &rx, packet);
+        assert!(tx.borrow().is_empty());
+
+        // High bits 10: discard and send a parameter problem, pointing at the
+        // offending option (40-byte header + 2 bytes into the extension header).
+        let options = [0x81, 0x04, 0x00, 0x00, 0x00, 0x00];
+        let packet = ipv6_packet(
+            REMOTE_V6,
+            OUR_V6,
+            IpProtocol::HopByHop,
+            &hbh_payload(IpProtocol::Udp, &options, b""),
+        );
+        inject(&mut stack, &rx, packet.clone());
+        {
+            let tx = tx.borrow();
+            assert_eq!(tx.len(), 1);
+            let (msg_type, msg_code, pointer, quote) = parse_icmpv6_reply(&tx[0], OUR_V6, REMOTE_V6);
+            assert_eq!(msg_type, Icmpv6Message::ParamProblem);
+            assert_eq!(msg_code, Icmpv6ParamProblem::UnrecognizedOption.into());
+            assert_eq!(pointer, 42);
+            assert_eq!(quote, packet);
+        }
+    }
+
+    #[test]
+    fn test_icmpv6_hop_by_hop_unrecognized_option_multicast() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+
+        // High bits 11: discard, and send the error only if the destination was
+        // not multicast, which it is here, so nothing may be sent.
+        let options = [0xc1, 0x04, 0x00, 0x00, 0x00, 0x00];
+        let packet = ipv6_packet(
+            REMOTE_V6,
+            IPV6_LINK_LOCAL_ALL_NODES,
+            IpProtocol::HopByHop,
+            &hbh_payload(IpProtocol::Udp, &options, b""),
+        );
+        inject(&mut stack, &rx, packet);
+        assert!(tx.borrow().is_empty());
+
+        // High bits 10: the error is sent even for a multicast destination, with
+        // the source picked from the interface.
+        let options = [0x81, 0x04, 0x00, 0x00, 0x00, 0x00];
+        let packet = ipv6_packet(
+            REMOTE_V6,
+            IPV6_LINK_LOCAL_ALL_NODES,
+            IpProtocol::HopByHop,
+            &hbh_payload(IpProtocol::Udp, &options, b""),
+        );
+        inject(&mut stack, &rx, packet.clone());
+        let tx = tx.borrow();
+        assert_eq!(tx.len(), 1);
+        let (msg_type, msg_code, _, quote) = parse_icmpv6_reply(&tx[0], OUR_V6, REMOTE_V6);
+        assert_eq!(msg_type, Icmpv6Message::ParamProblem);
+        assert_eq!(msg_code, Icmpv6ParamProblem::UnrecognizedOption.into());
+        assert_eq!(quote, packet);
+    }
+
+    #[test]
+    fn test_icmp_error_quote_truncated() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        // A big offending packet: the quote is capped so the error fits the
+        // minimum MTU (576 for IPv4: 20-byte header + 8-byte ICMP header + quote).
+        let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol(99), &[0xab; 1000]);
+        inject(&mut stack, &rx, packet.clone());
+
+        let tx = tx.borrow();
+        let (_, _, quote) = parse_icmpv4_reply(&tx[0], OUR_V4, REMOTE_V4);
+        assert_eq!(quote.len(), IPV4_MIN_MTU - IPV4_HEADER_LEN - 8);
+        assert_eq!(quote, packet[..quote.len()]);
+    }
+
+    #[test]
+    fn test_neighbor_failure_dst_unreachable() {
+        let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
+
+        // A raw socket listening for ICMPv4, the erring application.
+        let raw_handle = stack.add_raw_socket();
+        stack
+            .raw(raw_handle)
+            .bind(RawMode::Ip {
+                version: Some(IpVersion::Ipv4),
+                protocol: Some(IpProtocol::Icmp),
+            })
+            .unwrap();
+
+        // Send a datagram to an on-link address that will never resolve: the
+        // packet is queued and an ARP request goes out.
+        let dead = Ipv4Address::new(192, 168, 1, 99);
+        let udp_handle = stack.add_udp_socket();
+        stack.udp(udp_handle).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack.udp(udp_handle).send_slice(b"anyone?", (dead, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 1); // the first ARP request
+
+        // Let the resolution run out of probes.
+        for secs in 1..=4 {
+            stack.poll(Instant::ZERO + Duration::from_secs(secs));
+        }
+        // Every transmission was an ARP request: the error is not sent to the
+        // wire, it is delivered back through local ingress...
+        assert_eq!(tx.borrow().len(), MAX_MULTICAST_SOLICIT as usize);
+
+        // ...where the raw socket receives it: host unreachable, from us to us,
+        // quoting the queued UDP packet.
+        let error = stack.raw(raw_handle).recv().unwrap();
+        let (msg_type, msg_code, quote) = parse_icmpv4_reply(&error, OUR_V4, OUR_V4);
+        assert_eq!(msg_type, Icmpv4Message::DstUnreachable);
+        assert_eq!(msg_code, Icmpv4DstUnreachable::HostUnreachable.into());
+
+        let mut quoted = quote.clone();
+        let ip = Ipv4Packet::new_checked(&mut quoted[..]).unwrap();
+        assert_eq!(ip.src_addr(), OUR_V4);
+        assert_eq!(ip.dst_addr(), dead);
+        assert_eq!(ip.next_header(), IpProtocol::Udp);
     }
 }

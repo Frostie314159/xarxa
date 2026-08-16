@@ -345,7 +345,12 @@ impl<'a> Packet<'a> {
     #[inline]
     pub fn clear_reserved(&mut self) {
         match self.msg_type() {
-            Message::RouterSolicit | Message::NeighborSolicit | Message::NeighborAdvert | Message::Redirect => {
+            Message::DstUnreachable
+            | Message::TimeExceeded
+            | Message::RouterSolicit
+            | Message::NeighborSolicit
+            | Message::NeighborAdvert
+            | Message::Redirect => {
                 NetworkEndian::write_u32(&mut self.buffer[field::UNUSED], 0);
             }
             Message::MldQuery => {

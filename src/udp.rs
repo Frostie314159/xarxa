@@ -25,8 +25,9 @@ use crate::stack::{Iface, StackInner, TxContext, addr_score, alloc_ephemeral_por
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
 use crate::wire::{
-    ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
-    IpVersion, Ipv4Packet, Ipv6Packet, UDP_HEADER_LEN, UdpPacket,
+    ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, Icmpv4DstUnreachable, Icmpv4Message, Icmpv6DstUnreachable,
+    Icmpv6Message, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv6ExtHeader,
+    Ipv6Packet, UDP_HEADER_LEN, UdpPacket,
 };
 
 /// A handle to a UDP socket added to a [`Stack`].
@@ -275,7 +276,16 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
             }
             IpVersion::Ipv6 => {
                 let packet = Ipv6Packet::new_unchecked(&mut buf[..]);
-                (packet.src_addr().into(), packet.dst_addr().into(), IPV6_HEADER_LEN)
+                let src_addr = packet.src_addr();
+                let dst_addr = packet.dst_addr();
+                let next_header = packet.next_header();
+                let mut header_len = IPV6_HEADER_LEN;
+                if next_header == IpProtocol::HopByHop {
+                    let ext = Ipv6ExtHeader::new_checked(&buf[IPV6_HEADER_LEN..])
+                        .expect("queued packet was validated on ingress");
+                    header_len += ext.header_len();
+                }
+                (src_addr.into(), dst_addr.into(), header_len)
             }
         };
 
@@ -699,11 +709,12 @@ impl StackInner {
     /// `recv` can parse the addresses back out of it.
     pub(crate) fn process_udp(
         &mut self,
-        iface: &Iface,
+        iface: &mut Iface,
         sockets: &mut Slab<UdpSocketState>,
         src_addr: IpAddress,
         dst_addr: IpAddress,
         ip_header_len: usize,
+        handled_by_raw: bool,
         mut buf: PacketBuf,
     ) {
         let Ok(udp_packet) = UdpPacket::new_checked(&mut buf) else {
@@ -757,7 +768,28 @@ impl StackInner {
         }
 
         trace!("udp: no socket bound to port {}, dropping", dst_port);
-        // TODO: send an ICMP port unreachable error.
+        // ICMP port unreachable. The IP header was added back above, so `buf` is
+        // the whole original packet again, ready to be quoted. Suppressed when a raw
+        // socket got a copy: the application is handling UDP itself, and the error
+        // would sabotage its exchange.
+        if !handled_by_raw {
+            match dst_addr {
+                IpAddress::Ipv4(_) => self.transmit_icmpv4_error(
+                    iface,
+                    &mut buf,
+                    Icmpv4Message::DstUnreachable,
+                    Icmpv4DstUnreachable::PortUnreachable.into(),
+                ),
+                IpAddress::Ipv6(_) => self.transmit_icmpv6_error(
+                    iface,
+                    &mut buf,
+                    Icmpv6Message::DstUnreachable,
+                    Icmpv6DstUnreachable::PortUnreachable.into(),
+                    0,
+                    false,
+                ),
+            }
+        }
     }
 }
 
@@ -856,11 +888,12 @@ mod test {
         let mut buf = queued_packet_from(src_addr, src_port, dst_addr, payload);
         buf.pull_front(IPV4_HEADER_LEN);
         stack.inner.process_udp(
-            stack.ifaces.get(0),
+            stack.ifaces.get_mut(0),
             &mut stack.sockets.udp,
             src_addr.into(),
             dst_addr.into(),
             IPV4_HEADER_LEN,
+            false,
             buf,
         );
     }
