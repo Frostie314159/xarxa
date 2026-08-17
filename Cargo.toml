@@ -4,8 +4,40 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["std", "log", "auto-icmp-echo-reply", "icmp-error-handling"]
+default = [
+    "std",
+    "log",
+    "auto-icmp-echo-reply",
+    "icmp-error-handling",
+    "medium-ethernet",
+    "medium-ip",
+    "proto-ipv4",
+    "proto-ipv6",
+    "socket-raw",
+    "socket-udp",
+    "socket-tcp",
+]
 std = ["dep:libc"]
+## Support interfaces that send and receive Ethernet frames, with the link-layer
+## machinery that goes with them (ARP, NDISC, the neighbor cache).
+medium-ethernet = []
+## Support interfaces that send and receive bare IP packets, without a link-layer
+## header.
+medium-ip = []
+## Support IPv4 (and, with `medium-ethernet`, ARP).
+proto-ipv4 = []
+## Support IPv6 (and, with `medium-ethernet`, NDISC).
+proto-ipv6 = []
+## Raw sockets.
+socket-raw = ["socket"]
+## UDP sockets.
+socket-udp = ["socket"]
+## TCP sockets and listeners.
+socket-tcp = ["socket"]
+## Enabled automatically by the `socket-*` features: "this build has sockets at
+## all", which is what the socket-side stack machinery (the egress context,
+## ephemeral port allocation, demux scoring) is gated on. Do not enable directly.
+socket = []
 ## Waker registration on sockets, for building `Future`s on top of the stack.
 async = []
 ## Automatically reply to ICMP echo requests. Disable to handle echo requests
@@ -33,15 +65,15 @@ rand = "0.8"
 
 [[example]]
 name = "tuntap"
-required-features = ["std", "log"]
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp"]
 
 [[example]]
 name = "tcp_server"
-required-features = ["std", "log"]
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"]
 
 [[example]]
 name = "tcp_client"
-required-features = ["std", "log"]
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

@@ -24,10 +24,12 @@ pub use self::tuntap::TunTapInterface;
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub enum Medium {
     /// Ethernet medium. Devices of this type send and receive Ethernet frames.
+    #[cfg(feature = "medium-ethernet")]
     Ethernet,
 
     /// IP medium. Devices of this type send and receive IP frames, without an
     /// Ethernet header. MAC addresses are not used.
+    #[cfg(feature = "medium-ip")]
     Ip,
 }
 
@@ -38,10 +40,10 @@ pub enum Medium {
 /// they start from [`Default`] and overwrite the fields they care about:
 ///
 /// ```
-/// # use xarxa::iface::{IfaceCapabilities, Medium};
+/// # use xarxa::iface::IfaceCapabilities;
 /// let mut caps = IfaceCapabilities::default();
-/// caps.medium = Medium::Ethernet;
 /// caps.max_transmission_unit = 1514;
+/// // caps.medium = Medium::Ethernet; is the default when `medium-ethernet` is on
 /// ```
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone)]
@@ -60,8 +62,14 @@ pub struct IfaceCapabilities {
 impl Default for IfaceCapabilities {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "medium-ethernet")]
             medium: Medium::Ethernet,
+            #[cfg(not(feature = "medium-ethernet"))]
+            medium: Medium::Ip,
+            #[cfg(feature = "medium-ethernet")]
             max_transmission_unit: 1514,
+            #[cfg(not(feature = "medium-ethernet"))]
+            max_transmission_unit: 1500,
         }
     }
 }

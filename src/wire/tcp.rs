@@ -643,7 +643,7 @@ impl Control {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "proto-ipv4"))]
 mod test {
     use super::*;
     use crate::wire::Ipv4Address;

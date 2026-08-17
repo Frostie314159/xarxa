@@ -1,23 +1,28 @@
 //! The network stack.
 
 use alloc::boxed::Box;
+#[cfg(feature = "socket-tcp")]
 use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
-#[cfg(feature = "icmp-error-handling")]
+#[cfg(all(feature = "icmp-error-handling", any(feature = "socket-udp", feature = "socket-tcp")))]
 use crate::icmp_error::{IcmpError, parse_quoted_packet};
 use crate::iface::{IfaceCapabilities, Interface, Medium};
+#[cfg(feature = "medium-ethernet")]
 use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
+#[cfg(feature = "socket-raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketState};
 use crate::route::Routes;
 use crate::slab::Slab;
+#[cfg(feature = "socket-tcp")]
 use crate::tcp::{
     PollAt, SocketBuffer, TcpHandle, TcpListener, TcpListenerHandle, TcpListenerState, TcpRepr, TcpSocket,
     TcpSocketState,
 };
 use crate::time::Instant;
+#[cfg(feature = "socket-udp")]
 use crate::udp::{UdpHandle, UdpSocket, UdpSocketState};
 use crate::wire::*;
 
@@ -47,14 +52,19 @@ pub struct Stack {
 
 /// The stack's socket storage, one slab per socket type.
 pub(crate) struct Sockets {
+    #[cfg(feature = "socket-udp")]
     pub(crate) udp: Slab<UdpSocketState>,
+    #[cfg(feature = "socket-raw")]
     pub(crate) raw: Slab<RawSocketState>,
+    #[cfg(feature = "socket-tcp")]
     pub(crate) tcp: Slab<TcpSocketState>,
+    #[cfg(feature = "socket-tcp")]
     pub(crate) tcp_listeners: Slab<TcpListenerState>,
 }
 
 /// An interface added to the stack, with its configuration.
 pub(crate) struct IfaceState {
+    #[cfg_attr(not(any(feature = "socket", feature = "medium-ethernet")), allow(dead_code))]
     handle: IfaceHandle,
     dev: Box<dyn Interface>,
     hardware_addr: EthernetAddress,
@@ -63,6 +73,7 @@ pub(crate) struct IfaceState {
 
 /// An interface borrowed from a [`Stack`], returned by [`Stack::iface`].
 pub struct Iface<'a> {
+    #[cfg_attr(not(feature = "medium-ethernet"), allow(dead_code))]
     inner: &'a mut StackInner,
     ifaces: &'a mut Slab<IfaceState>,
     index: usize,
@@ -182,9 +193,12 @@ impl Iface<'_> {
 
     /// Purge state associated to this interface.
     fn invalidate(&mut self) {
-        let handle = IfaceHandle(self.index);
-        self.inner.neighbor_cache.purge_iface(handle);
-        self.inner.pending.purge_iface(handle);
+        #[cfg(feature = "medium-ethernet")]
+        {
+            let handle = IfaceHandle(self.index);
+            self.inner.neighbor_cache.purge_iface(handle);
+            self.inner.pending.purge_iface(handle);
+        }
     }
 }
 
@@ -194,8 +208,11 @@ impl Iface<'_> {
 /// while taking `&mut self`.
 pub(crate) struct StackInner {
     pub(crate) now: Instant,
+    #[cfg_attr(not(any(feature = "socket-udp", feature = "socket-tcp")), allow(dead_code))]
     pub(crate) rand: Rand,
+    #[cfg(feature = "medium-ethernet")]
     neighbor_cache: NeighborCache,
+    #[cfg(feature = "medium-ethernet")]
     pending: PendingQueue,
     routes: Routes,
 }
@@ -205,6 +222,7 @@ pub(crate) struct StackInner {
 /// Sockets hand fully-built L4 packets to [`TxContext::transmit_ip`]. Picking the
 /// egress interface, building the IP header and resolving the neighbor all happen
 /// in here, so socket code doesn't have to care about any of it.
+#[cfg(feature = "socket")]
 pub(crate) struct TxContext<'a> {
     pub(crate) inner: &'a mut StackInner,
     pub(crate) ifaces: &'a mut Slab<IfaceState>,
@@ -220,33 +238,40 @@ pub(crate) struct TxContext<'a> {
 /// twice.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "socket")]
 pub(crate) struct EgressRoute {
     pub(crate) iface: IfaceHandle,
     /// The address to resolve on the link: the destination itself when on-link
     /// (or broadcast/multicast), else the gateway from the routing table.
     pub(crate) next_hop: IpAddress,
     /// The egress interface's IP-layer MTU.
+    #[cfg_attr(not(feature = "socket-tcp"), allow(dead_code))]
     pub(crate) ip_mtu: usize,
 }
 
+#[cfg(feature = "socket")]
 impl TxContext<'_> {
     /// The current time, as last set by [`Stack::poll`].
+    #[cfg(feature = "socket-tcp")]
     pub(crate) fn now(&self) -> Instant {
         self.inner.now
     }
 
     /// The stack's PRNG.
+    #[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
     pub(crate) fn rand(&mut self) -> &mut Rand {
         &mut self.inner.rand
     }
 
     /// Check whether any interface has the given IP address assigned.
+    #[cfg(feature = "socket-tcp")]
     pub(crate) fn has_ip_addr(&self, addr: IpAddress) -> bool {
         self.ifaces.iter().any(|(_, iface)| iface.has_ip_addr(addr))
     }
 
     /// Get a source address for sending to the given destination, selected from the
     /// interface the packet would go out of.
+    #[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
     pub(crate) fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
         let route = self.route(dst_addr)?;
         self.ifaces.get(route.iface.0).get_source_address(dst_addr)
@@ -288,6 +313,7 @@ impl TxContext<'_> {
     ///
     /// `src_addr` and `dst_addr` must belong to the same address family, the packet
     /// is dropped otherwise.
+    #[cfg(feature = "socket-udp")]
     pub(crate) fn transmit_ip(
         &mut self,
         buf: PacketBuf,
@@ -306,6 +332,7 @@ impl TxContext<'_> {
     /// [`transmit_ip`](Self::transmit_ip) for a destination the caller already
     /// routed: transmit on the decided interface, resolving `route.next_hop`
     /// instead of routing again.
+    #[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
     pub(crate) fn transmit_ip_routed(
         &mut self,
         route: &EgressRoute,
@@ -317,14 +344,17 @@ impl TxContext<'_> {
     ) {
         let iface = self.ifaces.get_mut(route.iface.0);
         let ethertype = match (src_addr, dst_addr) {
+            #[cfg(feature = "proto-ipv4")]
             (IpAddress::Ipv4(src), IpAddress::Ipv4(dst)) => {
                 push_ipv4_header(&mut buf, src, dst, next_header, hop_limit);
                 EthernetProtocol::Ipv4
             }
+            #[cfg(feature = "proto-ipv6")]
             (IpAddress::Ipv6(src), IpAddress::Ipv6(dst)) => {
                 push_ipv6_header(&mut buf, src, dst, next_header, hop_limit);
                 EthernetProtocol::Ipv6
             }
+            #[allow(unreachable_patterns)]
             _ => {
                 debug!("cannot transmit, address family mismatch");
                 return;
@@ -338,6 +368,7 @@ impl TxContext<'_> {
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
+    #[cfg(all(feature = "socket-raw", feature = "medium-ethernet"))]
     pub(crate) fn transmit_ethernet_frame(&mut self, iface: IfaceHandle, buf: PacketBuf) {
         let iface = self.ifaces.get_mut(iface.0);
         self.inner.transmit_raw(iface, buf);
@@ -348,6 +379,7 @@ impl TxContext<'_> {
     /// hand the frame to the device.
     ///
     /// Returns `false` if there is no route to the destination.
+    #[cfg(feature = "socket-raw")]
     pub(crate) fn transmit_raw_ip(&mut self, buf: PacketBuf, dst_addr: IpAddress) -> bool {
         let Some(route) = self.route(&dst_addr) else {
             debug!("no route to {}, dropping packet", dst_addr);
@@ -355,7 +387,9 @@ impl TxContext<'_> {
         };
         let iface = self.ifaces.get_mut(route.iface.0);
         let ethertype = match dst_addr {
+            #[cfg(feature = "proto-ipv4")]
             IpAddress::Ipv4(_) => EthernetProtocol::Ipv4,
+            #[cfg(feature = "proto-ipv6")]
             IpAddress::Ipv6(_) => EthernetProtocol::Ipv6,
         };
         self.inner
@@ -368,6 +402,7 @@ impl TxContext<'_> {
 /// candidate sockets: `None` if it does not match, else how specific the filter
 /// that matched it is. No address matches anything (0), an unspecified one
 /// matches its own IP version (1), and a concrete one matches only itself (2).
+#[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
 pub(crate) fn addr_score(filter: &IpListenEndpoint, addr: &IpAddress) -> Option<u8> {
     match filter.addr {
         None => Some(0),
@@ -378,6 +413,7 @@ pub(crate) fn addr_score(filter: &IpListenEndpoint, addr: &IpAddress) -> Option<
 
 /// The bottom of the ephemeral (dynamic) local port range, per IANA. The range
 /// runs to the top of the port space, 65535.
+#[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
 pub(crate) const EPHEMERAL_PORT_MIN: u16 = 49152;
 
 /// Allocate an ephemeral local port: start at a random point in the range and
@@ -385,6 +421,7 @@ pub(crate) const EPHEMERAL_PORT_MIN: u16 = 49152;
 ///
 /// The random start makes local ports hard to predict for off-path attackers
 /// (RFC 6056 §3.3). `None` is returned only when every port in the range is in use.
+#[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
 pub(crate) fn alloc_ephemeral_port(rand: &mut Rand, mut in_use: impl FnMut(u16) -> bool) -> Option<u16> {
     const RANGE: u32 = (u16::MAX - EPHEMERAL_PORT_MIN) as u32 + 1;
     let start = rand.rand_u32() % RANGE;
@@ -394,6 +431,7 @@ pub(crate) fn alloc_ephemeral_port(rand: &mut Rand, mut in_use: impl FnMut(u16) 
 }
 
 /// The result of a neighbor lookup.
+#[cfg(feature = "medium-ethernet")]
 enum NeighborLookup {
     /// The destination hardware address.
     Found(EthernetAddress),
@@ -414,15 +452,21 @@ impl Stack {
             inner: StackInner {
                 now: Instant::ZERO,
                 rand: Rand::new(random_seed),
+                #[cfg(feature = "medium-ethernet")]
                 neighbor_cache: NeighborCache::new(),
+                #[cfg(feature = "medium-ethernet")]
                 pending: PendingQueue::new(),
                 routes: Routes::new(),
             },
             ifaces: Slab::new(),
             sockets: Sockets {
+                #[cfg(feature = "socket-udp")]
                 udp: Slab::new(),
+                #[cfg(feature = "socket-raw")]
                 raw: Slab::new(),
+                #[cfg(feature = "socket-tcp")]
                 tcp: Slab::new(),
+                #[cfg(feature = "socket-tcp")]
                 tcp_listeners: Slab::new(),
             },
         }
@@ -471,8 +515,11 @@ impl Stack {
     /// Panics if the handle is stale (the interface was already removed).
     pub fn remove_iface(&mut self, handle: IfaceHandle) -> Box<dyn Interface> {
         let iface = self.ifaces.remove(handle.0);
-        self.inner.neighbor_cache.purge_iface(handle);
-        self.inner.pending.purge_iface(handle);
+        #[cfg(feature = "medium-ethernet")]
+        {
+            self.inner.neighbor_cache.purge_iface(handle);
+            self.inner.pending.purge_iface(handle);
+        }
         self.inner.routes.purge_iface(handle);
         iface.dev
     }
@@ -488,6 +535,7 @@ impl Stack {
     }
 
     /// Add a UDP socket to the stack, returning a handle to it.
+    #[cfg(feature = "socket-udp")]
     pub fn add_udp_socket(&mut self) -> UdpHandle {
         UdpHandle(self.sockets.udp.add_with(|_| UdpSocketState::new()))
     }
@@ -496,6 +544,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
+    #[cfg(feature = "socket-udp")]
     pub fn remove_udp_socket(&mut self, handle: UdpHandle) {
         self.sockets.udp.remove(handle.0);
     }
@@ -504,6 +553,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
+    #[cfg(feature = "socket-udp")]
     pub fn udp(&mut self, handle: UdpHandle) -> UdpSocket<'_> {
         self.sockets.udp.get(handle.0); // Stale handles panic here, not on first use.
         UdpSocket {
@@ -517,6 +567,7 @@ impl Stack {
     }
 
     /// Add a raw socket to the stack, returning a handle to it.
+    #[cfg(feature = "socket-raw")]
     pub fn add_raw_socket(&mut self) -> RawHandle {
         RawHandle(self.sockets.raw.add_with(|_| RawSocketState::new()))
     }
@@ -525,6 +576,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
+    #[cfg(feature = "socket-raw")]
     pub fn remove_raw_socket(&mut self, handle: RawHandle) {
         self.sockets.raw.remove(handle.0);
     }
@@ -533,6 +585,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
+    #[cfg(feature = "socket-raw")]
     pub fn raw(&mut self, handle: RawHandle) -> RawSocket<'_> {
         RawSocket {
             state: self.sockets.raw.get_mut(handle.0),
@@ -545,6 +598,7 @@ impl Stack {
 
     /// Add a TCP socket to the stack, with the given receive and transmit buffer
     /// capacities, returning a handle to it.
+    #[cfg(feature = "socket-tcp")]
     pub fn add_tcp_socket(&mut self, rx_capacity: usize, tx_capacity: usize) -> TcpHandle {
         TcpHandle(self.sockets.tcp.add_with(|_| {
             TcpSocketState::new(
@@ -561,6 +615,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
+    #[cfg(feature = "socket-tcp")]
     pub fn remove_tcp_socket(&mut self, handle: TcpHandle) {
         self.sockets.tcp.remove(handle.0);
     }
@@ -569,6 +624,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
+    #[cfg(feature = "socket-tcp")]
     pub fn tcp(&mut self, handle: TcpHandle) -> TcpSocket<'_> {
         self.sockets.tcp.get(handle.0); // Stale handles panic here, not on first use.
         TcpSocket {
@@ -582,6 +638,7 @@ impl Stack {
     }
 
     /// Add a TCP listener to the stack, returning a handle to it.
+    #[cfg(feature = "socket-tcp")]
     pub fn add_tcp_listener(&mut self) -> TcpListenerHandle {
         TcpListenerHandle(self.sockets.tcp_listeners.add_with(|_| TcpListenerState::new()))
     }
@@ -590,6 +647,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the listener was already removed).
+    #[cfg(feature = "socket-tcp")]
     pub fn remove_tcp_listener(&mut self, handle: TcpListenerHandle) {
         self.sockets.tcp_listeners.remove(handle.0);
     }
@@ -598,6 +656,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the listener was already removed).
+    #[cfg(feature = "socket-tcp")]
     pub fn tcp_listener(&mut self, handle: TcpListenerHandle) -> TcpListener<'_> {
         self.sockets.tcp_listeners.get(handle.0); // Stale handles panic here, not on first use.
         TcpListener {
@@ -609,7 +668,13 @@ impl Stack {
     }
 
     /// Borrow the stack context for socket egress (used by socket unit tests).
-    #[cfg(test)]
+    #[cfg(all(
+        test,
+        feature = "socket-tcp",
+        feature = "medium-ip",
+        feature = "proto-ipv4",
+        feature = "proto-ipv6"
+    ))]
     pub(crate) fn tx_context(&mut self) -> TxContext<'_> {
         TxContext {
             inner: &mut self.inner,
@@ -629,9 +694,11 @@ impl Stack {
         self.inner.now = timestamp;
 
         // Drop queued packets whose neighbor resolution timed out.
+        #[cfg(feature = "medium-ethernet")]
         self.inner.pending.purge_expired(timestamp);
 
         for (_, iface) in self.ifaces.iter_mut() {
+            #[cfg(feature = "medium-ethernet")]
             self.inner.poll_neighbor_timers(iface, &mut self.sockets);
 
             while let Some(buf) = iface.dev.receive() {
@@ -642,40 +709,48 @@ impl Stack {
         // Drive TCP egress: this both acknowledges what ingress just delivered and
         // advances the TCP timers (retransmissions, delayed ACKs, keep-alives,
         // zero-window probes, ...).
-        let mut cx = TxContext {
-            inner: &mut self.inner,
-            ifaces: &mut self.ifaces,
+        #[cfg(feature = "socket-tcp")]
+        let tcp_poll_at = {
+            let mut cx = TxContext {
+                inner: &mut self.inner,
+                ifaces: &mut self.ifaces,
+            };
+            for (_, socket) in self.sockets.tcp.iter_mut() {
+                crate::tcp::flush(socket, &mut cx);
+            }
+
+            self.sockets
+                .tcp
+                .iter()
+                .filter_map(|(_, socket)| match socket.poll_at() {
+                    PollAt::Now => Some(timestamp),
+                    PollAt::Time(t) => Some(t),
+                    PollAt::Ingress => None,
+                })
         };
-        for (_, socket) in self.sockets.tcp.iter_mut() {
-            crate::tcp::flush(socket, &mut cx);
-        }
+        #[cfg(not(feature = "socket-tcp"))]
+        let tcp_poll_at = core::iter::empty();
 
-        let tcp_poll_at = self
-            .sockets
-            .tcp
-            .iter()
-            .filter_map(|(_, socket)| match socket.poll_at() {
-                PollAt::Now => Some(timestamp),
-                PollAt::Time(t) => Some(t),
-                PollAt::Ingress => None,
-            });
+        #[cfg(feature = "medium-ethernet")]
+        let timers = [self.inner.neighbor_cache.poll_at(), self.inner.pending.poll_at()];
+        #[cfg(not(feature = "medium-ethernet"))]
+        let timers: [Option<Instant>; 0] = [];
 
-        [self.inner.neighbor_cache.poll_at(), self.inner.pending.poll_at()]
-            .into_iter()
-            .flatten()
-            .chain(tcp_poll_at)
-            .min()
+        timers.into_iter().flatten().chain(tcp_poll_at).min()
     }
 }
 
 impl StackInner {
     fn process(&mut self, iface: &mut IfaceState, sockets: &mut Sockets, buf: PacketBuf) {
         match iface.dev.capabilities().medium {
+            #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => self.process_ethernet(iface, sockets, buf),
+            #[cfg(feature = "medium-ip")]
             Medium::Ip => self.process_ip(iface, sockets, buf),
         }
     }
 
+    #[cfg(feature = "medium-ethernet")]
     fn process_ethernet(&mut self, iface: &mut IfaceState, sockets: &mut Sockets, mut buf: PacketBuf) {
         let eth_frame = check!(EthernetFrame::new_checked(&mut buf));
 
@@ -693,36 +768,46 @@ impl StackInner {
         // Offer the whole frame to Ethernet-mode raw sockets. Ethertypes the stack
         // itself processes are copied to the socket, everything else is consumed
         // by it.
-        let stack_wants = matches!(
-            ethertype,
-            EthernetProtocol::Arp | EthernetProtocol::Ipv4 | EthernetProtocol::Ipv6
-        );
-        let Some(mut buf) = self.process_raw_ethernet(iface, &mut sockets.raw, ethertype, stack_wants, buf) else {
+        #[cfg(feature = "socket-raw")]
+        let Some(mut buf) = ({
+            let stack_wants = matches!(
+                ethertype,
+                EthernetProtocol::Arp | EthernetProtocol::Ipv4 | EthernetProtocol::Ipv6
+            );
+            self.process_raw_ethernet(iface, &mut sockets.raw, ethertype, stack_wants, buf)
+        }) else {
             return;
         };
 
         buf.pull_front(ETHERNET_HEADER_LEN);
 
         match ethertype {
+            #[cfg(feature = "proto-ipv4")]
             EthernetProtocol::Arp => self.process_arp(iface, buf),
+            #[cfg(feature = "proto-ipv4")]
             EthernetProtocol::Ipv4 => self.process_ipv4(iface, sockets, Some(src_addr), buf),
+            #[cfg(feature = "proto-ipv6")]
             EthernetProtocol::Ipv6 => self.process_ipv6(iface, sockets, Some(src_addr), buf),
             // Drop all other traffic.
             _ => {}
         }
     }
 
+    #[cfg(feature = "medium-ip")]
     fn process_ip(&mut self, iface: &mut IfaceState, sockets: &mut Sockets, buf: PacketBuf) {
         if buf.is_empty() {
             return;
         }
         match IpVersion::of_packet(&buf) {
+            #[cfg(feature = "proto-ipv4")]
             Ok(IpVersion::Ipv4) => self.process_ipv4(iface, sockets, None, buf),
+            #[cfg(feature = "proto-ipv6")]
             Ok(IpVersion::Ipv6) => self.process_ipv6(iface, sockets, None, buf),
             Err(_) => {}
         }
     }
 
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
     fn process_arp(&mut self, iface: &mut IfaceState, mut buf: PacketBuf) {
         let arp_packet = check!(ArpPacket::new_checked(&mut buf));
 
@@ -787,6 +872,7 @@ impl StackInner {
         }
     }
 
+    #[cfg(feature = "proto-ipv4")]
     fn process_ipv4(
         &mut self,
         iface: &mut IfaceState,
@@ -826,30 +912,39 @@ impl StackInner {
             return;
         }
 
+        #[cfg(feature = "medium-ethernet")]
         if let Some(eth_src) = eth_src
             && iface.is_unicast_v4(dst_addr)
         {
             self.neighbor_cache
                 .reset_expiry_if_existing((iface.handle, IpAddress::Ipv4(src_addr)), eth_src, self.now);
         }
+        #[cfg(not(feature = "medium-ethernet"))]
+        let _ = eth_src;
 
         // Strip any trailing padding added by the link layer.
         buf.set_len(total_len);
 
         // Offer the whole packet to IP-mode raw sockets. Protocols the stack itself
         // processes are copied to the socket, everything else is consumed by it.
-        let stack_wants = matches!(next_header, IpProtocol::Icmp | IpProtocol::Udp | IpProtocol::Tcp);
-        let Some((mut buf, handled_by_raw)) =
+        #[cfg_attr(not(feature = "socket-udp"), allow(unused_variables))]
+        #[cfg(feature = "socket-raw")]
+        let Some((mut buf, handled_by_raw)) = ({
+            let stack_wants = matches!(next_header, IpProtocol::Icmp | IpProtocol::Udp | IpProtocol::Tcp);
             self.process_raw_ip(&mut sockets.raw, IpVersion::Ipv4, next_header, stack_wants, buf)
-        else {
+        }) else {
             return;
         };
+        #[cfg_attr(not(feature = "socket-udp"), allow(unused_variables))]
+        #[cfg(not(feature = "socket-raw"))]
+        let handled_by_raw = false;
 
         // Strip the IP header.
         buf.pull_front(header_len);
 
         match next_header {
             IpProtocol::Icmp => self.process_icmpv4(iface, sockets, src_addr, dst_addr, buf),
+            #[cfg(feature = "socket-udp")]
             IpProtocol::Udp => self.process_udp(
                 iface,
                 &mut sockets.udp,
@@ -859,6 +954,7 @@ impl StackInner {
                 handled_by_raw,
                 buf,
             ),
+            #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => self.process_tcp(
                 iface,
                 &mut sockets.tcp,
@@ -892,6 +988,7 @@ impl StackInner {
     ///
     /// The socket's own transmissions (data, ACKs of received data) are not sent
     /// here. [`Stack::poll`] drives them right after ingress processing.
+    #[cfg(feature = "socket-tcp")]
     fn process_tcp(
         &mut self,
         iface: &mut IfaceState,
@@ -950,6 +1047,7 @@ impl StackInner {
     }
 
     /// Serialize a TCP segment and transmit it on the given interface.
+    #[cfg(feature = "socket-tcp")]
     fn transmit_tcp(
         &mut self,
         iface: &mut IfaceState,
@@ -960,16 +1058,20 @@ impl StackInner {
     ) {
         let buf = crate::tcp::build_tcp_packet(repr, &src_addr, &dst_addr);
         match (src_addr, dst_addr) {
+            #[cfg(feature = "proto-ipv4")]
             (IpAddress::Ipv4(src), IpAddress::Ipv4(dst)) => {
                 self.transmit_ipv4(iface, buf, src, dst, IpProtocol::Tcp, hop_limit)
             }
+            #[cfg(feature = "proto-ipv6")]
             (IpAddress::Ipv6(src), IpAddress::Ipv6(dst)) => {
                 self.transmit_ipv6(iface, buf, src, dst, IpProtocol::Tcp, hop_limit)
             }
+            #[allow(unreachable_patterns)]
             _ => unreachable!(),
         }
     }
 
+    #[cfg(feature = "proto-ipv4")]
     fn process_icmpv4(
         &mut self,
         iface: &mut IfaceState,
@@ -986,7 +1088,7 @@ impl StackInner {
 
         #[cfg(not(feature = "auto-icmp-echo-reply"))]
         let _ = (&iface, src_addr, dst_addr);
-        #[cfg(not(feature = "icmp-error-handling"))]
+        #[cfg(not(all(feature = "icmp-error-handling", any(feature = "socket-udp", feature = "socket-tcp"))))]
         let _ = (&mut icmp_packet, &sockets);
 
         match (icmp_packet.msg_type(), icmp_packet.msg_code()) {
@@ -1029,7 +1131,7 @@ impl StackInner {
             (Icmpv4Message::EchoReply, _) => {}
 
             // Deliver error messages to the socket whose packet provoked them.
-            #[cfg(feature = "icmp-error-handling")]
+            #[cfg(all(feature = "icmp-error-handling", any(feature = "socket-udp", feature = "socket-tcp")))]
             (msg_type, msg_code) if msg_type.is_error() => {
                 if let Some(error) = IcmpError::from_icmpv4(msg_type, msg_code) {
                     self.deliver_icmp_error(sockets, error, icmp_packet.data_mut());
@@ -1048,7 +1150,7 @@ impl StackInner {
     /// match wins). TCP demux is by exact 4-tuple, and the socket additionally
     /// validates the quoted sequence number against its send window, so blindly
     /// spoofed errors cannot reset connections (RFC 5927).
-    #[cfg(feature = "icmp-error-handling")]
+    #[cfg(all(feature = "icmp-error-handling", any(feature = "socket-udp", feature = "socket-tcp")))]
     fn deliver_icmp_error(&mut self, sockets: &mut Sockets, error: IcmpError, quote: &mut [u8]) {
         let Some(quoted) = parse_quoted_packet(quote) else {
             trace!("icmp error: quote too short to identify a flow, ignoring");
@@ -1057,12 +1159,15 @@ impl StackInner {
         let local = IpEndpoint::new(quoted.src_addr, quoted.src_port);
         let remote = IpEndpoint::new(quoted.dst_addr, quoted.dst_port);
         match quoted.protocol {
+            #[cfg(feature = "socket-udp")]
             IpProtocol::Udp => crate::udp::process_icmp_error(&mut sockets.udp, error, local, remote),
+            #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => crate::tcp::process_icmp_error(&mut sockets.tcp, error, local, remote, quoted.tcp_seq),
             _ => {}
         }
     }
 
+    #[cfg(feature = "proto-ipv6")]
     fn process_ipv6(
         &mut self,
         iface: &mut IfaceState,
@@ -1093,6 +1198,7 @@ impl StackInner {
             return;
         }
 
+        #[cfg(feature = "medium-ethernet")]
         if let Some(eth_src) = eth_src
             && dst_addr.x_is_unicast()
         {
@@ -1135,18 +1241,24 @@ impl StackInner {
 
         // Offer the whole packet to IP-mode raw sockets. Protocols the stack itself
         // processes are copied to the socket, everything else is consumed by it.
-        let stack_wants = matches!(next_header, IpProtocol::Icmpv6 | IpProtocol::Udp | IpProtocol::Tcp);
-        let Some((mut buf, handled_by_raw)) =
+        #[cfg_attr(not(feature = "socket-udp"), allow(unused_variables))]
+        #[cfg(feature = "socket-raw")]
+        let Some((mut buf, handled_by_raw)) = ({
+            let stack_wants = matches!(next_header, IpProtocol::Icmpv6 | IpProtocol::Udp | IpProtocol::Tcp);
             self.process_raw_ip(&mut sockets.raw, IpVersion::Ipv6, next_header, stack_wants, buf)
-        else {
+        }) else {
             return;
         };
+        #[cfg_attr(not(feature = "socket-udp"), allow(unused_variables))]
+        #[cfg(not(feature = "socket-raw"))]
+        let handled_by_raw = false;
 
         // Strip the IP header (and any extension headers).
         buf.pull_front(l4_offset);
 
         match next_header {
             IpProtocol::Icmpv6 => self.process_icmpv6(iface, sockets, eth_src, src_addr, dst_addr, hop_limit, buf),
+            #[cfg(feature = "socket-udp")]
             IpProtocol::Udp => self.process_udp(
                 iface,
                 &mut sockets.udp,
@@ -1156,6 +1268,7 @@ impl StackInner {
                 handled_by_raw,
                 buf,
             ),
+            #[cfg(feature = "socket-tcp")]
             IpProtocol::Tcp => self.process_tcp(
                 iface,
                 &mut sockets.tcp,
@@ -1183,6 +1296,7 @@ impl StackInner {
         }
     }
 
+    #[cfg(feature = "proto-ipv6")]
     fn process_icmpv6(
         &mut self,
         iface: &mut IfaceState,
@@ -1193,14 +1307,19 @@ impl StackInner {
         hop_limit: u8,
         mut buf: PacketBuf,
     ) {
+        #[cfg(not(all(feature = "medium-ethernet", feature = "proto-ipv6")))]
+        let _ = (eth_src, hop_limit);
+        #[cfg(not(feature = "auto-icmp-echo-reply"))]
+        let _ = &iface;
+
         let mut icmp_packet = check!(Icmpv6Packet::new_checked(&mut buf));
         if !icmp_packet.verify_checksum(&src_addr, &dst_addr) {
             trace!("icmpv6: checksum incorrect");
             return;
         }
 
-        #[cfg(not(feature = "icmp-error-handling"))]
-        let _ = &sockets;
+        #[cfg(not(all(feature = "icmp-error-handling", any(feature = "socket-udp", feature = "socket-tcp"))))]
+        let _ = (&mut icmp_packet, &sockets);
 
         match icmp_packet.msg_type() {
             // Respond to echo requests.
@@ -1231,7 +1350,7 @@ impl StackInner {
             Icmpv6Message::EchoReply => {}
 
             // Deliver error messages to the socket whose packet provoked them.
-            #[cfg(feature = "icmp-error-handling")]
+            #[cfg(all(feature = "icmp-error-handling", any(feature = "socket-udp", feature = "socket-tcp")))]
             msg_type if msg_type.is_error() => {
                 if let Some(error) = IcmpError::from_icmpv6(msg_type, icmp_packet.msg_code()) {
                     self.deliver_icmp_error(sockets, error, icmp_packet.payload_mut());
@@ -1240,10 +1359,12 @@ impl StackInner {
 
             // NDISC is only processed if the packet arrived with the un-decremented
             // hop limit, and only on Ethernet mediums.
+            #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
             Icmpv6Message::NeighborSolicit if hop_limit == 0xff && eth_src.is_some() => {
                 self.process_ndisc_solicit(iface, src_addr, dst_addr, &mut icmp_packet)
             }
 
+            #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
             Icmpv6Message::NeighborAdvert if hop_limit == 0xff && eth_src.is_some() => {
                 self.process_ndisc_advert(iface, src_addr, &mut icmp_packet)
             }
@@ -1252,6 +1373,7 @@ impl StackInner {
         }
     }
 
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
     fn process_ndisc_solicit(
         &mut self,
         iface: &mut IfaceState,
@@ -1299,6 +1421,7 @@ impl StackInner {
         }
     }
 
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
     fn process_ndisc_advert(
         &mut self,
         iface: &mut IfaceState,
@@ -1330,6 +1453,7 @@ impl StackInner {
     /// Advance the solicitation retransmission timers of the neighbors being resolved
     /// on this interface, retransmitting solicitations and failing resolutions that
     /// exhausted their probes.
+    #[cfg(feature = "medium-ethernet")]
     fn poll_neighbor_timers(&mut self, iface: &mut IfaceState, sockets: &mut Sockets) {
         #[cfg(not(feature = "icmp-error-handling"))]
         let _ = &sockets;
@@ -1363,9 +1487,10 @@ impl StackInner {
     /// where the erring TCP/UDP socket, or a raw-socket ping application,
     /// receives it, rather than transmitted to the wire. `orig` is the queued
     /// packet, a whole IP frame.
-    #[cfg(feature = "icmp-error-handling")]
+    #[cfg(all(feature = "medium-ethernet", feature = "icmp-error-handling"))]
     fn deliver_neighbor_failure_error(&mut self, iface: &mut IfaceState, sockets: &mut Sockets, mut orig: PacketBuf) {
         match IpVersion::of_packet(&orig) {
+            #[cfg(feature = "proto-ipv4")]
             Ok(IpVersion::Ipv4) => {
                 let (src_addr, header_len, next_header) = {
                     let packet = Ipv4Packet::new_unchecked(&mut orig);
@@ -1391,6 +1516,7 @@ impl StackInner {
                 push_ipv4_header(&mut reply, reply_src, src_addr, IpProtocol::Icmp, 64);
                 self.process_ipv4(iface, sockets, None, reply);
             }
+            #[cfg(feature = "proto-ipv6")]
             Ok(IpVersion::Ipv6) => {
                 let (src_addr, next_header) = {
                     let packet = Ipv6Packet::new_unchecked(&mut orig);
@@ -1424,15 +1550,19 @@ impl StackInner {
     }
 
     /// Send a solicitation (ARP request / NDISC neighbor solicit) for the given address.
+    #[cfg(feature = "medium-ethernet")]
     fn solicit_neighbor(&mut self, iface: &mut IfaceState, addr: IpAddress) {
         match addr {
+            #[cfg(feature = "proto-ipv4")]
             IpAddress::Ipv4(addr) => self.transmit_arp_request(iface, addr),
+            #[cfg(feature = "proto-ipv6")]
             IpAddress::Ipv6(addr) => self.transmit_ndisc_solicit(iface, addr),
         }
     }
 
     /// Fill the neighbor cache, and flush any packets that were queued waiting for
     /// this neighbor to resolve.
+    #[cfg(feature = "medium-ethernet")]
     fn fill_neighbor(&mut self, iface: &mut IfaceState, addr: IpAddress, hardware_addr: EthernetAddress) {
         let key = (iface.handle, addr);
         self.neighbor_cache.fill(key, hardware_addr, self.now);
@@ -1440,7 +1570,9 @@ impl StackInner {
         for packet in self.pending.take_matching(&key) {
             trace!("neighbor: {} resolved, flushing queued packet", addr);
             let ethertype = match packet.key.1 {
+                #[cfg(feature = "proto-ipv4")]
                 IpAddress::Ipv4(_) => EthernetProtocol::Ipv4,
+                #[cfg(feature = "proto-ipv6")]
                 IpAddress::Ipv6(_) => EthernetProtocol::Ipv6,
             };
             self.transmit_ethernet(iface, hardware_addr, packet.buf, ethertype);
@@ -1452,6 +1584,7 @@ impl StackInner {
     ///
     /// `next_hop` is the pre-routed address to resolve, if the caller already made
     /// the routing decision. `None` routes here.
+    #[cfg(feature = "medium-ethernet")]
     fn lookup_hardware_addr(
         &mut self,
         iface: &mut IfaceState,
@@ -1464,10 +1597,12 @@ impl StackInner {
 
         if dst_addr.is_multicast() {
             let hardware_addr = match *dst_addr {
+                #[cfg(feature = "proto-ipv4")]
                 IpAddress::Ipv4(addr) => {
                     let b = addr.octets();
                     EthernetAddress::from_bytes(&[0x01, 0x00, 0x5e, b[1] & 0x7F, b[2], b[3]])
                 }
+                #[cfg(feature = "proto-ipv6")]
                 IpAddress::Ipv6(addr) => {
                     let b = addr.octets();
                     EthernetAddress::from_bytes(&[0x33, 0x33, b[12], b[13], b[14], b[15]])
@@ -1501,6 +1636,7 @@ impl StackInner {
         NeighborLookup::Pending { next_hop }
     }
 
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
     fn transmit_arp_request(&mut self, iface: &mut IfaceState, target_addr: Ipv4Address) {
         let Some(source_protocol_addr) = iface.get_source_address_ipv4(&target_addr) else {
             debug!("arp: no source address for request");
@@ -1525,6 +1661,7 @@ impl StackInner {
         self.transmit_ethernet(iface, EthernetAddress::BROADCAST, buf, EthernetProtocol::Arp);
     }
 
+    #[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
     fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState, target_addr: Ipv6Address) {
         let src_addr = iface.get_source_address_ipv6(&target_addr);
         let dst_addr = target_addr.solicited_node();
@@ -1559,6 +1696,7 @@ impl StackInner {
     /// Errors are only sent when both the source and the destination of the
     /// offending packet are unicast (RFC 1122 §3.2.2): none about broadcast or
     /// multicast traffic, and none to non-unicast senders.
+    #[cfg(feature = "proto-ipv4")]
     pub(crate) fn transmit_icmpv4_error(
         &mut self,
         iface: &mut IfaceState,
@@ -1583,6 +1721,7 @@ impl StackInner {
     /// Errors are never sent to non-unicast sources, nor about multicast-destined
     /// packets (RFC 4443 §2.4). The exception is an unrecognized hop-by-hop option
     /// whose type demands the error even then (`allow_multicast_dst`).
+    #[cfg(feature = "proto-ipv6")]
     pub(crate) fn transmit_icmpv6_error(
         &mut self,
         iface: &mut IfaceState,
@@ -1611,6 +1750,7 @@ impl StackInner {
         self.transmit_ipv6(iface, reply, reply_src, src_addr, IpProtocol::Icmpv6, 64);
     }
 
+    #[cfg(feature = "proto-ipv4")]
     fn transmit_ipv4(
         &mut self,
         iface: &mut IfaceState,
@@ -1624,6 +1764,7 @@ impl StackInner {
         self.transmit_ip_frame(iface, IpAddress::Ipv4(dst_addr), None, buf, EthernetProtocol::Ipv4);
     }
 
+    #[cfg(feature = "proto-ipv6")]
     fn transmit_ipv6(
         &mut self,
         iface: &mut IfaceState,
@@ -1654,8 +1795,13 @@ impl StackInner {
         buf: PacketBuf,
         ethertype: EthernetProtocol,
     ) {
+        #[cfg(not(feature = "medium-ethernet"))]
+        let _ = (dst_addr, next_hop, ethertype);
+
         match iface.dev.capabilities().medium {
+            #[cfg(feature = "medium-ip")]
             Medium::Ip => self.transmit_raw(iface, buf),
+            #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => match self.lookup_hardware_addr(iface, &dst_addr, next_hop) {
                 NeighborLookup::Found(hardware_addr) => self.transmit_ethernet(iface, hardware_addr, buf, ethertype),
                 NeighborLookup::Pending { next_hop } => {
@@ -1669,6 +1815,7 @@ impl StackInner {
         }
     }
 
+    #[cfg(feature = "medium-ethernet")]
     fn transmit_ethernet(
         &mut self,
         iface: &mut IfaceState,
@@ -1694,6 +1841,7 @@ impl StackInner {
     ///
     /// On-link destinations resolve to themselves. Off-link destinations resolve to a
     /// router from the routing table, but only if the route goes out this interface.
+    #[cfg(feature = "medium-ethernet")]
     fn route(&self, iface: &IfaceState, addr: &IpAddress) -> Option<IpAddress> {
         if iface.in_same_network(addr) {
             Some(*addr)
@@ -1707,6 +1855,7 @@ impl StackInner {
 }
 
 /// Prepend an IPv4 header to a fully-built L4 payload.
+#[cfg(feature = "proto-ipv4")]
 fn push_ipv4_header(
     buf: &mut PacketBuf,
     src_addr: Ipv4Address,
@@ -1735,6 +1884,7 @@ fn push_ipv4_header(
 }
 
 /// Prepend an IPv6 header to a fully-built L4 payload.
+#[cfg(feature = "proto-ipv6")]
 fn push_ipv6_header(
     buf: &mut PacketBuf,
     src_addr: Ipv6Address,
@@ -1761,6 +1911,7 @@ const ICMP_ERROR_HEADER_LEN: usize = 8;
 
 /// Build an ICMPv4 error message, quoting as much of `orig` (a whole IP packet)
 /// as fits within the minimum MTU (RFC 1812 §4.3.2.3).
+#[cfg(feature = "proto-ipv4")]
 fn build_icmpv4_error(orig: &[u8], msg_type: Icmpv4Message, msg_code: u8) -> PacketBuf {
     let quote_len = orig.len().min(IPV4_MIN_MTU - IPV4_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
     let mut reply = PacketBuf::new();
@@ -1781,6 +1932,7 @@ fn build_icmpv4_error(orig: &[u8], msg_type: Icmpv4Message, msg_code: u8) -> Pac
 /// as fits within the minimum MTU (RFC 4443 §2.4). `src_addr` and `dst_addr` are
 /// the addresses the error will be sent between, for the checksum. `pointer` is
 /// written for parameter problem messages.
+#[cfg(feature = "proto-ipv6")]
 fn build_icmpv6_error(
     orig: &[u8],
     src_addr: &Ipv6Address,
@@ -1809,6 +1961,7 @@ fn build_icmpv6_error(
 }
 
 /// The outcome of processing a hop-by-hop options header.
+#[cfg(feature = "proto-ipv6")]
 enum HopByHopAction {
     /// All options accepted, continue at the upper-layer header.
     Continue { next_header: IpProtocol, ext_len: usize },
@@ -1823,6 +1976,7 @@ enum HopByHopAction {
 ///
 /// Recognized options (padding, router alert) are skipped. Unrecognized ones are
 /// acted on per the two high bits of their type (RFC 8200 §4.2).
+#[cfg(feature = "proto-ipv6")]
 fn process_hop_by_hop(payload: &[u8]) -> crate::wire::Result<HopByHopAction> {
     let ext = Ipv6ExtHeader::new_checked(payload)?;
     for option in Ipv6OptionsIter::new(ext.data()) {
@@ -1860,11 +2014,13 @@ fn process_hop_by_hop(payload: &[u8]) -> crate::wire::Result<HopByHopAction> {
 
 impl IfaceState {
     /// The handle this interface is identified by in the stack.
+    #[cfg(all(feature = "socket-raw", feature = "medium-ethernet"))]
     pub(crate) fn handle(&self) -> IfaceHandle {
         self.handle
     }
 
     /// The interface's medium.
+    #[cfg(all(feature = "socket-raw", feature = "medium-ethernet"))]
     pub(crate) fn medium(&self) -> Medium {
         self.dev.capabilities().medium
     }
@@ -1875,7 +2031,9 @@ impl IfaceState {
     pub(crate) fn ip_mtu(&self) -> usize {
         let caps = self.dev.capabilities();
         let mtu = match caps.medium {
+            #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => caps.max_transmission_unit - ETHERNET_HEADER_LEN,
+            #[cfg(feature = "medium-ip")]
             Medium::Ip => caps.max_transmission_unit,
         };
         mtu.min(PACKET_BUF_SIZE - ETHERNET_HEADER_LEN)
@@ -1886,15 +2044,17 @@ impl IfaceState {
         self.ip_addrs.iter().any(|probe| probe.address() == addr)
     }
 
+    #[cfg(any(feature = "socket", feature = "medium-ethernet"))]
     fn in_same_network(&self, addr: &IpAddress) -> bool {
         self.ip_addrs.iter().any(|cidr| cidr.contains_addr(addr))
     }
 
     /// Get the first IPv4 address of the interface.
-    #[cfg(feature = "auto-icmp-echo-reply")]
+    #[cfg(all(feature = "proto-ipv4", feature = "auto-icmp-echo-reply"))]
     fn ipv4_addr(&self) -> Option<Ipv4Address> {
         self.ip_addrs.iter().find_map(|addr| match *addr {
             IpCidr::Ipv4(cidr) => Some(cidr.address()),
+            #[allow(unreachable_patterns)]
             _ => None,
         })
     }
@@ -1904,9 +2064,14 @@ impl IfaceState {
     /// This function tries to find the first IPv4 address from the interface
     /// that is in the same subnet as the destination address. If no such
     /// address is found, the first IPv4 address from the interface is returned.
+    #[cfg(all(
+        feature = "proto-ipv4",
+        any(feature = "medium-ethernet", feature = "socket-udp", feature = "socket-tcp")
+    ))]
     fn get_source_address_ipv4(&self, dst_addr: &Ipv4Address) -> Option<Ipv4Address> {
         let mut first_ipv4 = None;
         for cidr in self.ip_addrs.iter() {
+            #[allow(irrefutable_let_patterns)]
             if let IpCidr::Ipv4(cidr) = cidr {
                 // Return immediately if we find an address in the same subnet
                 if cidr.contains_addr(dst_addr) {
@@ -1923,24 +2088,31 @@ impl IfaceState {
     }
 
     /// Get a source address for the given destination address.
+    #[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
     fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
         match dst_addr {
+            #[cfg(feature = "proto-ipv4")]
             IpAddress::Ipv4(addr) => self.get_source_address_ipv4(addr).map(IpAddress::Ipv4),
+            #[cfg(feature = "proto-ipv6")]
             IpAddress::Ipv6(addr) => Some(IpAddress::Ipv6(self.get_source_address_ipv6(addr))),
         }
     }
 
     /// Checks if an address is broadcast, taking into account ipv4 subnet-local
     /// broadcast addresses.
+    #[cfg(any(feature = "medium-ethernet", feature = "socket-udp"))]
     pub(crate) fn is_broadcast(&self, address: &IpAddress) -> bool {
         match address {
+            #[cfg(feature = "proto-ipv4")]
             IpAddress::Ipv4(address) => self.is_broadcast_v4(*address),
+            #[cfg(feature = "proto-ipv6")]
             IpAddress::Ipv6(_) => false,
         }
     }
 
     /// Checks if an address is broadcast, taking into account ipv4 subnet-local
     /// broadcast addresses.
+    #[cfg(feature = "proto-ipv4")]
     fn is_broadcast_v4(&self, address: Ipv4Address) -> bool {
         if address.is_broadcast() {
             return true;
@@ -1950,12 +2122,14 @@ impl IfaceState {
             .iter()
             .filter_map(|own_cidr| match own_cidr {
                 IpCidr::Ipv4(own_ip) => Some(own_ip.broadcast()?),
+                #[cfg(feature = "proto-ipv6")]
                 IpCidr::Ipv6(_) => None,
             })
             .any(|broadcast_address| address == broadcast_address)
     }
 
     /// Checks if an ipv4 address is unicast, taking into account subnet broadcast addresses
+    #[cfg(feature = "proto-ipv4")]
     fn is_unicast_v4(&self, address: Ipv4Address) -> bool {
         address.x_is_unicast() && !self.is_broadcast_v4(address)
     }
@@ -1965,6 +2139,7 @@ impl IfaceState {
     /// See [RFC 4291 § 2.7.1] for more details.
     ///
     /// [RFC 4291 § 2.7.1]: https://tools.ietf.org/html/rfc4291#section-2.7.1
+    #[cfg(feature = "proto-ipv6")]
     fn has_solicited_node(&self, addr: Ipv6Address) -> bool {
         self.ip_addrs.iter().any(|cidr| {
             match *cidr {
@@ -1982,6 +2157,7 @@ impl IfaceState {
     ///
     /// The stack implicitly joins the all-nodes multicast group and the solicited
     /// node multicast group of each of its addresses.
+    #[cfg(feature = "proto-ipv6")]
     fn has_multicast_group(&self, addr: Ipv6Address) -> bool {
         addr == IPV6_LINK_LOCAL_ALL_NODES || self.has_solicited_node(addr)
     }
@@ -1991,6 +2167,7 @@ impl IfaceState {
     ///
     /// # Panics
     /// This function panics if the destination address is unspecified.
+    #[cfg(feature = "proto-ipv6")]
     fn get_source_address_ipv6(&self, dst_addr: &Ipv6Address) -> Ipv6Address {
         assert!(!dst_addr.is_unspecified());
 
@@ -2048,12 +2225,14 @@ impl IfaceState {
             .ip_addrs
             .iter()
             .find_map(|a| match a {
+                #[cfg(feature = "proto-ipv4")]
                 IpCidr::Ipv4(_) => None,
                 IpCidr::Ipv6(a) => Some(a),
             })
             .unwrap(); // NOTE: we check above that there is at least one IPv6 address.
 
         for addr in self.ip_addrs.iter().filter_map(|a| match a {
+            #[cfg(feature = "proto-ipv4")]
             IpCidr::Ipv4(_) => None,
             IpCidr::Ipv6(a) => Some(a),
         }) {
@@ -2093,6 +2272,7 @@ impl IfaceState {
 
 /// Scan the NDISC options of a neighbor solicitation/advertisement for the (source or
 /// target) link-layer address option.
+#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
 fn ndisc_lladdr_option(
     icmp_packet: &mut Icmpv6Packet<'_>,
     option_type: NdiscOptionType,
@@ -2115,7 +2295,16 @@ fn ndisc_lladdr_option(
     Ok(lladdr)
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "medium-ethernet",
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "proto-ipv6",
+    feature = "socket-raw",
+    feature = "socket-udp",
+    feature = "socket-tcp"
+))]
 mod test {
     use std::cell::RefCell;
     use std::collections::VecDeque;

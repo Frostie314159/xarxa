@@ -13,14 +13,21 @@ use alloc::collections::VecDeque;
 use core::fmt;
 
 use crate::buf::PacketBuf;
+#[cfg(feature = "medium-ethernet")]
 use crate::iface::Medium;
 use crate::slab::Slab;
-use crate::stack::{IfaceHandle, IfaceState, StackInner, TxContext};
+#[cfg(feature = "medium-ethernet")]
+use crate::stack::{IfaceHandle, IfaceState};
+use crate::stack::{StackInner, TxContext};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
-use crate::wire::{
-    ETHERNET_HEADER_LEN, EthernetFrame, EthernetProtocol, IpAddress, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet,
-};
+#[cfg(feature = "proto-ipv4")]
+use crate::wire::Ipv4Packet;
+#[cfg(feature = "proto-ipv6")]
+use crate::wire::Ipv6Packet;
+use crate::wire::{ETHERNET_HEADER_LEN, IpAddress, IpProtocol, IpVersion};
+#[cfg(feature = "medium-ethernet")]
+use crate::wire::{EthernetFrame, EthernetProtocol};
 
 /// A handle to a raw socket added to a [`Stack`].
 ///
@@ -34,6 +41,7 @@ pub struct RawHandle(pub(crate) usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawMode {
     /// Send and receive whole Ethernet frames on one interface.
+    #[cfg(feature = "medium-ethernet")]
     Ethernet {
         /// The interface the socket sends and receives on. Its medium must be
         /// [`Medium::Ethernet`].
@@ -60,6 +68,7 @@ pub enum BindError {
     /// The socket is already bound.
     InvalidState,
     /// The interface of an Ethernet-mode bind is not an Ethernet-medium interface.
+    #[cfg(feature = "medium-ethernet")]
     InvalidMedium,
 }
 
@@ -67,6 +76,7 @@ impl fmt::Display for BindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BindError::InvalidState => write!(f, "invalid state"),
+            #[cfg(feature = "medium-ethernet")]
             BindError::InvalidMedium => write!(f, "invalid medium"),
         }
     }
@@ -172,10 +182,12 @@ fn parse_ip_headers(buf: &mut [u8]) -> Option<(IpAddress, IpProtocol)> {
         return None;
     }
     match IpVersion::of_packet(buf).ok()? {
+        #[cfg(feature = "proto-ipv4")]
         IpVersion::Ipv4 => {
             let packet = Ipv4Packet::new_checked(buf).ok()?;
             Some((packet.dst_addr().into(), packet.next_header()))
         }
+        #[cfg(feature = "proto-ipv6")]
         IpVersion::Ipv6 => {
             let packet = Ipv6Packet::new_checked(buf).ok()?;
             Some((packet.dst_addr().into(), packet.next_header()))
@@ -212,6 +224,7 @@ impl RawSocket<'_> {
         if self.is_open() {
             return Err(BindError::InvalidState);
         }
+        #[cfg(feature = "medium-ethernet")]
         if let RawMode::Ethernet { iface, .. } = mode
             && self.tx.ifaces.get(iface.0).medium() != Medium::Ethernet
         {
@@ -389,6 +402,7 @@ impl RawSocket<'_> {
         // Ethernet frames go out as-is. IP packets get an Ethernet header prepended
         // on Ethernet mediums, so they need headroom for it.
         let headroom = match mode {
+            #[cfg(feature = "medium-ethernet")]
             RawMode::Ethernet { .. } => 0,
             RawMode::Ip { .. } => ETHERNET_HEADER_LEN,
         };
@@ -404,6 +418,7 @@ impl RawSocket<'_> {
         buf.set_len(size);
 
         match mode {
+            #[cfg(feature = "medium-ethernet")]
             RawMode::Ethernet { iface, ethertype } => {
                 {
                     let Ok(frame) = EthernetFrame::new_checked(&mut buf) else {
@@ -443,6 +458,7 @@ impl StackInner {
     /// (the stack itself processes this ethertype), the socket receives a copy and
     /// the original is returned for further processing. Otherwise the socket takes
     /// the buffer zero-copy and `None` is returned.
+    #[cfg(feature = "medium-ethernet")]
     pub(crate) fn process_raw_ethernet(
         &mut self,
         iface: &IfaceState,
@@ -459,6 +475,7 @@ impl StackInner {
             else {
                 continue;
             };
+            #[allow(unreachable_patterns)]
             if bound_iface != iface.handle() {
                 continue;
             }
@@ -525,7 +542,13 @@ impl StackInner {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "medium-ethernet",
+    feature = "medium-ip",
+    feature = "proto-ipv4",
+    feature = "proto-ipv6"
+))]
 mod test {
     use std::cell::RefCell;
     use std::rc::Rc;

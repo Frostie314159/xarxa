@@ -54,6 +54,7 @@ impl<T> Slab<T> {
     }
 
     /// Iterate over all occupied slots, with their indexes.
+    #[cfg(feature = "socket")]
     pub fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
         self.slots
             .iter()

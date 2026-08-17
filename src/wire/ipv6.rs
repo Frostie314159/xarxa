@@ -95,6 +95,7 @@ pub(crate) trait AddressExt {
     /// # Panics
     /// This function panics if the given address is not
     /// unicast.
+    #[cfg(feature = "medium-ethernet")]
     fn solicited_node(&self) -> Address;
 
     /// Return the scope of the address.
@@ -140,6 +141,7 @@ impl AddressExt for Address {
         bytes
     }
 
+    #[cfg(feature = "medium-ethernet")]
     fn solicited_node(&self) -> Address {
         assert!(self.x_is_unicast());
         let o = self.octets();

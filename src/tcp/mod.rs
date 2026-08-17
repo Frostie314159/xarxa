@@ -16,9 +16,13 @@ use crate::stack::{EgressRoute, TxContext, alloc_ephemeral_port};
 use crate::time::{Duration, Instant};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
+#[cfg(feature = "proto-ipv4")]
+use crate::wire::IPV4_HEADER_LEN;
+#[cfg(feature = "proto-ipv6")]
+use crate::wire::IPV6_HEADER_LEN;
 use crate::wire::{
-    ETHERNET_HEADER_LEN, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol,
-    TCP_HEADER_LEN, TcpControl, TcpPacket, TcpSeqNumber,
+    ETHERNET_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, TCP_HEADER_LEN, TcpControl, TcpPacket,
+    TcpSeqNumber,
 };
 
 mod assembler;
@@ -1533,7 +1537,9 @@ impl TcpSocketState {
         }
 
         let ip_header_len = match self.tuple.unwrap().local.addr {
+            #[cfg(feature = "proto-ipv4")]
             IpAddress::Ipv4(_) => crate::wire::IPV4_HEADER_LEN,
+            #[cfg(feature = "proto-ipv6")]
             IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
         };
 
@@ -1766,7 +1772,9 @@ impl TcpSocketState {
         // The hop limit, and the IP header length that feeds the MSS calculation.
         let hop_limit = self.hop_limit.unwrap_or(64);
         let ip_header_len = match tuple.local.addr {
+            #[cfg(feature = "proto-ipv4")]
             IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
+            #[cfg(feature = "proto-ipv6")]
             IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
         };
 
@@ -2057,7 +2065,9 @@ impl TcpSocketState {
 /// headroom reserved for the IP and Ethernet headers below it.
 pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_addr: &IpAddress) -> PacketBuf {
     let ip_header_len = match dst_addr {
+        #[cfg(feature = "proto-ipv4")]
         IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
+        #[cfg(feature = "proto-ipv6")]
         IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
     };
     let mut buf = PacketBuf::new();
@@ -2786,7 +2796,7 @@ impl fmt::Write for TcpSocket<'_> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "medium-ip", feature = "proto-ipv4", feature = "proto-ipv6"))]
 mod test {
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface, Medium};
@@ -9642,7 +9652,7 @@ mod test {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "medium-ip", feature = "proto-ipv4"))]
 mod stack_test {
     //! Stack-level tests: TCP segments travelling through the full ingress
     //! (`Stack::poll`) and egress paths, IP headers and checksums

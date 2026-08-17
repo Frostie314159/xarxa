@@ -101,7 +101,10 @@ impl<'a> Packet<'a> {
         }
 
         if self.checksum() == 0 {
+            #[cfg(feature = "proto-ipv4")]
             return matches!(src_addr, IpAddress::Ipv4(_));
+            #[cfg(not(feature = "proto-ipv4"))]
+            return false;
         }
 
         checksum::combine(&[
@@ -170,7 +173,7 @@ impl<'a> AsRef<[u8]> for Packet<'a> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "proto-ipv4", feature = "proto-ipv6"))]
 mod test {
     use super::*;
     use crate::wire::{Ipv4Address, Ipv6Address};

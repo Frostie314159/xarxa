@@ -4,10 +4,12 @@
 //! - Source ports for TCP and UDP.
 //! - TCP initial sequence numbers.
 
-// In test builds the TCP initial sequence number is a fixed value, leaving the
-// PRNG unused.
-#![cfg_attr(test, allow(dead_code))]
-
+// In test builds the TCP initial sequence number is a fixed value, and without
+// sockets nothing needs random numbers at all, leaving the PRNG unused.
+#![cfg_attr(
+    any(test, not(any(feature = "socket-udp", feature = "socket-tcp"))),
+    allow(dead_code)
+)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
 pub(crate) struct Rand {

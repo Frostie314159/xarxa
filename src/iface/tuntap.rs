@@ -5,6 +5,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::buf::PacketBuf;
 use crate::iface::{IfaceCapabilities, Interface, Medium};
+#[cfg(feature = "medium-ethernet")]
 use crate::wire::ETHERNET_HEADER_LEN;
 
 const SIOCGIFMTU: libc::c_ulong = 0x8921;
@@ -25,7 +26,9 @@ const TUNSETIFF: libc::c_ulong = if cfg!(any(
 } else {
     0x400454CA
 };
+#[cfg(feature = "medium-ip")]
 const IFF_TUN: libc::c_int = 0x0001;
+#[cfg(feature = "medium-ethernet")]
 const IFF_TAP: libc::c_int = 0x0002;
 const IFF_NO_PI: libc::c_int = 0x1000;
 
@@ -106,7 +109,9 @@ impl TunTapInterface {
 
     fn attach_interface_ifreq(lower: libc::c_int, medium: Medium, ifr: &mut ifreq) -> io::Result<()> {
         let mode = match medium {
+            #[cfg(feature = "medium-ip")]
             Medium::Ip => IFF_TUN,
+            #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => IFF_TAP,
         };
         ifr.ifr_data = mode | IFF_NO_PI;
@@ -134,7 +139,9 @@ impl TunTapInterface {
         // SIOCGIFMTU returns the IP MTU (typically 1500 bytes.)
         // xarxa counts the entire Ethernet packet in the MTU, so add the Ethernet header size to it.
         let mtu = match medium {
+            #[cfg(feature = "medium-ip")]
             Medium::Ip => ip_mtu,
+            #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => ip_mtu + ETHERNET_HEADER_LEN,
         };
 
