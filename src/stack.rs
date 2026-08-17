@@ -1113,7 +1113,7 @@ impl StackInner {
                 };
 
                 let mut reply = PacketBuf::new();
-                reply.reserve(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN);
+                reply.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
                 reply.set_len(icmp_packet.header_len() + icmp_packet.data().len());
                 {
                     let mut reply_icmp = Icmpv4Packet::new_unchecked(&mut reply);
@@ -1332,7 +1332,7 @@ impl StackInner {
                 };
 
                 let mut reply = PacketBuf::new();
-                reply.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
+                reply.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
                 reply.set_len(icmp_packet.header_len() + icmp_packet.payload().len());
                 {
                     let mut reply_icmp = Icmpv6Packet::new_unchecked(&mut reply);
@@ -1915,7 +1915,7 @@ const ICMP_ERROR_HEADER_LEN: usize = 8;
 fn build_icmpv4_error(orig: &[u8], msg_type: Icmpv4Message, msg_code: u8) -> PacketBuf {
     let quote_len = orig.len().min(IPV4_MIN_MTU - IPV4_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
     let mut reply = PacketBuf::new();
-    reply.reserve(ETHERNET_HEADER_LEN + IPV4_HEADER_LEN);
+    reply.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
     reply.set_len(ICMP_ERROR_HEADER_LEN + quote_len);
     {
         let mut icmp = Icmpv4Packet::new_unchecked(&mut reply);
@@ -1943,7 +1943,7 @@ fn build_icmpv6_error(
 ) -> PacketBuf {
     let quote_len = orig.len().min(IPV6_MIN_MTU - IPV6_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
     let mut reply = PacketBuf::new();
-    reply.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
+    reply.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
     reply.set_len(ICMP_ERROR_HEADER_LEN + quote_len);
     {
         let mut icmp = Icmpv6Packet::new_unchecked(&mut reply);
@@ -2026,8 +2026,8 @@ impl IfaceState {
     }
 
     /// The interface's IP-layer MTU: the device MTU minus the Ethernet header on
-    /// Ethernet mediums, clamped to what a `PacketBuf` can carry (egress always
-    /// reserves Ethernet headroom, whatever the medium).
+    /// Ethernet mediums, clamped to what a `PacketBuf` can carry once the
+    /// link-layer headroom egress reserves ([`LINK_HEADER_LEN`]) is taken out.
     pub(crate) fn ip_mtu(&self) -> usize {
         let caps = self.dev.capabilities();
         let mtu = match caps.medium {
@@ -2036,7 +2036,7 @@ impl IfaceState {
             #[cfg(feature = "medium-ip")]
             Medium::Ip => caps.max_transmission_unit,
         };
-        mtu.min(PACKET_BUF_SIZE - ETHERNET_HEADER_LEN)
+        mtu.min(PACKET_BUF_SIZE - LINK_HEADER_LEN)
     }
 
     fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {

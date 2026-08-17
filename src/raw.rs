@@ -25,9 +25,9 @@ use crate::waker::WakerRegistration;
 use crate::wire::Ipv4Packet;
 #[cfg(feature = "proto-ipv6")]
 use crate::wire::Ipv6Packet;
-use crate::wire::{ETHERNET_HEADER_LEN, IpAddress, IpProtocol, IpVersion};
 #[cfg(feature = "medium-ethernet")]
 use crate::wire::{EthernetFrame, EthernetProtocol};
+use crate::wire::{IpAddress, IpProtocol, IpVersion, LINK_HEADER_LEN};
 
 /// A handle to a raw socket added to a [`Stack`].
 ///
@@ -373,9 +373,11 @@ impl RawSocket<'_> {
     /// immediately.
     ///
     /// The packet must be complete, headers included: a whole Ethernet frame (at
-    /// most 1514 octets) in Ethernet mode, a whole IP packet (at most 1500 octets)
-    /// in IP mode. It is emitted exactly as written, so the user is responsible for
-    /// every header field, including the IPv4 header checksum.
+    /// most 1514 octets) in Ethernet mode, a whole IP packet (at most 1500 octets,
+    /// or the full 1514 in a build without `medium-ethernet`, which reserves no
+    /// link-layer headroom) in IP mode. It is emitted exactly as written, so the
+    /// user is responsible for every header field, including the IPv4 header
+    /// checksum.
     ///
     /// In Ethernet mode the frame is transmitted on the bound interface as-is. In IP
     /// mode the destination address is read from the IP header, and the packet is
@@ -404,7 +406,7 @@ impl RawSocket<'_> {
         let headroom = match mode {
             #[cfg(feature = "medium-ethernet")]
             RawMode::Ethernet { .. } => 0,
-            RawMode::Ip { .. } => ETHERNET_HEADER_LEN,
+            RawMode::Ip { .. } => LINK_HEADER_LEN,
         };
 
         let mut buf = PacketBuf::new();
@@ -556,7 +558,9 @@ mod test {
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface};
     use crate::stack::Stack;
-    use crate::wire::{EthernetAddress, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpCidr, Ipv4Address, Ipv6Address};
+    use crate::wire::{
+        ETHERNET_HEADER_LEN, EthernetAddress, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpCidr, Ipv4Address, Ipv6Address,
+    };
 
     /// A mock device: never receives, records transmitted frames.
     struct TestDevice {

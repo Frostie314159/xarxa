@@ -26,13 +26,13 @@ use crate::slab::Slab;
 use crate::stack::{IfaceState, StackInner, TxContext, addr_score, alloc_ephemeral_port};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
-use crate::wire::{
-    ETHERNET_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, UDP_HEADER_LEN, UdpPacket,
-};
 #[cfg(feature = "proto-ipv4")]
 use crate::wire::{IPV4_HEADER_LEN, Icmpv4DstUnreachable, Icmpv4Message, Ipv4Packet};
 #[cfg(feature = "proto-ipv6")]
 use crate::wire::{IPV6_HEADER_LEN, Icmpv6DstUnreachable, Icmpv6Message, Ipv6ExtHeader, Ipv6Packet};
+use crate::wire::{
+    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, LINK_HEADER_LEN, UDP_HEADER_LEN, UdpPacket,
+};
 
 /// A handle to a UDP socket added to a [`Stack`].
 ///
@@ -729,7 +729,7 @@ impl UdpSocket<'_> {
             #[cfg(feature = "proto-ipv6")]
             IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
         };
-        let headroom = ETHERNET_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
+        let headroom = LINK_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
 
         let mut buf = PacketBuf::new();
         if max_size > buf.capacity() - headroom {

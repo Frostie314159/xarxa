@@ -21,7 +21,7 @@ use crate::wire::IPV4_HEADER_LEN;
 #[cfg(feature = "proto-ipv6")]
 use crate::wire::IPV6_HEADER_LEN;
 use crate::wire::{
-    ETHERNET_HEADER_LEN, IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, TCP_HEADER_LEN, TcpControl, TcpPacket,
+    IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, LINK_HEADER_LEN, TCP_HEADER_LEN, TcpControl, TcpPacket,
     TcpSeqNumber,
 };
 
@@ -2071,7 +2071,7 @@ pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_add
         IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
     };
     let mut buf = PacketBuf::new();
-    buf.reserve(ETHERNET_HEADER_LEN + ip_header_len);
+    buf.reserve(LINK_HEADER_LEN + ip_header_len);
     buf.set_len(repr.buffer_len());
     let mut packet = TcpPacket::new_unchecked(&mut buf);
     repr.emit(&mut packet, src_addr, dst_addr);
