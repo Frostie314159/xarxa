@@ -264,7 +264,7 @@ impl TxContext<'_> {
     }
 
     /// Check whether any interface has the given IP address assigned.
-    #[cfg(feature = "socket-tcp")]
+    #[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
     pub(crate) fn has_ip_addr(&self, addr: IpAddress) -> bool {
         self.ifaces.iter().any(|(_, iface)| iface.has_ip_addr(addr))
     }

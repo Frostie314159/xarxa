@@ -909,13 +909,6 @@ impl TcpSocketState {
         }
     }
 
-    /// Take the pending ICMP error, if one has been reported against this
-    /// connection.
-    #[cfg(feature = "icmp-error-handling")]
-    pub fn take_icmp_error(&mut self) -> Option<IcmpError> {
-        self.icmp_error.take()
-    }
-
     pub(crate) fn process(
         &mut self,
         now: Instant,
@@ -1666,16 +1659,6 @@ impl TcpSocketState {
         // NOTE(unwrap): we check tuple is not None above.
         let tuple = self.tuple.unwrap();
 
-        // Check if the interface still has our source IP address.
-        // If not (e.g. the interface's IP changed), reset the socket.
-        // We use reset() instead of set_state(Closed) to avoid sending
-        // an RST packet with the now-invalid source IP.
-        if !cx.has_ip_addr(tuple.local.addr) {
-            debug!("source IP address no longer available, closing socket");
-            self.reset();
-            return Ok(());
-        }
-
         if self.remote_last_ts.is_none() {
             // We get here in exactly two cases:
             //  1) This socket just transitioned into SYN-SENT.
@@ -1737,7 +1720,21 @@ impl TcpSocketState {
         // never routed a second time. With no route, keep the last known MTU and
         // proceed. The segment is built and dropped at emit time, so socket
         // state still advances and the retransmit timer owns recovery.
-        let route = cx.route(&tuple.remote.addr);
+        //
+        // The source address must still be assigned to some interface, not
+        // necessarily the egress one (weak host model). A source address that is
+        // no longer ours is treated exactly like a routing failure: dropped at
+        // emit, socket unaffected. The address may come back (e.g. a DHCP
+        // renewal), and the retransmit timer owns recovery in the meantime.
+        let route = if cx.has_ip_addr(tuple.local.addr) {
+            cx.route(&tuple.remote.addr)
+        } else {
+            debug!(
+                "source address {} not assigned to any interface, dropping packet",
+                tuple.local.addr
+            );
+            None
+        };
         if let Some(route) = &route {
             self.ip_mtu = route.ip_mtu;
         }
@@ -2646,21 +2643,6 @@ impl TcpSocket<'_> {
         Ok(result)
     }
 
-    /// Take the pending ICMP error, if one has been reported against this
-    /// connection.
-    ///
-    /// When an ICMP error message quoting one of this connection's segments
-    /// arrives, from the network or generated locally when neighbor resolution
-    /// for the remote fails, it is recorded here (a single slot, the newest
-    /// wins), and taking it clears it. During the handshake (SYN-SENT /
-    /// SYN-RECEIVED) the error also aborts the connection, so a connect to an
-    /// unreachable destination fails fast. On an established connection the error
-    /// is advisory only (RFC 5927) and the connection carries on.
-    #[cfg(feature = "icmp-error-handling")]
-    pub fn take_icmp_error(&mut self) -> Option<IcmpError> {
-        self.inner_mut().take_icmp_error()
-    }
-
     /// Call `f` with the largest contiguous slice of octets in the transmit buffer,
     /// and enqueue the amount of elements returned by `f`.
     ///
@@ -2782,6 +2764,13 @@ impl TcpSocket<'_> {
     /// Note that the Berkeley sockets interface does not have an equivalent of this API.
     pub fn recv_queue(&self) -> usize {
         self.inner().rx_buffer.len()
+    }
+
+    /// Take the pending ICMP error, if one has been reported against this
+    /// connection.
+    #[cfg(feature = "icmp-error-handling")]
+    pub fn take_icmp_error(&mut self) -> Option<IcmpError> {
+        self.inner_mut().icmp_error.take()
     }
 }
 
@@ -9624,7 +9613,7 @@ mod test {
     // =========================================================================================//
 
     #[test]
-    fn test_established_close_on_src_ip_change() {
+    fn test_established_src_ip_change_drops_segments() {
         let mut s = socket_established();
 
         // Verify socket is working normally
@@ -9639,16 +9628,45 @@ mod test {
             }]
         );
 
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1 + 3),
+                ..SEND_TEMPL
+            }
+        );
+
         // Simulate interface IP change - remove the socket's source IP
         // and add a different one.
         s.stack.ifaces.get_mut(0).ip_addrs = vec![IpCidr::new(OTHER_ADDR.into(), 24)];
 
-        // The socket's source IP is no longer on the interface.
-        // When dispatch() runs, it should detect this and reset the socket
-        // silently (no RST sent, since that would use the invalid source IP).
+        // The socket's source IP is no longer ours: dispatch treats it like a
+        // routing failure. The segment is still built, but with no route, so
+        // emit drops it. The socket stays open, and the retransmit timer owns
+        // recovery in case the address comes back.
         s.view().send_slice(b"def").unwrap();
-        recv_nothing!(s);
-        assert_eq!(s.state, State::Closed);
+        let mut routes = vec![];
+        let result: Result<(), ()> = s.sockets.get_mut(0).dispatch(
+            &mut s.stack.tx_context(),
+            |_, (route, _src_addr, _dst_addr, _hop_limit, _repr)| {
+                routes.push(route.is_some());
+                Ok(())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(routes, [false], "segment should be emitted with no route");
+        assert_eq!(s.state, State::Established);
+
+        // Restoring the address makes egress work again, and the retransmission
+        // carries the dropped data.
+        s.stack.ifaces.get_mut(0).ip_addrs = vec![IpCidr::new(LOCAL_ADDR.into(), 24)];
+        recv!(s, time 2000, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 3,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"def"[..],
+            ..RECV_TEMPL
+        }));
     }
 }
 

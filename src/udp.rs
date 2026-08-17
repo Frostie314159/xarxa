@@ -665,8 +665,9 @@ impl UdpSocket<'_> {
     ///
     /// Returns `Err(SendError::Unaddressable)` if the socket is not bound, the
     /// destination address or port is still unspecified after defaulting, the
-    /// destination's address family does not match the source address, or no source
-    /// address is available.
+    /// destination's address family does not match the source address, no source
+    /// address is available, or the source address is not assigned to any
+    /// interface.
     /// Returns `Err(SendError::BufferFull)` if the payload cannot fit in a packet
     /// buffer.
     pub fn send_with(
@@ -718,6 +719,13 @@ impl UdpSocket<'_> {
                 .ok_or(SendError::Unaddressable)?,
         };
         if src_addr.version() != meta.endpoint.addr.version() {
+            return Err(SendError::Unaddressable);
+        }
+        // The source address must be assigned to some interface, not necessarily
+        // the egress one (weak host model). A stack-selected source is ours by
+        // construction, this catches an explicit or bound source address that
+        // isn't (or no longer is) ours.
+        if !self.tx.has_ip_addr(src_addr) {
             return Err(SendError::Unaddressable);
         }
 
@@ -1288,6 +1296,51 @@ mod test {
         socket.bind(LOCAL_PORT, (REMOTE_ADDR, REMOTE_PORT)).unwrap();
         assert_eq!(socket.send_slice(b"hi", IpEndpoint::UNSPECIFIED), Ok(()));
         assert_eq!(socket.send_slice(b"hi", IpEndpoint::new(OTHER_ADDR.into(), 9)), Ok(()));
+    }
+
+    #[test]
+    fn test_send_requires_own_src_addr() {
+        let mut stack = stack_with_iface();
+        let handle = stack.add_udp_socket();
+        let mut socket = stack.udp(handle);
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+
+        let dst = IpEndpoint::new(REMOTE_ADDR.into(), REMOTE_PORT);
+
+        // An explicit source address that isn't ours fails synchronously, the
+        // interface's own address works. (Raw sockets, by contrast, may send
+        // any source address.)
+        assert_eq!(
+            socket.send_slice(
+                b"hi",
+                UdpMetadata {
+                    endpoint: dst,
+                    local_address: Some(OTHER_ADDR.into()),
+                }
+            ),
+            Err(SendError::Unaddressable)
+        );
+        assert_eq!(
+            socket.send_slice(
+                b"hi",
+                UdpMetadata {
+                    endpoint: dst,
+                    local_address: Some(LOCAL_ADDR.into()),
+                }
+            ),
+            Ok(())
+        );
+        socket.close();
+
+        // A bound source address that is no longer ours (the interface's
+        // address changed) also fails the send.
+        socket
+            .bind((LOCAL_ADDR, LOCAL_PORT), (REMOTE_ADDR, REMOTE_PORT))
+            .unwrap();
+        assert_eq!(socket.send_slice(b"hi", dst), Ok(()));
+        stack.ifaces.get_mut(0).ip_addrs = vec![IpCidr::new(OTHER_ADDR.into(), 24)];
+        let mut socket = stack.udp(handle);
+        assert_eq!(socket.send_slice(b"hi", dst), Err(SendError::Unaddressable));
     }
 
     #[test]
