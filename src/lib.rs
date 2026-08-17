@@ -19,6 +19,7 @@ pub mod buf;
 #[cfg(feature = "icmp-error-handling")]
 mod icmp_error;
 pub mod iface;
+pub mod meta;
 #[cfg(feature = "medium-ethernet")]
 pub mod neighbor;
 mod rand;
@@ -39,6 +40,9 @@ pub mod wire;
 pub use buf::{PACKET_BUF_SIZE, PacketBuf};
 #[cfg(feature = "icmp-error-handling")]
 pub use icmp_error::IcmpError;
+pub use meta::PacketMeta;
+#[cfg(feature = "packetmeta-timestamp")]
+pub use meta::{Timestamp, TxTimestamp};
 #[cfg(feature = "socket-raw")]
 pub use raw::{RawHandle, RawMode, RawSocket};
 pub use route::{Route, Routes};

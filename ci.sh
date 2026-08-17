@@ -26,7 +26,8 @@ SOCKETS=(
 # with all of the above would be thousands of builds for no extra coverage.
 for extra in "" "defmt" "log" "std" "std,log" "std,defmt" "async" "std,log,async" \
              "icmp-error-handling" "auto-icmp-echo-reply" "async,icmp-error-handling" \
-             "std,log,async,icmp-error-handling,auto-icmp-echo-reply"; do
+             "packetmeta-id" "packetmeta-timestamp" "packetmeta-timestamp,defmt" \
+             "std,log,async,icmp-error-handling,auto-icmp-echo-reply,packetmeta-timestamp"; do
   cargo check --no-default-features \
     --features "medium-ethernet,medium-ip,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp${extra:+,$extra}"
 done
@@ -38,7 +39,7 @@ for medium in "${MEDIA[@]}"; do
       # Bare, and with everything that adds code paths to the combination.
       cargo check --no-default-features --features "$features"
       cargo check --no-default-features \
-        --features "$features,std,log,async,icmp-error-handling,auto-icmp-echo-reply"
+        --features "$features,std,log,async,icmp-error-handling,auto-icmp-echo-reply,packetmeta-timestamp"
     done
   done
 done
@@ -57,4 +58,7 @@ for medium in "${MEDIA[@]}"; do
 done
 
 cargo test
+# Once more with packet metadata: the default feature set leaves `PacketMeta`
+# zero-sized, so the tests that exercise it are gated on the feature.
+cargo test --features packetmeta-timestamp
 cargo build --examples

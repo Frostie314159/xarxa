@@ -15,6 +15,7 @@ use core::fmt;
 use crate::buf::PacketBuf;
 #[cfg(feature = "medium-ethernet")]
 use crate::iface::Medium;
+use crate::meta::PacketMeta;
 use crate::slab::Slab;
 #[cfg(feature = "medium-ethernet")]
 use crate::stack::{IfaceHandle, IfaceState};
@@ -172,6 +173,9 @@ fn copy_packet(buf: &PacketBuf) -> PacketBuf {
     let mut copy = PacketBuf::new();
     copy.set_len(buf.len());
     copy.copy_from_slice(buf);
+    // The copy is the same packet: it carries the same metadata (arrival timestamp,
+    // driver-assigned id).
+    copy.set_meta(buf.meta());
     copy
 }
 
@@ -360,7 +364,14 @@ impl RawSocket<'_> {
     ///
     /// See [send_with](#method.send_with).
     pub fn send_slice(&mut self, data: &[u8]) -> Result<(), SendError> {
-        self.send_with(data.len(), |buf| {
+        self.send_slice_with_meta(data, PacketMeta::default())
+    }
+
+    /// Send a packet with the given [`PacketMeta`] attached, copying it from a slice.
+    ///
+    /// See [send_with_meta](#method.send_with_meta).
+    pub fn send_slice_with_meta(&mut self, data: &[u8], meta: PacketMeta) -> Result<(), SendError> {
+        self.send_with_meta(data.len(), meta, |buf| {
             buf.copy_from_slice(data);
             data.len()
         })
@@ -397,6 +408,21 @@ impl RawSocket<'_> {
     /// Panics if the socket is bound (Ethernet mode) to an interface that has been
     /// removed.
     pub fn send_with(&mut self, max_size: usize, f: impl FnOnce(&mut [u8]) -> usize) -> Result<(), SendError> {
+        self.send_with_meta(max_size, PacketMeta::default(), f)
+    }
+
+    /// Send a packet with the given [`PacketMeta`] attached, building it in place.
+    ///
+    /// The metadata is handed to the driver along with the frame. This is how a
+    /// packet is tagged with an id, or a transmit timestamp is requested for it (see
+    /// [`Iface::poll_tx_timestamp`](crate::Iface::poll_tx_timestamp)). Everything else
+    /// is exactly [`send_with`](Self::send_with).
+    pub fn send_with_meta(
+        &mut self,
+        max_size: usize,
+        meta: PacketMeta,
+        f: impl FnOnce(&mut [u8]) -> usize,
+    ) -> Result<(), SendError> {
         let Some(mode) = self.state.mode else {
             return Err(SendError::Unaddressable);
         };
@@ -413,6 +439,7 @@ impl RawSocket<'_> {
         if max_size > buf.capacity() - headroom {
             return Err(SendError::BufferFull);
         }
+        buf.set_meta(meta);
         buf.reserve(headroom);
         buf.set_len(max_size);
         let size = f(&mut buf);
@@ -861,6 +888,81 @@ mod test {
         let (res_buf, handled) = res.unwrap();
         assert_eq!(&*res_buf, &packet[..]);
         assert!(!handled);
+    }
+
+    /// Packet metadata reaches a raw socket on the zero-copy ingress path *and* on
+    /// the copy the socket gets when the stack also wants the packet, and rides back
+    /// out to the device on send.
+    #[cfg(feature = "packetmeta-id")]
+    #[test]
+    fn test_packet_meta() {
+        /// A device that records the metadata of every frame it is handed.
+        struct MetaDevice(Rc<RefCell<Vec<PacketMeta>>>);
+
+        impl Interface for MetaDevice {
+            fn capabilities(&self) -> IfaceCapabilities {
+                IfaceCapabilities {
+                    medium: Medium::Ethernet,
+                    max_transmission_unit: 1500,
+                }
+            }
+            fn receive(&mut self) -> Option<PacketBuf> {
+                None
+            }
+            fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+                self.0.borrow_mut().push(buf.meta());
+                Ok(())
+            }
+        }
+
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let iface = stack.add_iface(
+            Box::new(MetaDevice(sent.clone())),
+            EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
+        );
+
+        let handle = stack.add_raw_socket();
+        stack
+            .raw(handle)
+            .bind(RawMode::Ethernet { iface, ethertype: None })
+            .unwrap();
+
+        // Zero-copy ingress: the socket takes the very buffer the driver filled.
+        let mut buf = buf_from(&eth_frame(ETHERTYPE_CUSTOM, b"abcd"));
+        buf.meta_mut().id = 0x1111;
+        let res = stack.inner.process_raw_ethernet(
+            stack.ifaces.get(iface.0),
+            &mut stack.sockets.raw,
+            ETHERTYPE_CUSTOM,
+            false,
+            buf,
+        );
+        assert!(res.is_none());
+        assert_eq!(stack.raw(handle).recv().unwrap().meta().id, 0x1111);
+
+        // Copied ingress (the stack wants the ethertype too): the copy is the same
+        // packet, so it carries the same metadata.
+        let mut buf = buf_from(&eth_frame(EthernetProtocol::Arp, b"abcd"));
+        buf.meta_mut().id = 0x2222;
+        let res = stack.inner.process_raw_ethernet(
+            stack.ifaces.get(iface.0),
+            &mut stack.sockets.raw,
+            EthernetProtocol::Arp,
+            true,
+            buf,
+        );
+        assert_eq!(res.unwrap().meta().id, 0x2222);
+        assert_eq!(stack.raw(handle).recv().unwrap().meta().id, 0x2222);
+
+        // Egress: the metadata handed to send reaches the device, and a plain send
+        // carries the default.
+        let frame = eth_frame(ETHERTYPE_CUSTOM, b"out");
+        let mut meta = PacketMeta::default();
+        meta.id = 0x3333;
+        stack.raw(handle).send_slice_with_meta(&frame, meta).unwrap();
+        stack.raw(handle).send_slice(&frame).unwrap();
+        assert_eq!(&*sent.borrow(), &[meta, PacketMeta::default()]);
     }
 
     #[test]

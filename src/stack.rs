@@ -101,6 +101,19 @@ impl Iface<'_> {
         self.state().ip_mtu()
     }
 
+    /// Poll the device for the timestamp of an already-transmitted packet, sent with
+    /// [`PacketMeta::request_timestamp`](crate::PacketMeta::request_timestamp) set.
+    ///
+    /// Returns `None` if no timestamp is available right now, which is also all a
+    /// device without transmit timestamping support ever returns. See
+    /// [`Interface::poll_tx_timestamp`] for what a caller must tolerate: timestamps
+    /// arrive an arbitrary time after the packet was sent, possibly out of order, and
+    /// possibly never.
+    #[cfg(feature = "packetmeta-timestamp")]
+    pub fn poll_tx_timestamp(&mut self) -> Option<crate::meta::TxTimestamp> {
+        self.state_mut().dev.poll_tx_timestamp()
+    }
+
     /// The hardware (MAC) address of the interface.
     ///
     /// Meaningful on [`Medium::Ethernet`] interfaces only.
@@ -2791,6 +2804,106 @@ mod test {
             packet.fill_checksum(&src_addr, &dst_addr);
         }
         ipv6_packet(src_addr, dst_addr, IpProtocol::Icmpv6, &icmp)
+    }
+
+    /// End to end: the driver stamps a received frame and the metadata travels up the
+    /// stack into the socket that receives it. A socket's send metadata travels back
+    /// down into the driver, and the transmit timestamp it asked for comes back out of
+    /// band, tagged with the packet's id.
+    #[cfg(feature = "packetmeta-timestamp")]
+    #[test]
+    fn test_packet_meta_end_to_end() {
+        use crate::meta::{PacketMeta, Timestamp, TxTimestamp};
+
+        const RX_STAMP: Timestamp = Timestamp::from_seconds_and_nanos(4, 500);
+        const TX_STAMP: Timestamp = Timestamp::from_seconds_and_nanos(9, 250);
+
+        /// A device that timestamps everything it receives and everything it is asked
+        /// to timestamp on transmit.
+        struct PtpDevice {
+            rx: Queue,
+            sent: Rc<RefCell<Vec<PacketMeta>>>,
+            tx_stamps: Rc<RefCell<VecDeque<TxTimestamp>>>,
+        }
+
+        impl Interface for PtpDevice {
+            fn capabilities(&self) -> IfaceCapabilities {
+                IfaceCapabilities {
+                    medium: Medium::Ip,
+                    max_transmission_unit: 1500,
+                }
+            }
+            fn receive(&mut self) -> Option<PacketBuf> {
+                let bytes = self.rx.borrow_mut().pop_front()?;
+                let mut buf = PacketBuf::new();
+                buf.set_len(bytes.len());
+                buf.copy_from_slice(&bytes);
+                buf.meta_mut().id = 0x1111;
+                buf.meta_mut().timestamp = Some(RX_STAMP);
+                Some(buf)
+            }
+            fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
+                let meta = buf.meta();
+                self.sent.borrow_mut().push(meta);
+                if meta.request_timestamp {
+                    self.tx_stamps.borrow_mut().push_back(TxTimestamp {
+                        id: meta.id,
+                        timestamp: TX_STAMP,
+                    });
+                }
+                Ok(())
+            }
+            fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
+                self.tx_stamps.borrow_mut().pop_front()
+            }
+        }
+
+        let rx = Rc::new(RefCell::new(VecDeque::new()));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let iface = stack.add_iface(
+            Box::new(PtpDevice {
+                rx: rx.clone(),
+                sent: sent.clone(),
+                tx_stamps: Rc::new(RefCell::new(VecDeque::new())),
+            }),
+            EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
+        );
+        stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24));
+
+        let handle = stack.add_udp_socket();
+        stack.udp(handle).bind(319, IpListenEndpoint::UNSPECIFIED).unwrap();
+
+        // Ingress: driver → ethernet/IP/UDP demux → socket queue → recv.
+        let datagram = udp_datagram(REMOTE_V4.into(), 319, OUR_V4.into(), 319, b"sync");
+        inject(
+            &mut stack,
+            &rx,
+            ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram),
+        );
+        let packet = stack.udp(handle).recv().unwrap();
+        assert_eq!(&*packet, b"sync");
+        assert_eq!(packet.meta().meta.id, 0x1111);
+        assert_eq!(packet.meta().meta.timestamp, Some(RX_STAMP));
+
+        // Egress: socket → driver, with a transmit timestamp requested.
+        let mut meta: crate::udp::UdpMetadata = IpEndpoint::new(REMOTE_V4.into(), 319).into();
+        meta.meta.id = 0x2222;
+        meta.meta.request_timestamp = true;
+        stack.udp(handle).send_slice(b"delay_req", meta).unwrap();
+        assert_eq!(sent.borrow().len(), 1);
+        assert_eq!(sent.borrow()[0].id, 0x2222);
+        assert!(sent.borrow()[0].request_timestamp);
+
+        // ... and the timestamp comes back out of band, tagged with the id.
+        assert_eq!(
+            stack.iface(iface).poll_tx_timestamp(),
+            Some(TxTimestamp {
+                id: 0x2222,
+                timestamp: TX_STAMP,
+            })
+        );
+        assert_eq!(stack.iface(iface).poll_tx_timestamp(), None);
     }
 
     #[test]

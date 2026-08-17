@@ -83,6 +83,10 @@ pub trait Interface {
     ///
     /// Returns a buffer holding the received frame if one is available, transferring
     /// ownership of it to the caller.
+    ///
+    /// A driver that has per-packet metadata to report, such as an identifier or a
+    /// receive timestamp, sets it on the buffer's [`PacketMeta`](crate::PacketMeta)
+    /// here. It travels with the packet up to the socket that receives it.
     fn receive(&mut self) -> Option<PacketBuf>;
 
     /// Queue a frame for transmission, transferring ownership of the buffer to the iface.
@@ -90,7 +94,42 @@ pub trait Interface {
     /// The iface holds the buffer until the hardware is done with it, then drops it.
     /// If the frame cannot be queued right now (device busy or queue full), the buffer
     /// is handed back in the `Err` variant.
+    ///
+    /// The buffer's [`PacketMeta`](crate::PacketMeta) is whatever the sending socket
+    /// attached to the packet (default for packets the stack generates itself). A
+    /// driver that supports transmit timestamping timestamps the frame if
+    /// [`request_timestamp`](crate::PacketMeta::request_timestamp) is set, and reports
+    /// the result from [`poll_tx_timestamp`](Self::poll_tx_timestamp) tagged with the
+    /// packet's [`id`](crate::PacketMeta::id).
     fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf>;
+
+    /// Poll for the timestamp of an already-transmitted packet.
+    ///
+    /// Returns the transmit timestamp of a packet previously sent with
+    /// [`PacketMeta::request_timestamp`](crate::PacketMeta::request_timestamp) set,
+    /// tagged with that packet's [`PacketMeta::id`](crate::PacketMeta::id), or `None`
+    /// if no timestamp is available right now. Reached from the stack through
+    /// [`Iface::poll_tx_timestamp`](crate::Iface::poll_tx_timestamp).
+    ///
+    /// Transmit timestamps are reported out of band, rather than on the packet like
+    /// receive timestamps are, because a packet's transmit timestamp does not exist yet
+    /// when [`transmit`](Self::transmit) returns: it has not gone out on the wire yet.
+    ///
+    /// Callers must be robust against all of the following:
+    ///
+    /// * Timestamps become available an arbitrary time after `transmit` returned, so
+    ///   this should be polled repeatedly, not just once after sending.
+    /// * Timestamps may be reported out of order with respect to transmission.
+    /// * Timestamps may never arrive at all, e.g. because the hardware ran out of
+    ///   timestamp slots. Never block waiting for a particular `id` to show up without
+    ///   a timeout.
+    ///
+    /// Devices that do not support transmit timestamping always return `None`, which is
+    /// the default implementation.
+    #[cfg(feature = "packetmeta-timestamp")]
+    fn poll_tx_timestamp(&mut self) -> Option<crate::meta::TxTimestamp> {
+        None
+    }
 }
 
 /// Wait until given file descriptor becomes readable, but no longer than given timeout.

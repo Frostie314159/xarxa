@@ -40,6 +40,17 @@ socket-tcp = ["socket"]
 socket = []
 ## Waker registration on sockets, for building `Future`s on top of the stack.
 async = []
+## Enable the `PacketMeta::id` field: an opaque number that travels with a packet
+## through the whole stack, set by the driver on receive and by the application on
+## send. Costs 4 bytes in every packet buffer.
+packetmeta-id = []
+## Enable the `PacketMeta::timestamp` and `PacketMeta::request_timestamp` fields, and
+## `Interface::poll_tx_timestamp`: hardware timestamping of received and transmitted
+## packets.
+##
+## Transmit timestamps are correlated back to the packet that produced them by
+## `PacketMeta::id`, so this implies `packetmeta-id`.
+packetmeta-timestamp = ["packetmeta-id"]
 ## Automatically reply to ICMP echo requests. Disable to handle echo requests
 ## yourself through a raw socket.
 auto-icmp-echo-reply = []

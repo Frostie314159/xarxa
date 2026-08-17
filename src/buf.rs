@@ -4,6 +4,8 @@ use alloc::boxed::Box;
 use core::fmt;
 use core::ops::{Deref, DerefMut};
 
+use crate::meta::PacketMeta;
+
 /// Size of the buffer in a [`PacketBuf`].
 ///
 /// Currently hardcoded to 1514 (max size of an Ethernet frame without FCS)
@@ -19,6 +21,8 @@ struct PacketBufInner {
     /// Number of valid bytes.
     len: u16,
     // invariant: headroom + len <= PACKET_BUF_SIZE
+    /// Per-packet metadata. Zero-sized unless a `packetmeta-*` feature is enabled.
+    meta: PacketMeta,
     data: [u8; PACKET_BUF_SIZE],
 }
 
@@ -35,15 +39,36 @@ pub struct PacketBuf {
 }
 
 impl PacketBuf {
-    /// Allocate a new, empty packet buffer with zero headroom.
+    /// Allocate a new, empty packet buffer with zero headroom and default metadata.
     pub fn new() -> Self {
         Self {
             inner: Box::new(PacketBufInner {
                 headroom: 0,
                 len: 0,
+                meta: PacketMeta::default(),
                 data: [0; PACKET_BUF_SIZE],
             }),
         }
+    }
+
+    /// The packet's metadata.
+    ///
+    /// On a received packet this is what the driver attached to it. On a packet being
+    /// sent it is what the application attached, and what the driver will see in
+    /// [`Interface::transmit`](crate::iface::Interface::transmit). It travels with the
+    /// buffer through the whole stack, unaffected by header pushes and pulls.
+    pub fn meta(&self) -> PacketMeta {
+        self.inner.meta
+    }
+
+    /// Mutable reference to the packet's metadata.
+    pub fn meta_mut(&mut self) -> &mut PacketMeta {
+        &mut self.inner.meta
+    }
+
+    /// Replace the packet's metadata.
+    pub fn set_meta(&mut self, meta: PacketMeta) {
+        self.inner.meta = meta;
     }
 
     /// Total storage capacity of the buffer, in bytes.
@@ -190,5 +215,34 @@ mod tests {
     fn push_beyond_headroom() {
         let mut buf = PacketBuf::new();
         buf.push_front(1);
+    }
+
+    /// The storage a driver DMAs into must stay 4-byte aligned and a multiple of 4
+    /// long, whatever the metadata in front of it does to the layout.
+    #[test]
+    fn storage_is_dma_shaped() {
+        let mut buf = PacketBuf::new();
+        assert_eq!(buf.storage_mut().as_ptr() as usize % 4, 0);
+        assert_eq!(buf.storage_mut().len() % 4, 0);
+        assert!(buf.storage_mut().len() >= PACKET_BUF_SIZE);
+    }
+
+    /// Metadata rides along with the buffer, untouched by the header pushes and pulls
+    /// the packet goes through on its way up or down the stack.
+    #[cfg(feature = "packetmeta-id")]
+    #[test]
+    fn meta_travels_with_the_buffer() {
+        let mut buf = PacketBuf::new();
+        assert_eq!(buf.meta(), PacketMeta::default());
+
+        buf.meta_mut().id = 0xdead_beef;
+        buf.reserve(20);
+        buf.set_len(10);
+        buf.push_front(20);
+        buf.pull_front(4);
+        assert_eq!(buf.meta().id, 0xdead_beef);
+
+        buf.set_meta(PacketMeta::default());
+        assert_eq!(buf.meta().id, 0);
     }
 }

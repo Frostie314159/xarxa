@@ -14,6 +14,10 @@
 //! Received packets are queued with their IP and UDP headers still in the buffer.
 //! The addresses returned in [`UdpMetadata`] are parsed back out of those header
 //! bytes.
+//!
+//! [`UdpMetadata`] also carries the datagram's [`PacketMeta`] in both directions: on
+//! receive it is what the driver attached to the packet, on send it is attached to the
+//! packet handed to the driver.
 
 use alloc::collections::VecDeque;
 use core::fmt;
@@ -22,6 +26,7 @@ use core::ops::{Deref, Range};
 use crate::buf::PacketBuf;
 #[cfg(feature = "icmp-error-handling")]
 use crate::icmp_error::IcmpError;
+use crate::meta::PacketMeta;
 use crate::slab::Slab;
 use crate::stack::{IfaceState, StackInner, TxContext, addr_score, alloc_ephemeral_port};
 #[cfg(feature = "async")]
@@ -54,6 +59,12 @@ pub struct UdpMetadata {
     /// socket is not bound to a single address), a suitable source address is
     /// selected automatically.
     pub local_address: Option<IpAddress>,
+    /// The datagram's [packet metadata](PacketMeta): what the driver attached to an
+    /// incoming datagram, or what to attach to an outgoing one (an id to tag it with,
+    /// a transmit timestamp to request).
+    ///
+    /// Zero-sized unless a `packetmeta-*` feature is enabled.
+    pub meta: PacketMeta,
 }
 
 impl<T: Into<IpEndpoint>> From<T> for UdpMetadata {
@@ -61,6 +72,7 @@ impl<T: Into<IpEndpoint>> From<T> for UdpMetadata {
         Self {
             endpoint: value.into(),
             local_address: None,
+            meta: PacketMeta::default(),
         }
     }
 }
@@ -315,10 +327,12 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
             }
         };
 
+    let packet_meta = buf.meta();
     let udp = UdpPacket::new_unchecked(&mut buf[header_len..]);
     let meta = UdpMetadata {
         endpoint: IpEndpoint::new(src_addr, udp.src_port()),
         local_address: Some(dst_addr),
+        meta: packet_meta,
     };
     let payload = header_len + UDP_HEADER_LEN..header_len + udp.len() as usize;
     (meta, payload)
@@ -663,6 +677,10 @@ impl UdpSocket<'_> {
     /// inside the stack and sent when resolution completes. This still counts as a
     /// successful send.
     ///
+    /// `meta.meta` is attached to the packet and handed to the driver with it: an id
+    /// to tag the packet with, or a request to timestamp its transmission (see
+    /// [`Iface::poll_tx_timestamp`](crate::Iface::poll_tx_timestamp)).
+    ///
     /// Returns `Err(SendError::Unaddressable)` if the socket is not bound, the
     /// destination address or port is still unspecified after defaulting, the
     /// destination's address family does not match the source address, no source
@@ -743,6 +761,7 @@ impl UdpSocket<'_> {
         if max_size > buf.capacity() - headroom {
             return Err(SendError::BufferFull);
         }
+        buf.set_meta(meta.meta);
         buf.reserve(headroom);
         buf.set_len(max_size);
         let size = f(&mut buf);
@@ -1298,6 +1317,63 @@ mod test {
         assert_eq!(socket.send_slice(b"hi", IpEndpoint::new(OTHER_ADDR.into(), 9)), Ok(()));
     }
 
+    /// Packet metadata travels in both directions: what the driver attached to a
+    /// received datagram comes back out of `recv`, and what `send` was given reaches
+    /// the driver with the frame.
+    #[cfg(feature = "packetmeta-id")]
+    #[test]
+    fn test_packet_meta() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        /// A device that records the metadata of every frame it is handed.
+        struct MetaDevice(Rc<RefCell<Vec<PacketMeta>>>);
+
+        impl Interface for MetaDevice {
+            fn capabilities(&self) -> IfaceCapabilities {
+                IfaceCapabilities {
+                    medium: Medium::Ip,
+                    max_transmission_unit: 1500,
+                }
+            }
+            fn receive(&mut self) -> Option<PacketBuf> {
+                None
+            }
+            fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+                self.0.borrow_mut().push(buf.meta());
+                Ok(())
+            }
+        }
+
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let iface = stack.add_iface(Box::new(MetaDevice(sent.clone())), EthernetAddress([0x02; 6]));
+        stack.iface(iface).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
+
+        let handle = stack.add_udp_socket();
+        let mut socket = stack.udp(handle);
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+
+        // Ingress: the driver's metadata comes out of recv.
+        let mut buf = queued_packet(b"abcdef");
+        buf.meta_mut().id = 0x1234;
+        socket.inner_mut().rx_enqueue(buf);
+        assert_eq!(socket.recv().unwrap().meta().meta.id, 0x1234);
+
+        // Egress: the metadata given to send reaches the device.
+        let mut meta: UdpMetadata = IpEndpoint::new(REMOTE_ADDR.into(), REMOTE_PORT).into();
+        meta.meta.id = 0x5678;
+        socket.send_slice(b"hi", meta).unwrap();
+        assert_eq!(sent.borrow().len(), 1);
+        assert_eq!(sent.borrow()[0].id, 0x5678);
+
+        // ... and a plain send carries the default.
+        socket
+            .send_slice(b"hi", IpEndpoint::new(REMOTE_ADDR.into(), REMOTE_PORT))
+            .unwrap();
+        assert_eq!(sent.borrow()[1], PacketMeta::default());
+    }
+
     #[test]
     fn test_send_requires_own_src_addr() {
         let mut stack = stack_with_iface();
@@ -1316,6 +1392,7 @@ mod test {
                 UdpMetadata {
                     endpoint: dst,
                     local_address: Some(OTHER_ADDR.into()),
+                    meta: PacketMeta::default(),
                 }
             ),
             Err(SendError::Unaddressable)
@@ -1326,6 +1403,7 @@ mod test {
                 UdpMetadata {
                     endpoint: dst,
                     local_address: Some(LOCAL_ADDR.into()),
+                    meta: PacketMeta::default(),
                 }
             ),
             Ok(())
@@ -1363,6 +1441,7 @@ mod test {
             UdpMetadata {
                 endpoint: IpEndpoint::new(REMOTE_ADDR.into(), REMOTE_PORT),
                 local_address: Some(LOCAL_ADDR.into()),
+                meta: PacketMeta::default(),
             }
         );
         assert!(!socket.can_recv());
