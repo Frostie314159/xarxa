@@ -199,10 +199,10 @@ fn parse_ip_headers(buf: &mut [u8]) -> Option<(IpAddress, IpProtocol)> {
     }
 }
 
-/// A raw socket borrowed from a [`Stack`], returned by [`Stack::raw`].
+/// A raw socket borrowed from a [`Stack`], returned by [`Stack::raw_socket`].
 ///
 /// [`Stack`]: crate::Stack
-/// [`Stack::raw`]: crate::Stack::raw
+/// [`Stack::raw_socket`]: crate::Stack::raw_socket
 pub struct RawSocket<'a> {
     pub(crate) state: &'a mut RawSocketState,
     pub(crate) tx: TxContext<'a>,
@@ -688,7 +688,7 @@ mod test {
     fn test_bind_ip() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
-        let mut socket = stack.raw(handle);
+        let mut socket = stack.raw_socket(handle);
         assert!(!socket.is_open());
         assert_eq!(socket.mode(), None);
 
@@ -725,7 +725,7 @@ mod test {
         let (ip_iface, _) = add_test_iface(&mut stack, Medium::Ip, vec![]);
 
         let handle = stack.add_raw_socket();
-        let mut socket = stack.raw(handle);
+        let mut socket = stack.raw_socket(handle);
         assert_eq!(
             socket.bind(RawMode::Ethernet {
                 iface: ip_iface,
@@ -748,7 +748,7 @@ mod test {
     fn test_recv() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
-        let mut socket = stack.raw(handle);
+        let mut socket = stack.raw_socket(handle);
         socket
             .bind(RawMode::Ip {
                 version: None,
@@ -774,7 +774,7 @@ mod test {
     fn test_peek_and_recv_slice() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
-        let mut socket = stack.raw(handle);
+        let mut socket = stack.raw_socket(handle);
         socket
             .bind(RawMode::Ip {
                 version: None,
@@ -799,7 +799,7 @@ mod test {
     fn test_recv_slice_truncated() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
-        let mut socket = stack.raw(handle);
+        let mut socket = stack.raw_socket(handle);
         socket
             .bind(RawMode::Ip {
                 version: None,
@@ -823,14 +823,14 @@ mod test {
         let h_icmp = stack.add_raw_socket();
         let h_any = stack.add_raw_socket();
         stack
-            .raw(h_icmp)
+            .raw_socket(h_icmp)
             .bind(RawMode::Ip {
                 version: Some(IpVersion::Ipv4),
                 protocol: Some(IpProtocol::Icmp),
             })
             .unwrap();
         stack
-            .raw(h_any)
+            .raw_socket(h_any)
             .bind(RawMode::Ip {
                 version: None,
                 protocol: None,
@@ -847,8 +847,8 @@ mod test {
             buf_from(&packet),
         );
         assert!(res.is_none());
-        assert!(!stack.raw(h_icmp).can_recv());
-        assert_eq!(&*stack.raw(h_any).recv().unwrap(), &packet[..]);
+        assert!(!stack.raw_socket(h_icmp).can_recv());
+        assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &packet[..]);
 
         // A stack-handled protocol: the matching socket gets a copy, the original
         // is handed back for further processing.
@@ -863,8 +863,8 @@ mod test {
         let (res_buf, handled) = res.unwrap();
         assert_eq!(&*res_buf, &packet[..]);
         assert!(handled);
-        assert_eq!(&*stack.raw(h_icmp).recv().unwrap(), &packet[..]);
-        assert!(!stack.raw(h_any).can_recv());
+        assert_eq!(&*stack.raw_socket(h_icmp).recv().unwrap(), &packet[..]);
+        assert!(!stack.raw_socket(h_any).can_recv());
 
         // Version filter: an IPv6 packet skips the IPv4-bound socket.
         let packet = ipv6_packet(IpProtocol::Icmp, b"six");
@@ -876,11 +876,11 @@ mod test {
             buf_from(&packet),
         );
         assert!(res.is_none());
-        assert!(!stack.raw(h_icmp).can_recv());
-        assert_eq!(&*stack.raw(h_any).recv().unwrap(), &packet[..]);
+        assert!(!stack.raw_socket(h_icmp).can_recv());
+        assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &packet[..]);
 
         // No socket matches: the buffer is handed back.
-        stack.raw(h_any).close();
+        stack.raw_socket(h_any).close();
         let packet = ipv4_packet(IP_PROTO, b"nobody");
         let res = stack.inner.process_raw_ip(
             &mut stack.sockets.raw,
@@ -928,7 +928,7 @@ mod test {
 
         let handle = stack.add_raw_socket();
         stack
-            .raw(handle)
+            .raw_socket(handle)
             .bind(RawMode::Ethernet { iface, ethertype: None })
             .unwrap();
 
@@ -943,7 +943,7 @@ mod test {
             buf,
         );
         assert!(res.is_none());
-        assert_eq!(stack.raw(handle).recv().unwrap().meta().id, 0x1111);
+        assert_eq!(stack.raw_socket(handle).recv().unwrap().meta().id, 0x1111);
 
         // Copied ingress (the stack wants the ethertype too): the copy is the same
         // packet, so it carries the same metadata.
@@ -957,15 +957,15 @@ mod test {
             buf,
         );
         assert_eq!(res.unwrap().meta().id, 0x2222);
-        assert_eq!(stack.raw(handle).recv().unwrap().meta().id, 0x2222);
+        assert_eq!(stack.raw_socket(handle).recv().unwrap().meta().id, 0x2222);
 
         // Egress: the metadata handed to send reaches the device, and a plain send
         // carries the default.
         let frame = eth_frame(ETHERTYPE_CUSTOM, b"out");
         let mut meta = PacketMeta::default();
         meta.id = 0x3333;
-        stack.raw(handle).send_slice_with_meta(&frame, meta).unwrap();
-        stack.raw(handle).send_slice(&frame).unwrap();
+        stack.raw_socket(handle).send_slice_with_meta(&frame, meta).unwrap();
+        stack.raw_socket(handle).send_slice(&frame).unwrap();
         assert_eq!(&*sent.borrow(), &[meta, PacketMeta::default()]);
     }
 
@@ -978,14 +978,14 @@ mod test {
         let h_custom = stack.add_raw_socket();
         let h_any = stack.add_raw_socket();
         stack
-            .raw(h_custom)
+            .raw_socket(h_custom)
             .bind(RawMode::Ethernet {
                 iface: iface_a,
                 ethertype: Some(ETHERTYPE_CUSTOM),
             })
             .unwrap();
         stack
-            .raw(h_any)
+            .raw_socket(h_any)
             .bind(RawMode::Ethernet {
                 iface: iface_a,
                 ethertype: None,
@@ -1000,8 +1000,8 @@ mod test {
                 .inner
                 .process_raw_ethernet(iface, &mut stack.sockets.raw, ETHERTYPE_CUSTOM, false, buf_from(&frame));
         assert_eq!(&*res.unwrap(), &frame[..]);
-        assert!(!stack.raw(h_custom).can_recv());
-        assert!(!stack.raw(h_any).can_recv());
+        assert!(!stack.raw_socket(h_custom).can_recv());
+        assert!(!stack.raw_socket(h_any).can_recv());
 
         // Frame on the bound interface: the first matching socket takes it.
         let iface = stack.ifaces.get(iface_a.0);
@@ -1010,8 +1010,8 @@ mod test {
                 .inner
                 .process_raw_ethernet(iface, &mut stack.sockets.raw, ETHERTYPE_CUSTOM, false, buf_from(&frame));
         assert!(res.is_none());
-        assert_eq!(&*stack.raw(h_custom).recv().unwrap(), &frame[..]);
-        assert!(!stack.raw(h_any).can_recv());
+        assert_eq!(&*stack.raw_socket(h_custom).recv().unwrap(), &frame[..]);
+        assert!(!stack.raw_socket(h_any).can_recv());
 
         // A stack-handled ethertype skips the filtered socket, and the wildcard
         // socket gets a copy while the original is handed back.
@@ -1025,8 +1025,8 @@ mod test {
             buf_from(&frame),
         );
         assert_eq!(&*res.unwrap(), &frame[..]);
-        assert!(!stack.raw(h_custom).can_recv());
-        assert_eq!(&*stack.raw(h_any).recv().unwrap(), &frame[..]);
+        assert!(!stack.raw_socket(h_custom).can_recv());
+        assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &frame[..]);
     }
 
     #[test]
@@ -1036,24 +1036,27 @@ mod test {
         let handle = stack.add_raw_socket();
 
         let frame = eth_frame(ETHERTYPE_CUSTOM, b"hello");
-        assert_eq!(stack.raw(handle).send_slice(&frame), Err(SendError::Unaddressable));
+        assert_eq!(
+            stack.raw_socket(handle).send_slice(&frame),
+            Err(SendError::Unaddressable)
+        );
 
         stack
-            .raw(handle)
+            .raw_socket(handle)
             .bind(RawMode::Ethernet {
                 iface,
                 ethertype: Some(ETHERTYPE_CUSTOM),
             })
             .unwrap();
 
-        assert_eq!(stack.raw(handle).send_slice(&frame), Ok(()));
+        assert_eq!(stack.raw_socket(handle).send_slice(&frame), Ok(()));
         assert_eq!(*tx.borrow(), vec![frame.clone()]);
 
         // Shorter than an Ethernet header.
-        assert_eq!(stack.raw(handle).send_slice(&[0; 10]), Err(SendError::Malformed));
+        assert_eq!(stack.raw_socket(handle).send_slice(&[0; 10]), Err(SendError::Malformed));
         // Ethertype filter mismatch.
         let wrong = eth_frame(EthernetProtocol::Ipv4, b"hello");
-        assert_eq!(stack.raw(handle).send_slice(&wrong), Err(SendError::Malformed));
+        assert_eq!(stack.raw_socket(handle).send_slice(&wrong), Err(SendError::Malformed));
         assert_eq!(tx.borrow().len(), 1);
     }
 
@@ -1062,7 +1065,7 @@ mod test {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
         stack
-            .raw(handle)
+            .raw_socket(handle)
             .bind(RawMode::Ip {
                 version: Some(IpVersion::Ipv4),
                 protocol: None,
@@ -1071,7 +1074,10 @@ mod test {
 
         // No interface: no route to the destination.
         let packet = ipv4_packet(IP_PROTO, b"abcd");
-        assert_eq!(stack.raw(handle).send_slice(&packet), Err(SendError::Unaddressable));
+        assert_eq!(
+            stack.raw_socket(handle).send_slice(&packet),
+            Err(SendError::Unaddressable)
+        );
 
         // An IP-medium interface with the destination on-link. The packet goes out
         // byte for byte, the zeroed header checksum proves nothing rewrites it.
@@ -1080,19 +1086,25 @@ mod test {
             Medium::Ip,
             vec![IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24)],
         );
-        assert_eq!(stack.raw(handle).send_slice(&packet), Ok(()));
+        assert_eq!(stack.raw_socket(handle).send_slice(&packet), Ok(()));
         assert_eq!(*tx.borrow(), vec![packet.clone()]);
 
         // Malformed: empty, bogus version nibble, truncated header.
-        assert_eq!(stack.raw(handle).send_slice(&[]), Err(SendError::Malformed));
-        assert_eq!(stack.raw(handle).send_slice(&[0xf0; 40]), Err(SendError::Malformed));
-        assert_eq!(stack.raw(handle).send_slice(&packet[..10]), Err(SendError::Malformed));
+        assert_eq!(stack.raw_socket(handle).send_slice(&[]), Err(SendError::Malformed));
+        assert_eq!(
+            stack.raw_socket(handle).send_slice(&[0xf0; 40]),
+            Err(SendError::Malformed)
+        );
+        assert_eq!(
+            stack.raw_socket(handle).send_slice(&packet[..10]),
+            Err(SendError::Malformed)
+        );
         // Version filter mismatch: an IPv6 packet on an IPv4-bound socket.
         let v6 = ipv6_packet(IP_PROTO, b"abcd");
-        assert_eq!(stack.raw(handle).send_slice(&v6), Err(SendError::Malformed));
+        assert_eq!(stack.raw_socket(handle).send_slice(&v6), Err(SendError::Malformed));
         // Too big for a packet buffer (IP mode leaves room for the Ethernet header).
         assert_eq!(
-            stack.raw(handle).send_with(1503, |_| unreachable!()),
+            stack.raw_socket(handle).send_with(1503, |_| unreachable!()),
             Err(SendError::BufferFull)
         );
         assert_eq!(tx.borrow().len(), 1);
@@ -1108,7 +1120,7 @@ mod test {
         );
         let handle = stack.add_raw_socket();
         stack
-            .raw(handle)
+            .raw_socket(handle)
             .bind(RawMode::Ip {
                 version: None,
                 protocol: Some(IP_PROTO),
@@ -1116,10 +1128,15 @@ mod test {
             .unwrap();
 
         assert_eq!(
-            stack.raw(handle).send_slice(&ipv4_packet(IpProtocol::Tcp, b"nope")),
+            stack
+                .raw_socket(handle)
+                .send_slice(&ipv4_packet(IpProtocol::Tcp, b"nope")),
             Err(SendError::Malformed)
         );
-        assert_eq!(stack.raw(handle).send_slice(&ipv4_packet(IP_PROTO, b"yep")), Ok(()));
+        assert_eq!(
+            stack.raw_socket(handle).send_slice(&ipv4_packet(IP_PROTO, b"yep")),
+            Ok(())
+        );
         assert_eq!(tx.borrow().len(), 1);
     }
 }

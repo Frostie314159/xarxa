@@ -62,13 +62,16 @@ fn main() {
         .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100), iface);
 
     let udp_handle = stack.add_udp_socket();
-    stack.udp(udp_handle).bind(6969, IpListenEndpoint::UNSPECIFIED).unwrap();
+    stack
+        .udp_socket(udp_handle)
+        .bind(6969, IpListenEndpoint::UNSPECIFIED)
+        .unwrap();
 
     loop {
         let deadline = stack.poll(Instant::now());
 
         // Echo received datagrams back to their sender.
-        let mut socket = stack.udp(udp_handle);
+        let mut socket = stack.udp_socket(udp_handle);
         while let Ok(packet) = socket.recv() {
             let meta = packet.meta();
             log::info!("udp: echoing {} octets to {}", packet.payload().len(), meta);

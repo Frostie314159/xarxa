@@ -585,7 +585,7 @@ impl Stack {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "socket-udp")]
-    pub fn udp(&mut self, handle: UdpHandle) -> UdpSocket<'_> {
+    pub fn udp_socket(&mut self, handle: UdpHandle) -> UdpSocket<'_> {
         self.sockets.udp.get(handle.0); // Stale handles panic here, not on first use.
         UdpSocket {
             sockets: &mut self.sockets.udp,
@@ -617,7 +617,7 @@ impl Stack {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "socket-raw")]
-    pub fn raw(&mut self, handle: RawHandle) -> RawSocket<'_> {
+    pub fn raw_socket(&mut self, handle: RawHandle) -> RawSocket<'_> {
         RawSocket {
             state: self.sockets.raw.get_mut(handle.0),
             tx: TxContext {
@@ -656,7 +656,7 @@ impl Stack {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "socket-tcp")]
-    pub fn tcp(&mut self, handle: TcpHandle) -> TcpSocket<'_> {
+    pub fn tcp_socket(&mut self, handle: TcpHandle) -> TcpSocket<'_> {
         self.sockets.tcp.get(handle.0); // Stale handles panic here, not on first use.
         TcpSocket {
             sockets: &mut self.sockets.tcp,
@@ -2568,10 +2568,10 @@ mod test {
 
         // With a socket bound to the port, the datagram is delivered instead.
         let handle = stack.add_udp_socket();
-        stack.udp(handle).bind(7, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack.udp_socket(handle).bind(7, IpListenEndpoint::UNSPECIFIED).unwrap();
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
-        assert_eq!(&*stack.udp(handle).recv().unwrap(), b"echo?");
+        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"echo?");
     }
 
     #[test]
@@ -2580,7 +2580,7 @@ mod test {
         // An application handling UDP through a raw socket suppresses the error.
         let handle = stack.add_raw_socket();
         stack
-            .raw(handle)
+            .raw_socket(handle)
             .bind(RawMode::Ip {
                 version: Some(IpVersion::Ipv4),
                 protocol: Some(IpProtocol::Udp),
@@ -2592,7 +2592,7 @@ mod test {
         inject(&mut stack, &rx, packet.clone());
 
         assert!(tx.borrow().is_empty());
-        assert_eq!(&*stack.raw(handle).recv().unwrap(), &packet[..]);
+        assert_eq!(&*stack.raw_socket(handle).recv().unwrap(), &packet[..]);
     }
 
     #[test]
@@ -2649,7 +2649,7 @@ mod test {
     fn test_icmpv6_hop_by_hop_passthrough() {
         let (mut stack, rx, _tx) = test_stack(Medium::Ip);
         let handle = stack.add_udp_socket();
-        stack.udp(handle).bind(7, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack.udp_socket(handle).bind(7, IpListenEndpoint::UNSPECIFIED).unwrap();
 
         // PadN + an unknown option whose action is "skip" (high bits 00): the
         // packet continues to UDP and is delivered, headers intact.
@@ -2663,7 +2663,7 @@ mod test {
         );
         inject(&mut stack, &rx, packet);
 
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
         let recv = socket.recv().unwrap();
         assert_eq!(&*recv, b"echo?");
         assert_eq!(recv.meta().endpoint, IpEndpoint::new(REMOTE_V6.into(), 4000));
@@ -2760,7 +2760,7 @@ mod test {
         // A raw socket listening for ICMPv4, the erring application.
         let raw_handle = stack.add_raw_socket();
         stack
-            .raw(raw_handle)
+            .raw_socket(raw_handle)
             .bind(RawMode::Ip {
                 version: Some(IpVersion::Ipv4),
                 protocol: Some(IpProtocol::Icmp),
@@ -2771,8 +2771,14 @@ mod test {
         // packet is queued and an ARP request goes out.
         let dead = Ipv4Address::new(192, 168, 1, 99);
         let udp_handle = stack.add_udp_socket();
-        stack.udp(udp_handle).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
-        stack.udp(udp_handle).send_slice(b"anyone?", (dead, 1000)).unwrap();
+        stack
+            .udp_socket(udp_handle)
+            .bind(5555, IpListenEndpoint::UNSPECIFIED)
+            .unwrap();
+        stack
+            .udp_socket(udp_handle)
+            .send_slice(b"anyone?", (dead, 1000))
+            .unwrap();
         assert_eq!(tx.borrow().len(), 1); // the first ARP request
 
         // Let the resolution run out of probes.
@@ -2785,7 +2791,7 @@ mod test {
 
         // ...where the raw socket receives it: host unreachable, from us to us,
         // quoting the queued UDP packet.
-        let error = stack.raw(raw_handle).recv().unwrap();
+        let error = stack.raw_socket(raw_handle).recv().unwrap();
         let (msg_type, msg_code, quote) = parse_icmpv4_reply(&error, OUR_V4, OUR_V4);
         assert_eq!(msg_type, Icmpv4Message::DstUnreachable);
         assert_eq!(msg_code, Icmpv4DstUnreachable::HostUnreachable.into());
@@ -2903,7 +2909,10 @@ mod test {
         stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24));
 
         let handle = stack.add_udp_socket();
-        stack.udp(handle).bind(319, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack
+            .udp_socket(handle)
+            .bind(319, IpListenEndpoint::UNSPECIFIED)
+            .unwrap();
 
         // Ingress: driver → ethernet/IP/UDP demux → socket queue → recv.
         let datagram = udp_datagram(REMOTE_V4.into(), 319, OUR_V4.into(), 319, b"sync");
@@ -2912,7 +2921,7 @@ mod test {
             &rx,
             ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram),
         );
-        let packet = stack.udp(handle).recv().unwrap();
+        let packet = stack.udp_socket(handle).recv().unwrap();
         assert_eq!(&*packet, b"sync");
         assert_eq!(packet.meta().meta.id, 0x1111);
         assert_eq!(packet.meta().meta.timestamp, Some(RX_STAMP));
@@ -2921,7 +2930,7 @@ mod test {
         let mut meta: crate::udp::UdpMetadata = IpEndpoint::new(REMOTE_V4.into(), 319).into();
         meta.meta.id = 0x2222;
         meta.meta.request_timestamp = true;
-        stack.udp(handle).send_slice(b"delay_req", meta).unwrap();
+        stack.udp_socket(handle).send_slice(b"delay_req", meta).unwrap();
         assert_eq!(sent.borrow().len(), 1);
         assert_eq!(sent.borrow()[0].id, 0x2222);
         assert!(sent.borrow()[0].request_timestamp);
@@ -2941,8 +2950,8 @@ mod test {
     fn test_udp_icmp_error_delivery() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
         let handle = stack.add_udp_socket();
-        stack.udp(handle).bind(5000, (REMOTE_V4, 53)).unwrap();
-        stack.udp(handle).send_slice(b"query", (REMOTE_V4, 53)).unwrap();
+        stack.udp_socket(handle).bind(5000, (REMOTE_V4, 53)).unwrap();
+        stack.udp_socket(handle).send_slice(b"query", (REMOTE_V4, 53)).unwrap();
         let sent = tx.borrow().last().unwrap().clone();
 
         // A port unreachable arrives, quoting the datagram we sent.
@@ -2956,22 +2965,25 @@ mod test {
         inject(&mut stack, &rx, error);
 
         // recv reports it once, clearing it.
-        match stack.udp(handle).recv() {
+        match stack.udp_socket(handle).recv() {
             Err(UdpRecvError::IcmpError { error, remote }) => {
                 assert_eq!(error, IcmpError::PortUnreachable);
                 assert_eq!(remote, IpEndpoint::new(REMOTE_V4.into(), 53));
             }
             other => panic!("expected icmp error, got {:?}", other),
         }
-        assert_eq!(stack.udp(handle).take_icmp_error(), None);
-        assert!(matches!(stack.udp(handle).recv(), Err(UdpRecvError::Exhausted)));
+        assert_eq!(stack.udp_socket(handle).take_icmp_error(), None);
+        assert!(matches!(stack.udp_socket(handle).recv(), Err(UdpRecvError::Exhausted)));
     }
 
     #[test]
     fn test_udp_icmp_error_no_match() {
         let (mut stack, rx, _tx) = test_stack(Medium::Ip);
         let handle = stack.add_udp_socket();
-        stack.udp(handle).bind(5000, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack
+            .udp_socket(handle)
+            .bind(5000, IpListenEndpoint::UNSPECIFIED)
+            .unwrap();
 
         // An error quoting a flow from another local port: not for this socket.
         let quote = ipv4_packet(
@@ -2988,15 +3000,15 @@ mod test {
             &quote,
         );
         inject(&mut stack, &rx, error);
-        assert_eq!(stack.udp(handle).take_icmp_error(), None);
+        assert_eq!(stack.udp_socket(handle).take_icmp_error(), None);
     }
 
     #[test]
     fn test_udp_icmp_error_delivery_v6() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
         let handle = stack.add_udp_socket();
-        stack.udp(handle).bind(5000, (REMOTE_V6, 53)).unwrap();
-        stack.udp(handle).send_slice(b"query", (REMOTE_V6, 53)).unwrap();
+        stack.udp_socket(handle).bind(5000, (REMOTE_V6, 53)).unwrap();
+        stack.udp_socket(handle).send_slice(b"query", (REMOTE_V6, 53)).unwrap();
         let sent = tx.borrow().last().unwrap().clone();
 
         let error = icmpv6_error_packet(
@@ -3009,7 +3021,7 @@ mod test {
         inject(&mut stack, &rx, error);
 
         assert_eq!(
-            stack.udp(handle).take_icmp_error(),
+            stack.udp_socket(handle).take_icmp_error(),
             Some((IcmpError::PortUnreachable, IpEndpoint::new(REMOTE_V6.into(), 53)))
         );
     }
@@ -3019,8 +3031,11 @@ mod test {
         let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
         let dead = Ipv4Address::new(192, 168, 1, 99);
         let handle = stack.add_udp_socket();
-        stack.udp(handle).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
-        stack.udp(handle).send_slice(b"anyone?", (dead, 1000)).unwrap();
+        stack
+            .udp_socket(handle)
+            .bind(5555, IpListenEndpoint::UNSPECIFIED)
+            .unwrap();
+        stack.udp_socket(handle).send_slice(b"anyone?", (dead, 1000)).unwrap();
 
         // Let the ARP resolution run out of probes. The local destination
         // unreachable error lands on the socket, and nothing but the ARP
@@ -3029,7 +3044,7 @@ mod test {
             stack.poll(Instant::ZERO + Duration::from_secs(secs));
         }
         assert_eq!(
-            stack.udp(handle).take_icmp_error(),
+            stack.udp_socket(handle).take_icmp_error(),
             Some((IcmpError::HostUnreachable, IpEndpoint::new(dead.into(), 1000)))
         );
         assert_eq!(tx.borrow().len(), MAX_MULTICAST_SOLICIT as usize);
@@ -3039,9 +3054,9 @@ mod test {
     fn test_tcp_connect_aborted_by_icmp_error() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
         let handle = stack.add_tcp_socket(4096, 4096);
-        stack.tcp(handle).connect((REMOTE_V4, 80), 0).unwrap();
+        stack.tcp_socket(handle).connect((REMOTE_V4, 80), 0).unwrap();
         stack.poll(Instant::ZERO);
-        assert_eq!(stack.tcp(handle).state(), TcpState::SynSent);
+        assert_eq!(stack.tcp_socket(handle).state(), TcpState::SynSent);
         let syn = tx.borrow().last().unwrap().clone();
 
         // A host unreachable quoting our SYN aborts the nascent connection.
@@ -3054,15 +3069,18 @@ mod test {
         );
         inject(&mut stack, &rx, error);
 
-        assert_eq!(stack.tcp(handle).state(), TcpState::Closed);
-        assert_eq!(stack.tcp(handle).take_icmp_error(), Some(IcmpError::HostUnreachable));
+        assert_eq!(stack.tcp_socket(handle).state(), TcpState::Closed);
+        assert_eq!(
+            stack.tcp_socket(handle).take_icmp_error(),
+            Some(IcmpError::HostUnreachable)
+        );
     }
 
     #[test]
     fn test_tcp_established_icmp_error_is_soft() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
         let handle = stack.add_tcp_socket(4096, 4096);
-        stack.tcp(handle).connect((REMOTE_V4, 80), 0).unwrap();
+        stack.tcp_socket(handle).connect((REMOTE_V4, 80), 0).unwrap();
         stack.poll(Instant::ZERO);
         let syn = tx.borrow().last().unwrap().clone();
 
@@ -3090,10 +3108,10 @@ mod test {
             &rx,
             ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Tcp, &segment),
         );
-        assert_eq!(stack.tcp(handle).state(), TcpState::Established);
+        assert_eq!(stack.tcp_socket(handle).state(), TcpState::Established);
 
         // An error quoting an in-flight data segment is soft: recorded, not fatal.
-        stack.tcp(handle).send_slice(b"hello").unwrap();
+        stack.tcp_socket(handle).send_slice(b"hello").unwrap();
         stack.poll(Instant::ZERO);
         let data_segment = tx.borrow().last().unwrap().clone();
         let error = icmpv4_error_packet(
@@ -3104,8 +3122,11 @@ mod test {
             &data_segment,
         );
         inject(&mut stack, &rx, error);
-        assert_eq!(stack.tcp(handle).state(), TcpState::Established);
-        assert_eq!(stack.tcp(handle).take_icmp_error(), Some(IcmpError::HostUnreachable));
+        assert_eq!(stack.tcp_socket(handle).state(), TcpState::Established);
+        assert_eq!(
+            stack.tcp_socket(handle).take_icmp_error(),
+            Some(IcmpError::HostUnreachable)
+        );
 
         // An error quoting an out-of-window sequence number is a blind spoof:
         // ignored entirely.
@@ -3122,8 +3143,8 @@ mod test {
             &forged,
         );
         inject(&mut stack, &rx, error);
-        assert_eq!(stack.tcp(handle).state(), TcpState::Established);
-        assert_eq!(stack.tcp(handle).take_icmp_error(), None);
+        assert_eq!(stack.tcp_socket(handle).state(), TcpState::Established);
+        assert_eq!(stack.tcp_socket(handle).take_icmp_error(), None);
     }
 
     #[test]
@@ -3131,17 +3152,20 @@ mod test {
         let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
         let dead = Ipv4Address::new(192, 168, 1, 99);
         let handle = stack.add_tcp_socket(4096, 4096);
-        stack.tcp(handle).connect((dead, 80), 0).unwrap();
+        stack.tcp_socket(handle).connect((dead, 80), 0).unwrap();
 
         // The SYN is queued on the unresolvable neighbor. When resolution fails, the
         // local destination unreachable error aborts the connect.
         stack.poll(Instant::ZERO);
-        assert_eq!(stack.tcp(handle).state(), TcpState::SynSent);
+        assert_eq!(stack.tcp_socket(handle).state(), TcpState::SynSent);
         for secs in 1..=4 {
             stack.poll(Instant::ZERO + Duration::from_secs(secs));
         }
-        assert_eq!(stack.tcp(handle).state(), TcpState::Closed);
-        assert_eq!(stack.tcp(handle).take_icmp_error(), Some(IcmpError::HostUnreachable));
+        assert_eq!(stack.tcp_socket(handle).state(), TcpState::Closed);
+        assert_eq!(
+            stack.tcp_socket(handle).take_icmp_error(),
+            Some(IcmpError::HostUnreachable)
+        );
         // Nothing but ARP requests ever reached the wire.
         for frame in tx.borrow().iter() {
             let mut bytes = frame.clone();
@@ -3269,14 +3293,14 @@ mod test {
 
         // The neighbor is now resolved: a datagram to it goes out immediately.
         let udp = stack.add_udp_socket();
-        stack.udp(udp).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
-        stack.udp(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+        stack.udp_socket(udp).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
         assert_eq!(tx.borrow().len(), 2);
         assert_eq!(ethertype_of(&tx.borrow()[1]), EthernetProtocol::Ipv4);
 
         // Queue a packet on a neighbor that will never answer.
         let dead = Ipv4Address::new(192, 168, 1, 99);
-        stack.udp(udp).send_slice(b"anyone?", (dead, 1000)).unwrap();
+        stack.udp_socket(udp).send_slice(b"anyone?", (dead, 1000)).unwrap();
         assert_eq!(tx.borrow().len(), 3);
         assert_eq!(ethertype_of(&tx.borrow()[2]), EthernetProtocol::Arp);
 
@@ -3290,7 +3314,7 @@ mod test {
 
         // ...and the learned mapping is gone, so the next datagram to the remote
         // has to resolve it again.
-        stack.udp(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+        stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
         assert_eq!(tx.borrow().len(), 4);
         assert_eq!(ethertype_of(&tx.borrow()[3]), EthernetProtocol::Arp);
     }

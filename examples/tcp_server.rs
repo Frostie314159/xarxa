@@ -81,12 +81,15 @@ fn main() {
         // connection's socket buffers, and the socket answers the SYN with a
         // SYN|ACK on the next poll.
         while let Some(handle) = stack.tcp_listener(listener).accept(4096, 4096) {
-            log::info!("tcp: connection from {}", stack.tcp(handle).remote_endpoint().unwrap());
+            log::info!(
+                "tcp: connection from {}",
+                stack.tcp_socket(handle).remote_endpoint().unwrap()
+            );
             connections.push(handle);
         }
 
         connections.retain(|&handle| {
-            let mut socket = stack.tcp(handle);
+            let mut socket = stack.tcp_socket(handle);
 
             // Echo: move bytes from the receive buffer to the transmit buffer,
             // dequeueing no more than the transmit buffer has room for.

@@ -2180,14 +2180,14 @@ pub(crate) fn flush(state: &mut TcpSocketState, cx: &mut TxContext<'_>) {
 }
 
 /// A Transmission Control Protocol socket, borrowed from a [`Stack`] by
-/// [`Stack::tcp`].
+/// [`Stack::tcp_socket`].
 ///
 /// A TCP socket represents a single connection (connecting or connected): its
 /// 4-tuple is fully set from the start, by [`connect`](Self::connect) or by
 /// [`TcpListener::accept`]. Passive open lives in [`TcpListener`].
 ///
 /// [`Stack`]: crate::Stack
-/// [`Stack::tcp`]: crate::Stack::tcp
+/// [`Stack::tcp_socket`]: crate::Stack::tcp_socket
 pub struct TcpSocket<'a> {
     pub(crate) sockets: &'a mut Slab<TcpSocketState>,
     pub(crate) index: usize,
@@ -3327,9 +3327,9 @@ mod test {
         let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
         assert!(!stack.tcp_listener(h).can_accept());
         assert!(stack.tcp_listener(h).accept(64, 64).is_none());
-        assert_eq!(stack.tcp(sh).state(), State::SynReceived);
-        assert_eq!(stack.tcp(sh).local_endpoint(), Some(LOCAL_END));
-        assert_eq!(stack.tcp(sh).remote_endpoint(), Some(REMOTE_END));
+        assert_eq!(stack.tcp_socket(sh).state(), State::SynReceived);
+        assert_eq!(stack.tcp_socket(sh).local_endpoint(), Some(LOCAL_END));
+        assert_eq!(stack.tcp_socket(sh).remote_endpoint(), Some(REMOTE_END));
 
         // The accepted socket is exactly a SYN-RECEIVED socket: it sends the
         // SYN|ACK, advertising its actual receive window, and completes the
@@ -3882,14 +3882,14 @@ mod test {
 
         // Local port 0 allocates an ephemeral port. (The explicit local address
         // avoids needing an interface for source address selection.)
-        stack.tcp(h1).connect(REMOTE_END, (LOCAL_ADDR, 0)).unwrap();
-        let p1 = stack.tcp(h1).local_endpoint().unwrap().port;
+        stack.tcp_socket(h1).connect(REMOTE_END, (LOCAL_ADDR, 0)).unwrap();
+        let p1 = stack.tcp_socket(h1).local_endpoint().unwrap().port;
         assert!(p1 >= EPHEMERAL_PORT_MIN);
 
         // A second connection to the same remote would duplicate the 4-tuple,
         // so the allocation skips the port the first socket claimed.
-        stack.tcp(h2).connect(REMOTE_END, (LOCAL_ADDR, 0)).unwrap();
-        let p2 = stack.tcp(h2).local_endpoint().unwrap().port;
+        stack.tcp_socket(h2).connect(REMOTE_END, (LOCAL_ADDR, 0)).unwrap();
+        let p2 = stack.tcp_socket(h2).local_endpoint().unwrap().port;
         assert!(p2 >= EPHEMERAL_PORT_MIN);
         assert_ne!(p1, p2);
     }
@@ -3907,20 +3907,26 @@ mod test {
         let h3 = stack.add_tcp_socket(64, 64);
         let h4 = stack.add_tcp_socket(64, 64);
 
-        stack.tcp(h1).connect(REMOTE_END, (LOCAL_ADDR, LOCAL_PORT)).unwrap();
+        stack
+            .tcp_socket(h1)
+            .connect(REMOTE_END, (LOCAL_ADDR, LOCAL_PORT))
+            .unwrap();
 
         // Only the full 4-tuple must be unique: the same local endpoint may
         // connect to a different remote...
         stack
-            .tcp(h2)
+            .tcp_socket(h2)
             .connect(OTHER_REMOTE_END, (LOCAL_ADDR, LOCAL_PORT))
             .unwrap();
         // ...and a different local address may connect to the same remote.
-        stack.tcp(h3).connect(REMOTE_END, (OTHER_ADDR, LOCAL_PORT)).unwrap();
+        stack
+            .tcp_socket(h3)
+            .connect(REMOTE_END, (OTHER_ADDR, LOCAL_PORT))
+            .unwrap();
 
         // The identical 4-tuple is rejected.
         assert_eq!(
-            stack.tcp(h4).connect(REMOTE_END, (LOCAL_ADDR, LOCAL_PORT)),
+            stack.tcp_socket(h4).connect(REMOTE_END, (LOCAL_ADDR, LOCAL_PORT)),
             Err(ConnectError::InUse)
         );
     }
@@ -9877,8 +9883,8 @@ mod stack_test {
         // Accept allocates the actual socket, and the next poll sends the
         // SYN|ACK, advertising the socket's actual receive window.
         let h = stack.tcp_listener(lh).accept(64, 64).unwrap();
-        stack.tcp(h).set_ack_delay(None);
-        assert_eq!(stack.tcp(h).state(), State::SynReceived);
+        stack.tcp_socket(h).set_ack_delay(None);
+        assert_eq!(stack.tcp_socket(h).state(), State::SynReceived);
         stack.poll(Instant::from_millis(0));
         let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
         parse_tx(&mut frame, |tcp| {
@@ -9896,7 +9902,7 @@ mod stack_test {
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(1));
-        assert_eq!(stack.tcp(h).state(), State::Established);
+        assert_eq!(stack.tcp_socket(h).state(), State::Established);
         assert!(queues.borrow().tx.is_empty());
 
         // Data in, ACK out, and the data is readable from the socket.
@@ -9912,11 +9918,11 @@ mod stack_test {
             assert_eq!(tcp.ack_number(), REMOTE_SEQ + 1 + 5);
         });
         let mut data = [0; 8];
-        assert_eq!(stack.tcp(h).recv_slice(&mut data), Ok(5));
+        assert_eq!(stack.tcp_socket(h).recv_slice(&mut data), Ok(5));
         assert_eq!(&data[..5], b"hello");
 
         // Data out: enqueued by send, transmitted by the next poll.
-        assert_eq!(stack.tcp(h).send_slice(b"world"), Ok(5));
+        assert_eq!(stack.tcp_socket(h).send_slice(b"world"), Ok(5));
         stack.poll(Instant::from_millis(3));
         let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
         parse_tx(&mut frame, |tcp| {
@@ -9935,8 +9941,8 @@ mod stack_test {
         assert!(queues.borrow().tx.is_empty());
 
         // Close: the FIN is transmitted by the next poll.
-        stack.tcp(h).close();
-        assert_eq!(stack.tcp(h).state(), State::FinWait1);
+        stack.tcp_socket(h).close();
+        assert_eq!(stack.tcp_socket(h).state(), State::FinWait1);
         stack.poll(Instant::from_millis(4));
         let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
         parse_tx(&mut frame, |tcp| {
@@ -9993,7 +9999,7 @@ mod stack_test {
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(1));
-        assert_eq!(stack.tcp(h).state(), State::Established);
+        assert_eq!(stack.tcp_socket(h).state(), State::Established);
 
         // A SYN matching the established connection's exact 4-tuple goes to
         // the connected socket (which discards it: it carries no ACK) and
@@ -10022,8 +10028,11 @@ mod stack_test {
     fn test_stack_retransmission_timer() {
         let (mut stack, queues) = stack();
         let h = stack.add_tcp_socket(64, 64);
-        stack.tcp(h).set_ack_delay(None);
-        stack.tcp(h).connect((REMOTE_ADDR, REMOTE_PORT), LOCAL_PORT).unwrap();
+        stack.tcp_socket(h).set_ack_delay(None);
+        stack
+            .tcp_socket(h)
+            .connect((REMOTE_ADDR, REMOTE_PORT), LOCAL_PORT)
+            .unwrap();
 
         // The SYN is transmitted by the next poll, which returns the
         // retransmission deadline.

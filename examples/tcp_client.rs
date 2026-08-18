@@ -74,7 +74,7 @@ fn main() {
     let tcp_handle = stack.add_tcp_socket(4096, 4096);
 
     // Local port 0: the stack allocates an ephemeral port.
-    let mut socket = stack.tcp(tcp_handle);
+    let mut socket = stack.tcp_socket(tcp_handle);
     socket.connect(remote, 0).unwrap();
     log::info!("tcp: connecting to {remote} from {}", socket.local_endpoint().unwrap());
 
@@ -82,7 +82,7 @@ fn main() {
     loop {
         let deadline = stack.poll(Instant::now());
 
-        let mut socket = stack.tcp(tcp_handle);
+        let mut socket = stack.tcp_socket(tcp_handle);
 
         if !socket.is_active() {
             log::info!("tcp: connection closed");

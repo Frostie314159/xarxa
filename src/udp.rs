@@ -2,7 +2,7 @@
 //!
 //! [`Stack::add_udp_socket`](crate::Stack::add_udp_socket) creates a socket inside
 //! the stack and returns a [`UdpHandle`] identifying it. All operations go through
-//! [`Stack::udp`](crate::Stack::udp), which borrows the socket as a [`UdpSocket`]:
+//! [`Stack::udp_socket`](crate::Stack::udp_socket), which borrows the socket as a [`UdpSocket`]:
 //! receiving only touches the socket state, while sending transmits the datagram
 //! immediately.
 //!
@@ -338,10 +338,10 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
     (meta, payload)
 }
 
-/// A UDP socket borrowed from a [`Stack`], returned by [`Stack::udp`].
+/// A UDP socket borrowed from a [`Stack`], returned by [`Stack::udp_socket`].
 ///
 /// [`Stack`]: crate::Stack
-/// [`Stack::udp`]: crate::Stack::udp
+/// [`Stack::udp_socket`]: crate::Stack::udp_socket
 pub struct UdpSocket<'a> {
     pub(crate) sockets: &'a mut Slab<UdpSocketState>,
     pub(crate) index: usize,
@@ -1015,7 +1015,7 @@ mod test {
     #[test]
     fn test_bind() {
         let (mut stack, handle) = stack_with_socket();
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
         assert!(!socket.is_open());
         assert_eq!(socket.bind(LOCAL_PORT, ANY), Ok(()));
         assert!(socket.is_open());
@@ -1042,13 +1042,13 @@ mod test {
         let h1 = stack.add_udp_socket();
         let h2 = stack.add_udp_socket();
 
-        stack.udp(h1).bind(0, ANY).unwrap();
-        let p1 = stack.udp(h1).local_endpoint().port;
+        stack.udp_socket(h1).bind(0, ANY).unwrap();
+        let p1 = stack.udp_socket(h1).local_endpoint().port;
         assert!(p1 >= EPHEMERAL_PORT_MIN);
 
         // The second allocation must avoid the first socket's port.
-        stack.udp(h2).bind(0, ANY).unwrap();
-        let p2 = stack.udp(h2).local_endpoint().port;
+        stack.udp_socket(h2).bind(0, ANY).unwrap();
+        let p2 = stack.udp_socket(h2).local_endpoint().port;
         assert!(p2 >= EPHEMERAL_PORT_MIN);
         assert_ne!(p1, p2);
     }
@@ -1060,21 +1060,21 @@ mod test {
         let h2 = stack.add_udp_socket();
 
         // Identical 4-tuples conflict.
-        stack.udp(h1).bind(LOCAL_PORT, ANY).unwrap();
-        assert_eq!(stack.udp(h2).bind(LOCAL_PORT, ANY), Err(BindError::InUse));
+        stack.udp_socket(h1).bind(LOCAL_PORT, ANY).unwrap();
+        assert_eq!(stack.udp_socket(h2).bind(LOCAL_PORT, ANY), Err(BindError::InUse));
         // A specific address next to an address-less bind on the same port is
         // fine: the tuples differ, and demux picks the most specific match.
-        stack.udp(h2).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
+        stack.udp_socket(h2).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
 
         // Two different specific addresses may share a port.
         let h3 = stack.add_udp_socket();
         let h4 = stack.add_udp_socket();
         let h5 = stack.add_udp_socket();
-        stack.udp(h3).bind((LOCAL_ADDR, LOCAL_PORT + 2), ANY).unwrap();
-        stack.udp(h4).bind((OTHER_ADDR, LOCAL_PORT + 2), ANY).unwrap();
+        stack.udp_socket(h3).bind((LOCAL_ADDR, LOCAL_PORT + 2), ANY).unwrap();
+        stack.udp_socket(h4).bind((OTHER_ADDR, LOCAL_PORT + 2), ANY).unwrap();
         // ...but the same specific address may not.
         assert_eq!(
-            stack.udp(h5).bind((LOCAL_ADDR, LOCAL_PORT + 2), ANY),
+            stack.udp_socket(h5).bind((LOCAL_ADDR, LOCAL_PORT + 2), ANY),
             Err(BindError::InUse)
         );
     }
@@ -1089,16 +1089,24 @@ mod test {
 
         // A connected socket and a wildcard-remote socket share a local port:
         // the 4-tuples differ.
-        stack.udp(h1).bind(LOCAL_PORT, (REMOTE_ADDR, REMOTE_PORT)).unwrap();
-        stack.udp(h2).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
+        stack
+            .udp_socket(h1)
+            .bind(LOCAL_PORT, (REMOTE_ADDR, REMOTE_PORT))
+            .unwrap();
+        stack.udp_socket(h2).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
 
         // So do two sockets connected to different remotes.
-        stack.udp(h3).bind(LOCAL_PORT, (OTHER_ADDR, REMOTE_PORT)).unwrap();
+        stack
+            .udp_socket(h3)
+            .bind(LOCAL_PORT, (OTHER_ADDR, REMOTE_PORT))
+            .unwrap();
 
         // The identical local + remote is rejected. (h1's local address was
         // resolved to LOCAL_ADDR, so this bind duplicates its whole tuple.)
         assert_eq!(
-            stack.udp(h4).bind((LOCAL_ADDR, LOCAL_PORT), (REMOTE_ADDR, REMOTE_PORT)),
+            stack
+                .udp_socket(h4)
+                .bind((LOCAL_ADDR, LOCAL_PORT), (REMOTE_ADDR, REMOTE_PORT)),
             Err(BindError::InUse)
         );
     }
@@ -1112,14 +1120,20 @@ mod test {
 
         // The two halves of a dual stack are different tuples, so they may
         // share a port, as may the address-less bind that covers both.
-        stack.udp(h1).bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT), ANY).unwrap();
-        stack.udp(h2).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY).unwrap();
-        stack.udp(h3).bind(LOCAL_PORT, ANY).unwrap();
-        stack.udp(h3).close();
+        stack
+            .udp_socket(h1)
+            .bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT), ANY)
+            .unwrap();
+        stack
+            .udp_socket(h2)
+            .bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY)
+            .unwrap();
+        stack.udp_socket(h3).bind(LOCAL_PORT, ANY).unwrap();
+        stack.udp_socket(h3).close();
 
         // Identity does distinguish the versions: only the same half conflicts.
         assert_eq!(
-            stack.udp(h3).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY),
+            stack.udp_socket(h3).bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY),
             Err(BindError::InUse)
         );
     }
@@ -1127,7 +1141,7 @@ mod test {
     #[test]
     fn test_send_per_version_bind() {
         let (mut stack, handle) = stack_with_socket();
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
         socket.bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY).unwrap();
 
         // The bind scopes the socket to IPv6, so an IPv4 destination contradicts it.
@@ -1144,22 +1158,22 @@ mod test {
         let mut stack = stack_with_iface();
         let handle = stack.add_udp_socket();
         stack
-            .udp(handle)
+            .udp_socket(handle)
             .bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY)
             .unwrap();
 
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"no");
-        assert!(!stack.udp(handle).can_recv());
+        assert!(!stack.udp_socket(handle).can_recv());
 
         // The IPv4 half of the same port does take it.
         let handle = stack.add_udp_socket();
         stack
-            .udp(handle)
+            .udp_socket(handle)
             .bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT), ANY)
             .unwrap();
 
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"yes");
-        assert_eq!(&*stack.udp(handle).recv().unwrap(), b"yes");
+        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"yes");
     }
 
     #[test]
@@ -1168,7 +1182,7 @@ mod test {
 
         let mut stack = stack_with_iface();
         let handle = stack.add_udp_socket();
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
 
         // Local fully wildcard + exact remote: the ordinary connected client.
         // The local address is resolved from the routing tables, and an
@@ -1191,7 +1205,7 @@ mod test {
         // Without any interface there is no local address for the remote.
         let (mut stack, handle) = stack_with_socket();
         assert_eq!(
-            stack.udp(handle).bind(0, (REMOTE_ADDR, REMOTE_PORT)),
+            stack.udp_socket(handle).bind(0, (REMOTE_ADDR, REMOTE_PORT)),
             Err(BindError::Unaddressable)
         );
 
@@ -1199,7 +1213,7 @@ mod test {
         let mut stack = stack_with_iface();
         let handle = stack.add_udp_socket();
         assert_eq!(
-            stack.udp(handle).bind(
+            stack.udp_socket(handle).bind(
                 (LOCAL_ADDR, LOCAL_PORT),
                 (crate::wire::Ipv6Address::LOCALHOST, REMOTE_PORT)
             ),
@@ -1211,16 +1225,19 @@ mod test {
     fn test_connected_demux_filter() {
         let mut stack = stack_with_iface();
         let handle = stack.add_udp_socket();
-        stack.udp(handle).bind(LOCAL_PORT, (REMOTE_ADDR, REMOTE_PORT)).unwrap();
+        stack
+            .udp_socket(handle)
+            .bind(LOCAL_PORT, (REMOTE_ADDR, REMOTE_PORT))
+            .unwrap();
 
         // Matching the connected remote: delivered.
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"yes");
-        assert_eq!(&*stack.udp(handle).recv().unwrap(), b"yes");
+        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"yes");
 
         // Wrong source address or port: filtered out.
         deliver(&mut stack, OTHER_ADDR, REMOTE_PORT, b"no");
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT + 1, b"no");
-        assert!(!stack.udp(handle).can_recv());
+        assert!(!stack.udp_socket(handle).can_recv());
     }
 
     #[test]
@@ -1228,14 +1245,14 @@ mod test {
         // A partially specified remote: any port of one peer.
         let mut stack = stack_with_iface();
         let handle = stack.add_udp_socket();
-        stack.udp(handle).bind(LOCAL_PORT, (REMOTE_ADDR, 0)).unwrap();
+        stack.udp_socket(handle).bind(LOCAL_PORT, (REMOTE_ADDR, 0)).unwrap();
 
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"a");
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT + 1, b"b");
         deliver(&mut stack, OTHER_ADDR, REMOTE_PORT, b"no");
-        assert_eq!(&*stack.udp(handle).recv().unwrap(), b"a");
-        assert_eq!(&*stack.udp(handle).recv().unwrap(), b"b");
-        assert!(!stack.udp(handle).can_recv());
+        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"a");
+        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"b");
+        assert!(!stack.udp_socket(handle).can_recv());
     }
 
     #[test]
@@ -1247,10 +1264,10 @@ mod test {
         let h_any = stack.add_udp_socket();
         let h_addr = stack.add_udp_socket();
         let h_conn = stack.add_udp_socket();
-        stack.udp(h_any).bind(LOCAL_PORT, ANY).unwrap();
-        stack.udp(h_addr).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
+        stack.udp_socket(h_any).bind(LOCAL_PORT, ANY).unwrap();
+        stack.udp_socket(h_addr).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
         stack
-            .udp(h_conn)
+            .udp_socket(h_conn)
             .bind((LOCAL_ADDR, LOCAL_PORT), (REMOTE_ADDR, REMOTE_PORT))
             .unwrap();
 
@@ -1261,12 +1278,12 @@ mod test {
         // To another local address: only the wildcard socket matches.
         deliver_to(&mut stack, REMOTE_ADDR, REMOTE_PORT, OTHER_ADDR, b"any");
 
-        assert_eq!(&*stack.udp(h_conn).recv().unwrap(), b"conn");
-        assert!(!stack.udp(h_conn).can_recv());
-        assert_eq!(&*stack.udp(h_addr).recv().unwrap(), b"addr");
-        assert!(!stack.udp(h_addr).can_recv());
-        assert_eq!(&*stack.udp(h_any).recv().unwrap(), b"any");
-        assert!(!stack.udp(h_any).can_recv());
+        assert_eq!(&*stack.udp_socket(h_conn).recv().unwrap(), b"conn");
+        assert!(!stack.udp_socket(h_conn).can_recv());
+        assert_eq!(&*stack.udp_socket(h_addr).recv().unwrap(), b"addr");
+        assert!(!stack.udp_socket(h_addr).can_recv());
+        assert_eq!(&*stack.udp_socket(h_any).recv().unwrap(), b"any");
+        assert!(!stack.udp_socket(h_any).can_recv());
     }
 
     #[test]
@@ -1278,29 +1295,29 @@ mod test {
         let h_any = stack.add_udp_socket();
         let h_v4 = stack.add_udp_socket();
         let h_addr = stack.add_udp_socket();
-        stack.udp(h_any).bind(LOCAL_PORT, ANY).unwrap();
+        stack.udp_socket(h_any).bind(LOCAL_PORT, ANY).unwrap();
         stack
-            .udp(h_v4)
+            .udp_socket(h_v4)
             .bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT), ANY)
             .unwrap();
 
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"v4");
-        assert_eq!(&*stack.udp(h_v4).recv().unwrap(), b"v4");
-        assert!(!stack.udp(h_any).can_recv());
+        assert_eq!(&*stack.udp_socket(h_v4).recv().unwrap(), b"v4");
+        assert!(!stack.udp_socket(h_any).can_recv());
 
-        stack.udp(h_addr).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
+        stack.udp_socket(h_addr).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
 
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"addr");
-        assert_eq!(&*stack.udp(h_addr).recv().unwrap(), b"addr");
-        assert!(!stack.udp(h_v4).can_recv());
-        assert!(!stack.udp(h_any).can_recv());
+        assert_eq!(&*stack.udp_socket(h_addr).recv().unwrap(), b"addr");
+        assert!(!stack.udp_socket(h_v4).can_recv());
+        assert!(!stack.udp_socket(h_any).can_recv());
     }
 
     #[test]
     fn test_send_defaults_to_remote() {
         let mut stack = stack_with_iface();
         let handle = stack.add_udp_socket();
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
 
         // Unconnected socket: a wildcard destination is unaddressable.
         socket.bind(LOCAL_PORT, ANY).unwrap();
@@ -1351,7 +1368,7 @@ mod test {
         stack.iface(iface).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
 
         let handle = stack.add_udp_socket();
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
         // Ingress: the driver's metadata comes out of recv.
@@ -1378,7 +1395,7 @@ mod test {
     fn test_send_requires_own_src_addr() {
         let mut stack = stack_with_iface();
         let handle = stack.add_udp_socket();
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
         let dst = IpEndpoint::new(REMOTE_ADDR.into(), REMOTE_PORT);
@@ -1417,14 +1434,14 @@ mod test {
             .unwrap();
         assert_eq!(socket.send_slice(b"hi", dst), Ok(()));
         stack.ifaces.get_mut(0).ip_addrs = vec![IpCidr::new(OTHER_ADDR.into(), 24)];
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
         assert_eq!(socket.send_slice(b"hi", dst), Err(SendError::Unaddressable));
     }
 
     #[test]
     fn test_recv() {
         let (mut stack, handle) = stack_with_socket();
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
         assert!(!socket.can_recv());
@@ -1450,7 +1467,7 @@ mod test {
     #[test]
     fn test_peek_and_recv_slice() {
         let (mut stack, handle) = stack_with_socket();
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
         socket.inner_mut().rx_enqueue(queued_packet(b"abcdef"));
 
@@ -1472,7 +1489,7 @@ mod test {
     #[test]
     fn test_recv_slice_truncated() {
         let (mut stack, handle) = stack_with_socket();
-        let mut socket = stack.udp(handle);
+        let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
         socket.inner_mut().rx_enqueue(queued_packet(b"abcdef"));
 
