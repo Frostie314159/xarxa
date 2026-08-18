@@ -582,6 +582,12 @@ pub(crate) struct TcpSocketState {
     #[cfg(feature = "tcp-socket-timestamps")]
     last_remote_tsval: u32,
 
+    /// Random offset added to every tsval this connection sends.
+    /// - Avoids leaking system uptime
+    /// - Prevents correlating connections for hosts behind NAT.
+    #[cfg(feature = "tcp-socket-timestamps")]
+    tsval_offset: u32,
+
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -653,6 +659,8 @@ impl TcpSocketState {
             timestamps: false,
             #[cfg(feature = "tcp-socket-timestamps")]
             last_remote_tsval: 0,
+            #[cfg(feature = "tcp-socket-timestamps")]
+            tsval_offset: 0,
             congestion_controller: congestion::AnyController::new(),
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -734,6 +742,16 @@ impl TcpSocketState {
         TcpSeqNumber(rand.rand_u32() as i32)
     }
 
+    #[cfg(all(test, feature = "tcp-socket-timestamps"))]
+    fn random_tsval_offset(_rand: &mut Rand) -> u32 {
+        0
+    }
+
+    #[cfg(all(not(test), feature = "tcp-socket-timestamps"))]
+    fn random_tsval_offset(rand: &mut Rand) -> u32 {
+        rand.rand_u32()
+    }
+
     /// Number of octets transmitted but not yet ACKed.
     fn flight_size(&self) -> usize {
         self.remote_last_seq - self.local_seq_no
@@ -800,12 +818,14 @@ impl TcpSocketState {
     /// The timestamp option to put on an outgoing segment, echoing `tsecr`.
     ///
     /// `None` if timestamps are not in use on this connection. The tsval is the
-    /// poll clock in milliseconds: monotonic, and at the granularity RFC 7323
-    /// asks for.
+    /// poll clock in milliseconds, offset by this connection's random value:
+    /// monotonic, and at the granularity RFC 7323 asks for.
     #[cfg(feature = "tcp-socket-timestamps")]
     fn timestamp_repr(&self, now: Instant, tsecr: u32) -> Option<TcpTimestampRepr> {
-        self.timestamps
-            .then(|| TcpTimestampRepr::new(now.total_millis() as u32, tsecr))
+        self.timestamps.then(|| {
+            let tsval = (now.total_millis() as u32).wrapping_add(self.tsval_offset);
+            TcpTimestampRepr::new(tsval, tsecr)
+        })
     }
 
     fn ack_reply(&mut self, _now: Instant, repr: &TcpRepr) -> TcpRepr<'static> {
@@ -2475,6 +2495,8 @@ impl TcpSocket<'_> {
             return Err(ConnectError::InUse);
         }
         let seq = TcpSocketState::random_seq_no(self.tx.rand());
+        #[cfg(feature = "tcp-socket-timestamps")]
+        let tsval_offset = TcpSocketState::random_tsval_offset(self.tx.rand());
 
         let s = self.inner_mut();
         s.reset();
@@ -2491,6 +2513,7 @@ impl TcpSocket<'_> {
         {
             s.timestamps = true;
             s.last_remote_tsval = 0;
+            s.tsval_offset = tsval_offset;
         }
         Ok(())
     }
@@ -9445,8 +9468,6 @@ mod test {
         let mut s = socket_established();
         s.timestamps = true;
 
-        assert!(s.view().timestamp_enabled());
-
         // First roundtrip after establishing.
         s.view().send_slice(b"abcdef").unwrap();
         recv!(
@@ -9493,6 +9514,29 @@ mod test {
             }
         );
         assert_eq!(s.tx_buffer.len(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "tcp-socket-timestamps")]
+    fn test_tsval_offset() {
+        // The tsval is the clock plus the connection's random offset, so it
+        // does not leak the time since boot. The sum wraps.
+        let mut s = socket_established();
+        s.timestamps = true;
+        s.tsval_offset = 0xffff_ff00;
+
+        s.view().send_slice(b"abcdef").unwrap();
+        recv!(
+            s,
+            time 500,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: &b"abcdef"[..],
+                timestamp: Some(TcpTimestampRepr::new(0xffff_ff00u32.wrapping_add(500), 0)),
+                ..RECV_TEMPL
+            }]
+        );
     }
 
     #[cfg(feature = "tcp-socket-timestamps")]

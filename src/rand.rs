@@ -3,6 +3,7 @@
 //! This is used for:
 //! - Source ports for TCP and UDP.
 //! - TCP initial sequence numbers.
+//! - TCP timestamp random offsets.
 
 // In test builds the TCP initial sequence number is a fixed value, and without
 // sockets nothing needs random numbers at all, leaving the PRNG unused.

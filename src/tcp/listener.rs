@@ -332,6 +332,7 @@ impl TcpListener<'_> {
         {
             s.timestamps = syn.timestamp.is_some();
             s.last_remote_tsval = syn.timestamp.map_or(0, |ts| ts.tsval);
+            s.tsval_offset = TcpSocketState::random_tsval_offset(self.rand);
         }
 
         Some(TcpHandle(self.tcp.add_with(|_| s)))
