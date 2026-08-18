@@ -67,7 +67,7 @@ pub(crate) struct IfaceState {
     #[cfg_attr(not(any(feature = "socket", feature = "medium-ethernet")), allow(dead_code))]
     handle: IfaceHandle,
     dev: Box<dyn Interface>,
-    hardware_addr: EthernetAddress,
+    hardware_addr: HardwareAddress,
     pub(crate) ip_addrs: Vec<IpCidr>,
 }
 
@@ -114,20 +114,27 @@ impl Iface<'_> {
         self.state_mut().dev.poll_tx_timestamp()
     }
 
-    /// The hardware (MAC) address of the interface.
-    ///
-    /// Meaningful on [`Medium::Ethernet`] interfaces only.
-    pub fn hardware_addr(&self) -> EthernetAddress {
+    /// The hardware address of the interface.
+    pub fn hardware_addr(&self) -> HardwareAddress {
         self.state().hardware_addr
     }
 
-    /// Set the hardware (MAC) address of the interface.
+    /// Set the hardware address of the interface.
     ///
     /// The stack starts using it for the frames it sends and for ingress filtering
     /// immediately. It does not announce the change on the link, so peers keep the
     /// old address in their neighbor caches until it expires. Send a gratuitous ARP
     /// or unsolicited neighbor advertisement from a raw socket if that matters.
-    pub fn set_hardware_addr(&mut self, addr: EthernetAddress) {
+    ///
+    /// # Panics
+    /// Panics if the address is not of the kind the device's medium uses.
+    pub fn set_hardware_addr(&mut self, addr: HardwareAddress) {
+        let medium = self.state().dev.capabilities().medium;
+        assert_eq!(
+            addr.medium(),
+            medium,
+            "hardware address does not match the interface's medium"
+        );
         self.state_mut().hardware_addr = addr;
     }
 
@@ -491,15 +498,26 @@ impl Stack {
     /// add an IP address to it.
     ///
     /// ```no_run
-    /// # use xarxa::{Stack, iface::Interface, wire::{EthernetAddress, IpCidr, Ipv4Address}};
+    /// # use xarxa::{Stack, iface::Interface, wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address}};
     /// # fn configure(stack: &mut Stack, dev: Box<dyn Interface>) {
-    /// let handle = stack.add_iface(dev, EthernetAddress([0x02, 0, 0, 0, 0, 0x01]));
+    /// let handle = stack.add_iface(
+    ///     dev,
+    ///     HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
+    /// );
     /// stack
     ///     .iface(handle)
     ///     .add_ip_addr(IpCidr::new(Ipv4Address::new(192, 168, 1, 1).into(), 24));
     /// # }
     /// ```
-    pub fn add_iface(&mut self, dev: Box<dyn Interface>, hardware_addr: EthernetAddress) -> IfaceHandle {
+    ///
+    /// # Panics
+    /// Panics if the hardware address is not of the kind the device's medium uses.
+    pub fn add_iface(&mut self, dev: Box<dyn Interface>, hardware_addr: HardwareAddress) -> IfaceHandle {
+        assert_eq!(
+            hardware_addr.medium(),
+            dev.capabilities().medium,
+            "hardware address does not match the interface's medium"
+        );
         let index = self.ifaces.add_with(|index| IfaceState {
             handle: IfaceHandle(index),
             dev,
@@ -770,7 +788,7 @@ impl StackInner {
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
         if !eth_frame.dst_addr().is_broadcast()
             && !eth_frame.dst_addr().is_multicast()
-            && eth_frame.dst_addr() != iface.hardware_addr
+            && eth_frame.dst_addr() != iface.ethernet_addr()
         {
             return;
         }
@@ -876,7 +894,7 @@ impl StackInner {
                 arp_reply.set_hardware_len(6);
                 arp_reply.set_protocol_len(4);
                 arp_reply.set_operation(ArpOperation::Reply);
-                arp_reply.set_source_hardware_addr(iface.hardware_addr.as_bytes());
+                arp_reply.set_source_hardware_addr(iface.ethernet_addr().as_bytes());
                 arp_reply.set_source_protocol_addr(&target_protocol_addr.octets());
                 arp_reply.set_target_hardware_addr(source_hardware_addr.as_bytes());
                 arp_reply.set_target_protocol_addr(&source_protocol_addr.octets());
@@ -1426,7 +1444,7 @@ impl StackInner {
                     let mut opt = NdiscOption::new_unchecked(na.payload_mut());
                     opt.set_option_type(NdiscOptionType::TargetLinkLayerAddr);
                     opt.set_data_len(1);
-                    opt.set_link_layer_addr(RawHardwareAddress::from(iface.hardware_addr));
+                    opt.set_link_layer_addr(RawHardwareAddress::from(iface.ethernet_addr()));
                 }
                 na.fill_checksum(&target_addr, &src_addr);
             }
@@ -1666,7 +1684,7 @@ impl StackInner {
             arp_packet.set_hardware_len(6);
             arp_packet.set_protocol_len(4);
             arp_packet.set_operation(ArpOperation::Request);
-            arp_packet.set_source_hardware_addr(iface.hardware_addr.as_bytes());
+            arp_packet.set_source_hardware_addr(iface.ethernet_addr().as_bytes());
             arp_packet.set_source_protocol_addr(&source_protocol_addr.octets());
             arp_packet.set_target_hardware_addr(EthernetAddress::BROADCAST.as_bytes());
             arp_packet.set_target_protocol_addr(&target_addr.octets());
@@ -1694,7 +1712,7 @@ impl StackInner {
                 let mut opt = NdiscOption::new_unchecked(ns.payload_mut());
                 opt.set_option_type(NdiscOptionType::SourceLinkLayerAddr);
                 opt.set_data_len(1);
-                opt.set_link_layer_addr(RawHardwareAddress::from(iface.hardware_addr));
+                opt.set_link_layer_addr(RawHardwareAddress::from(iface.ethernet_addr()));
             }
             ns.fill_checksum(&src_addr, &dst_addr);
         }
@@ -1839,7 +1857,7 @@ impl StackInner {
         buf.push_front(ETHERNET_HEADER_LEN);
         let mut frame = EthernetFrame::new_unchecked(&mut buf);
         frame.set_dst_addr(dst_hw);
-        frame.set_src_addr(iface.hardware_addr);
+        frame.set_src_addr(iface.ethernet_addr());
         frame.set_ethertype(ethertype);
         self.transmit_raw(iface, buf);
     }
@@ -2036,6 +2054,15 @@ impl IfaceState {
     #[cfg(all(feature = "socket-raw", feature = "medium-ethernet"))]
     pub(crate) fn medium(&self) -> Medium {
         self.dev.capabilities().medium
+    }
+
+    /// The interface's Ethernet address.
+    ///
+    /// Panics on a non-Ethernet interface; only the Ethernet paths call it, and
+    /// `add_iface` checks the address matches the medium.
+    #[cfg(feature = "medium-ethernet")]
+    fn ethernet_addr(&self) -> EthernetAddress {
+        self.hardware_addr.ethernet_or_panic()
     }
 
     /// The interface's IP-layer MTU: the device MTU minus the Ethernet header on
@@ -2374,6 +2401,7 @@ mod test {
         }
     }
 
+    const OUR_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
     const OUR_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
     const REMOTE_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
     const OUR_V6: Ipv6Address = Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 1);
@@ -2394,7 +2422,10 @@ mod test {
                 rx: rx.clone(),
                 tx: tx.clone(),
             }),
-            EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
+            match medium {
+                Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
+                Medium::Ip => HardwareAddress::Ip,
+            },
         );
         stack
             .iface(handle)
@@ -2867,7 +2898,7 @@ mod test {
                 sent: sent.clone(),
                 tx_stamps: Rc::new(RefCell::new(VecDeque::new())),
             }),
-            EthernetAddress([0x02, 0, 0, 0, 0, 0x01]),
+            HardwareAddress::Ip,
         );
         stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24));
 

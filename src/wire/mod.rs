@@ -55,6 +55,8 @@ mod udp;
 
 use core::fmt;
 
+use crate::iface::Medium;
+
 pub use self::ethernet::{
     Address as EthernetAddress, EtherType as EthernetProtocol, Frame as EthernetFrame,
     HEADER_LEN as ETHERNET_HEADER_LEN,
@@ -154,6 +156,72 @@ impl fmt::Display for Error {
 
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// A hardware (link-layer) address.
+///
+/// Which variants exist depends on the enabled `medium-*` features. In a build
+/// that only drives [`Medium::Ip`](crate::iface::Medium::Ip) interfaces this
+/// type has a single variant and takes up no space.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareAddress {
+    /// An Ethernet (MAC) address. Requires the `medium-ethernet` feature.
+    #[cfg(feature = "medium-ethernet")]
+    Ethernet(EthernetAddress),
+    /// No address, for interfaces that send and receive bare IP packets.
+    /// Requires the `medium-ip` feature.
+    #[cfg(feature = "medium-ip")]
+    Ip,
+}
+
+impl HardwareAddress {
+    /// The medium this kind of address belongs to.
+    pub const fn medium(&self) -> Medium {
+        match self {
+            #[cfg(feature = "medium-ethernet")]
+            HardwareAddress::Ethernet(_) => Medium::Ethernet,
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => Medium::Ip,
+        }
+    }
+
+    /// The Ethernet address, or `None` if this is not one.
+    #[cfg(feature = "medium-ethernet")]
+    pub const fn ethernet(&self) -> Option<EthernetAddress> {
+        match self {
+            HardwareAddress::Ethernet(addr) => Some(*addr),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "medium-ethernet")]
+    pub(crate) fn ethernet_or_panic(&self) -> EthernetAddress {
+        match self {
+            HardwareAddress::Ethernet(addr) => *addr,
+            #[allow(unreachable_patterns)]
+            _ => panic!("hardware address is not an Ethernet address"),
+        }
+    }
+}
+
+impl fmt::Display for HardwareAddress {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            #[cfg(feature = "medium-ethernet")]
+            HardwareAddress::Ethernet(addr) => write!(f, "{addr}"),
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => write!(f, "none"),
+        }
+    }
+}
+
+#[cfg(feature = "medium-ethernet")]
+impl From<EthernetAddress> for HardwareAddress {
+    fn from(addr: EthernetAddress) -> Self {
+        HardwareAddress::Ethernet(addr)
+    }
+}
+
 pub const MAX_HARDWARE_ADDRESS_LEN: usize = 6;
 
 /// Unparsed hardware address.
@@ -217,5 +285,15 @@ impl core::fmt::Display for RawHardwareAddress {
 impl From<EthernetAddress> for RawHardwareAddress {
     fn from(addr: EthernetAddress) -> Self {
         Self::from_bytes(addr.as_bytes())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    /// A build that only drives IP interfaces pays nothing for hardware addresses.
+    #[test]
+    #[cfg(all(feature = "medium-ip", not(feature = "medium-ethernet")))]
+    fn test_hardware_address_is_zero_sized() {
+        assert_eq!(core::mem::size_of::<super::HardwareAddress>(), 0);
     }
 }

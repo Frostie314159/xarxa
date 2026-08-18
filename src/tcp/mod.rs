@@ -2840,7 +2840,7 @@ mod test {
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface, Medium};
     use crate::stack::Stack;
-    use crate::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv6Address};
+    use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
 
@@ -3089,10 +3089,7 @@ mod test {
     /// A stack with one interface owning `LOCAL_ADDR`.
     fn test_stack() -> Stack {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_iface(
-            Box::new(TestingDevice),
-            EthernetAddress([0x02, 0x02, 0x02, 0x02, 0x02, 0x02]),
-        );
+        let handle = stack.add_iface(Box::new(TestingDevice), HardwareAddress::Ip);
         stack.iface(handle).set_ip_addrs([
             IpCidr::new(LOCAL_ADDR.into(), 24),
             IpCidr::new(Ipv4Address::new(127, 0, 0, 1).into(), 8),
@@ -5235,7 +5232,7 @@ mod test {
 
         let mut s = socket_with_buffer_sizes(2048, 64);
         s.stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = s.stack.add_iface(Box::new(SmallMtuDevice), EthernetAddress([0x02; 6]));
+        let handle = s.stack.add_iface(Box::new(SmallMtuDevice), HardwareAddress::Ip);
         s.stack.iface(handle).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
         s.state = State::SynSent;
         s.tuple = Some(TUPLE);
@@ -9758,7 +9755,7 @@ mod stack_test {
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface, Medium};
     use crate::stack::Stack;
-    use crate::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Packet};
+    use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv4Packet};
     use std::cell::RefCell;
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -9818,7 +9815,7 @@ mod stack_test {
     fn stack() -> (Stack, Rc<RefCell<Queues>>) {
         let queues = Rc::new(RefCell::new(Queues::default()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_iface(Box::new(QueueDevice(queues.clone())), EthernetAddress([0x02; 6]));
+        let handle = stack.add_iface(Box::new(QueueDevice(queues.clone())), HardwareAddress::Ip);
         stack.iface(handle).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
         (stack, queues)
     }

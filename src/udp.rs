@@ -917,7 +917,7 @@ mod test {
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface, Medium};
     use crate::stack::Stack;
-    use crate::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv6Address};
+    use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
     fn stack_with_socket() -> (Stack, UdpHandle) {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
@@ -958,7 +958,7 @@ mod test {
     /// specified remote can resolve their local address.
     fn stack_with_iface() -> Stack {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_iface(Box::new(TestingDevice), EthernetAddress([0x02; 6]));
+        let handle = stack.add_iface(Box::new(TestingDevice), HardwareAddress::Ip);
         stack.iface(handle).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
         stack
     }
@@ -1347,7 +1347,7 @@ mod test {
 
         let sent = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = stack.add_iface(Box::new(MetaDevice(sent.clone())), EthernetAddress([0x02; 6]));
+        let iface = stack.add_iface(Box::new(MetaDevice(sent.clone())), HardwareAddress::Ip);
         stack.iface(iface).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
 
         let handle = stack.add_udp_socket();

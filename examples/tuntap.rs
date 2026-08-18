@@ -25,7 +25,7 @@ use std::os::unix::io::AsRawFd;
 use xarxa::iface::{Medium, TunTapInterface, wait};
 use xarxa::stack::Stack;
 use xarxa::time::Instant;
-use xarxa::wire::{EthernetAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address};
+use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
@@ -43,7 +43,13 @@ fn main() {
     let fd = device.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());
-    let iface = stack.add_iface(Box::new(device), EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]));
+    let iface = stack.add_iface(
+        Box::new(device),
+        match medium {
+            Medium::Ip => HardwareAddress::Ip,
+            Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])),
+        },
+    );
     stack.iface(iface).set_ip_addrs([
         IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24),
         IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
