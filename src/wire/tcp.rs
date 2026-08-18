@@ -116,6 +116,7 @@ mod field {
     pub const OPT_WS: u8 = 0x03;
     pub const OPT_SACKPERM: u8 = 0x04;
     pub const OPT_SACKRNG: u8 = 0x05;
+    #[cfg(feature = "tcp-socket-timestamps")]
     pub const OPT_TSTAMP: u8 = 0x08;
 }
 
@@ -471,8 +472,15 @@ pub enum TcpOption<'a> {
     WindowScale(u8),
     SackPermitted,
     SackRange([Option<(u32, u32)>; 3]),
-    TimeStamp { tsval: u32, tsecr: u32 },
-    Unknown { kind: u8, data: &'a [u8] },
+    #[cfg(feature = "tcp-socket-timestamps")]
+    TimeStamp {
+        tsval: u32,
+        tsecr: u32,
+    },
+    Unknown {
+        kind: u8,
+        data: &'a [u8],
+    },
 }
 
 impl<'a> TcpOption<'a> {
@@ -533,6 +541,7 @@ impl<'a> TcpOption<'a> {
                         });
                         option = TcpOption::SackRange(sack_ranges);
                     }
+                    #[cfg(feature = "tcp-socket-timestamps")]
                     (field::OPT_TSTAMP, 10) => {
                         let tsval = NetworkEndian::read_u32(&data[0..4]);
                         let tsecr = NetworkEndian::read_u32(&data[4..8]);
@@ -553,6 +562,7 @@ impl<'a> TcpOption<'a> {
             TcpOption::WindowScale(_) => 3,
             TcpOption::SackPermitted => 2,
             TcpOption::SackRange(s) => s.iter().filter(|s| s.is_some()).count() * 8 + 2,
+            #[cfg(feature = "tcp-socket-timestamps")]
             TcpOption::TimeStamp { tsval: _, tsecr: _ } => 10,
             TcpOption::Unknown { data, .. } => 2 + data.len(),
         }
@@ -597,6 +607,7 @@ impl<'a> TcpOption<'a> {
                             NetworkEndian::write_u32(&mut buffer[pos + 4..], second);
                         });
                     }
+                    #[cfg(feature = "tcp-socket-timestamps")]
                     &TcpOption::TimeStamp { tsval, tsecr } => {
                         buffer[0] = field::OPT_TSTAMP;
                         NetworkEndian::write_u32(&mut buffer[2..], tsval);
@@ -761,6 +772,7 @@ mod test {
                 0xa0, 0x34, 0x3e, 0xfc, 0xea, 0x34, 0x40, 0xae, 0xf0
             ]
         );
+        #[cfg(feature = "tcp-socket-timestamps")]
         assert_option_parses!(
             TcpOption::TimeStamp {
                 tsval: 5000000,

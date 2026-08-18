@@ -34,6 +34,8 @@ socket-raw = ["socket"]
 socket-udp = ["socket"]
 ## TCP sockets and listeners.
 socket-tcp = ["socket"]
+## Send and receive the TCP timestamp option (RFC 7323).
+tcp-socket-timestamps = ["socket-tcp"]
 ## Enabled automatically by the `socket-*` features: "this build has sockets at
 ## all", which is what the socket-side stack machinery (the egress context,
 ## ephemeral port allocation, demux scoring) is gated on. Do not enable directly.

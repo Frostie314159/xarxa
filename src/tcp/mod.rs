@@ -35,7 +35,8 @@ use self::assembler::Assembler;
 pub use self::listener::{TcpListener, TcpListenerHandle};
 pub(crate) use self::listener::{TcpListenerState, process_listeners};
 pub(crate) use self::repr::TcpRepr;
-pub use self::repr::{TcpTimestampGenerator, TcpTimestampRepr};
+#[cfg(feature = "tcp-socket-timestamps")]
+pub(crate) use self::repr::TcpTimestampRepr;
 use self::ring_buffer::RingBuffer;
 
 /// The IP MTU assumed for TCP segment sizing until the destination has been
@@ -570,10 +571,15 @@ pub(crate) struct TcpSocketState {
     /// The congestion control algorithm.
     congestion_controller: congestion::AnyController,
 
-    /// tsval generator - if some, tcp timestamp is enabled
-    tsval_generator: Option<TcpTimestampGenerator>,
+    /// Whether the TCP timestamp option (RFC 7323) is in use on this connection.
+    /// We offer it in the SYN of every connection we open, and answer with it if
+    /// the peer offered it; it stays on only if both ends did.
+    #[cfg(feature = "tcp-socket-timestamps")]
+    timestamps: bool,
 
-    /// 0 if not seen or timestamp not enabled
+    /// The last tsval received from the peer, echoed back as tsecr in every
+    /// segment we send. Zero until the first segment carrying a timestamp.
+    #[cfg(feature = "tcp-socket-timestamps")]
     last_remote_tsval: u32,
 
     #[cfg(feature = "async")]
@@ -643,7 +649,9 @@ impl TcpSocketState {
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
             nagle: true,
-            tsval_generator: None,
+            #[cfg(feature = "tcp-socket-timestamps")]
+            timestamps: false,
+            #[cfg(feature = "tcp-socket-timestamps")]
             last_remote_tsval: 0,
             congestion_controller: congestion::AnyController::new(),
             #[cfg(feature = "async")]
@@ -767,6 +775,7 @@ impl TcpSocketState {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            #[cfg(feature = "tcp-socket-timestamps")]
             timestamp: None,
             payload: &[],
         }
@@ -788,11 +797,26 @@ impl TcpSocketState {
         reply_repr
     }
 
-    fn ack_reply(&mut self, repr: &TcpRepr) -> TcpRepr<'static> {
+    /// The timestamp option to put on an outgoing segment, echoing `tsecr`.
+    ///
+    /// `None` if timestamps are not in use on this connection. The tsval is the
+    /// poll clock in milliseconds: monotonic, and at the granularity RFC 7323
+    /// asks for.
+    #[cfg(feature = "tcp-socket-timestamps")]
+    fn timestamp_repr(&self, now: Instant, tsecr: u32) -> Option<TcpTimestampRepr> {
+        self.timestamps
+            .then(|| TcpTimestampRepr::new(now.total_millis() as u32, tsecr))
+    }
+
+    fn ack_reply(&mut self, _now: Instant, repr: &TcpRepr) -> TcpRepr<'static> {
         let mut reply_repr = Self::reply(repr);
-        reply_repr.timestamp = repr
-            .timestamp
-            .and_then(|tcp_ts| tcp_ts.generate_reply(self.tsval_generator));
+        // Echo the incoming tsval, if the segment we are replying to carried one.
+        #[cfg(feature = "tcp-socket-timestamps")]
+        {
+            reply_repr.timestamp = repr
+                .timestamp
+                .and_then(|tcp_ts| self.timestamp_repr(_now, tcp_ts.tsval));
+        }
 
         // From RFC 793:
         // [...] an empty acknowledgment segment containing the current send-sequence number
@@ -858,7 +882,7 @@ impl TcpSocketState {
         // Rate-limit to 1 per second max.
         self.challenge_ack_timer = now + Duration::from_secs(1);
 
-        Some(self.ack_reply(repr))
+        Some(self.ack_reply(now, repr))
     }
 
     pub(crate) fn accepts(&self, src_addr: &IpAddress, dst_addr: &IpAddress, repr: &TcpRepr) -> bool {
@@ -1119,7 +1143,7 @@ impl TcpSocketState {
                     if !repr.payload.is_empty()
                         && matches!(repr.control, TcpControl::None | TcpControl::Psh | TcpControl::Fin)
                     {
-                        return Some(self.ack_reply(repr));
+                        return Some(self.ack_reply(now, repr));
                     }
 
                     return self.challenge_ack_reply(now, repr);
@@ -1218,9 +1242,10 @@ impl TcpSocketState {
                 if self.remote_win_scale.is_none() {
                     self.remote_win_shift = 0;
                 }
-                // Remote doesn't support timestamping, don't do it.
-                if repr.timestamp.is_none() {
-                    self.tsval_generator = None;
+                // Timestamps stay on only if the remote offered them too.
+                #[cfg(feature = "tcp-socket-timestamps")]
+                {
+                    self.timestamps = repr.timestamp.is_some();
                 }
 
                 if repr.ack_number.is_some() {
@@ -1401,6 +1426,7 @@ impl TcpSocketState {
         }
 
         // update last remote tsval
+        #[cfg(feature = "tcp-socket-timestamps")]
         if let Some(timestamp) = repr.timestamp {
             self.last_remote_tsval = timestamp.tsval;
         }
@@ -1510,7 +1536,7 @@ impl TcpSocketState {
             // This is fine because xarxa assumes that it can always transmit zero or one
             // packets for every packet it receives.
             trace!("ACKing incoming segment");
-            Some(self.ack_reply(repr))
+            Some(self.ack_reply(now, repr))
         } else {
             None
         }
@@ -1537,7 +1563,10 @@ impl TcpSocketState {
         };
 
         // The effective max segment size, taking into account the options and the local and remote limits.
-        let options_len = if self.tsval_generator.is_some() { 12 } else { 0 };
+        #[cfg(feature = "tcp-socket-timestamps")]
+        let options_len = if self.timestamps { 12 } else { 0 };
+        #[cfg(not(feature = "tcp-socket-timestamps"))]
+        let options_len = 0;
 
         let local_mss = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
         let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
@@ -1788,7 +1817,8 @@ impl TcpSocketState {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
-            timestamp: TcpTimestampRepr::generate_reply_with_tsval(self.tsval_generator, self.last_remote_tsval),
+            #[cfg(feature = "tcp-socket-timestamps")]
+            timestamp: self.timestamp_repr(cx.now(), self.last_remote_tsval),
             payload: &[],
         };
 
@@ -2194,16 +2224,6 @@ impl TcpSocket<'_> {
         self.inner_mut().tx_waker.register(waker)
     }
 
-    /// Enable or disable TCP Timestamp.
-    pub fn set_tsval_generator(&mut self, generator: Option<TcpTimestampGenerator>) {
-        self.inner_mut().tsval_generator = generator;
-    }
-
-    /// Return whether TCP Timestamp is enabled.
-    pub fn timestamp_enabled(&self) -> bool {
-        self.inner().tsval_generator.is_some()
-    }
-
     /// Set an algorithm for congestion control.
     ///
     /// `CongestionControl::None` indicates that no congestion control is applied.
@@ -2465,6 +2485,13 @@ impl TcpSocket<'_> {
         s.set_state(State::SynSent);
         s.local_seq_no = seq;
         s.remote_last_seq = seq;
+        // Every connection we open offers timestamps; the SYN|ACK decides
+        // whether they stay on.
+        #[cfg(feature = "tcp-socket-timestamps")]
+        {
+            s.timestamps = true;
+            s.last_remote_tsval = 0;
+        }
         Ok(())
     }
 
@@ -2837,6 +2864,7 @@ mod test {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
+        #[cfg(feature = "tcp-socket-timestamps")]
         timestamp: None,
         payload: &[],
     };
@@ -2851,6 +2879,7 @@ mod test {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
+        #[cfg(feature = "tcp-socket-timestamps")]
         timestamp: None,
         payload: &[],
     };
@@ -3717,6 +3746,8 @@ mod test {
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
+                #[cfg(feature = "tcp-socket-timestamps")]
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
@@ -3748,6 +3779,8 @@ mod test {
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
+                #[cfg(feature = "tcp-socket-timestamps")]
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
@@ -3780,6 +3813,8 @@ mod test {
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
+                #[cfg(feature = "tcp-socket-timestamps")]
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
@@ -4309,6 +4344,8 @@ mod test {
                     window_scale: Some(*shift_amt),
                     window_len: u16::try_from(*buffer_size).unwrap_or(u16::MAX),
                     sack_permitted: true,
+                    #[cfg(feature = "tcp-socket-timestamps")]
+                    timestamp: Some(TcpTimestampRepr::new(0, 0)),
                     ..RECV_TEMPL
                 }]
             );
@@ -5101,12 +5138,13 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "tcp-socket-timestamps")]
     fn test_established_options_reduce_payload_when_local_mss_limited() {
         const EFFECTIVE_MSS: usize = 64;
 
         // construct socket where remote MSS is less than local MSS
         let mut s = socket_established();
-        s.view().set_tsval_generator(Some(|| 1));
+        s.timestamps = true;
         s.remote_mss = EFFECTIVE_MSS;
 
         // Payload should contain 12 bytes less due to timestamp
@@ -5117,19 +5155,20 @@ mod test {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &[0; EFFECTIVE_MSS - 12],
-                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
     }
 
     #[test]
+    #[cfg(feature = "tcp-socket-timestamps")]
     fn test_established_options_reduce_payload_when_remote_mss_limited() {
         const EFFECTIVE_MSS: usize = BASE_MSS as usize;
 
         // construct socket where remote MSS is more than local MSS
         let mut s = socket_established_with_buffer_sizes(EFFECTIVE_MSS, 64);
-        s.view().set_tsval_generator(Some(|| 1));
+        s.timestamps = true;
         s.remote_mss = 9999;
         s.remote_win_len = 9999;
 
@@ -5141,7 +5180,7 @@ mod test {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &[0; EFFECTIVE_MSS - 12],
-                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
@@ -5239,13 +5278,13 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "tcp-socket-timestamps")]
     fn test_established_tiny_mss_with_options_makes_progress() {
         // Connect with timestamps enabled to a remote advertising an absurdly
         // small MSS. Without the MIN_SND_MSS clamp, an MSS smaller than the
         // options length would result in an effective MSS of zero, sending
         // empty segments in a loop without ever making progress.
         let mut s = socket();
-        s.view().set_tsval_generator(Some(|| 1));
         s.local_seq_no = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END.port).unwrap();
         recv!(
@@ -5257,7 +5296,7 @@ mod test {
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
-                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
@@ -5283,7 +5322,7 @@ mod test {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &[0; MIN_REMOTE_MSS - 12],
-                timestamp: Some(TcpTimestampRepr::new(1, 500)),
+                timestamp: Some(TcpTimestampRepr::new(0, 500)),
                 ..RECV_TEMPL
             }]
         );
@@ -8388,6 +8427,8 @@ mod test {
             max_seg_size: Some(BASE_MSS),
             window_scale: Some(0),
             sack_permitted: true,
+            #[cfg(feature = "tcp-socket-timestamps")]
+            timestamp: Some(TcpTimestampRepr::new(150, 0)),
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::SynSent);
@@ -8397,6 +8438,8 @@ mod test {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(TcpSeqNumber(0)),
             window_scale: None,
+            #[cfg(feature = "tcp-socket-timestamps")]
+            timestamp: Some(TcpTimestampRepr::new(250, 0)),
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::Closed);
@@ -9210,12 +9253,13 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "tcp-socket-timestamps")]
     fn test_nagle_works_with_reduced_payload_from_options() {
         const EFFECTIVE_MSS: usize = 64;
 
         let mut s = socket_established_with_buffer_sizes(256, 64);
         s.view().set_nagle_enabled(true);
-        s.view().set_tsval_generator(Some(|| 1));
+        s.timestamps = true;
         s.remote_mss = EFFECTIVE_MSS;
 
         // Send small segment to "arm" Nagle's
@@ -9226,7 +9270,7 @@ mod test {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &b"abcdef"[..],
-                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
@@ -9240,7 +9284,7 @@ mod test {
                 seq_number: LOCAL_SEQ + 1 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &[0; EFFECTIVE_MSS - 12],
-                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
@@ -9396,9 +9440,10 @@ mod test {
     // =========================================================================================//
 
     #[test]
+    #[cfg(feature = "tcp-socket-timestamps")]
     fn test_tsval_established_connection() {
         let mut s = socket_established();
-        s.view().set_tsval_generator(Some(|| 1));
+        s.timestamps = true;
 
         assert!(s.view().timestamp_enabled());
 
@@ -9410,7 +9455,7 @@ mod test {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &b"abcdef"[..],
-                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
@@ -9420,7 +9465,7 @@ mod test {
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6),
-                timestamp: Some(TcpTimestampRepr::new(500, 1)),
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
                 ..SEND_TEMPL
             }
         );
@@ -9429,16 +9474,18 @@ mod test {
         s.view().send_slice(b"foobar").unwrap();
         recv!(
             s,
+            time 100,
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1 + 6,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &b"foobar"[..],
-                timestamp: Some(TcpTimestampRepr::new(1, 500)),
+                timestamp: Some(TcpTimestampRepr::new(100, 500)),
                 ..RECV_TEMPL
             }]
         );
         send!(
             s,
+            time 100,
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1,
                 ack_number: Some(LOCAL_SEQ + 1 + 6 + 6),
@@ -9448,28 +9495,46 @@ mod test {
         assert_eq!(s.tx_buffer.len(), 0);
     }
 
-    #[test]
-    fn test_tsval_in_accepted_socket() {
-        // Timestamps default to off, so an accepted socket does not negotiate
-        // them in its SYN|ACK...
+    #[cfg(feature = "tcp-socket-timestamps")]
+    fn accepted_socket(syn: &TcpRepr) -> TestSocket {
         let (mut stack, h) = listener_stack();
-        assert!(listener_deliver(
-            &mut stack,
-            &TcpRepr {
-                timestamp: Some(TcpTimestampRepr::new(500, 0)),
-                ..syn_repr()
-            }
-        ));
+        assert!(listener_deliver(&mut stack, syn));
         let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
-        assert!(!stack.tcp(sh).timestamp_enabled());
-        let mut s = TestSocket {
+        TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
                 sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
                 sockets
             },
             stack,
-        };
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "tcp-socket-timestamps")]
+    fn test_tsval_in_accepted_socket() {
+        // A SYN carrying a timestamp gets a SYN|ACK echoing its tsval.
+        let mut s = accepted_socket(&TcpRepr {
+            timestamp: Some(TcpTimestampRepr::new(500, 0)),
+            ..syn_repr()
+        });
+        assert!(s.timestamps);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                timestamp: Some(TcpTimestampRepr::new(0, 500)),
+                ..RECV_TEMPL
+            }]
+        );
+
+        // A SYN without one gets a SYN|ACK without one: we only answer with
+        // timestamps if the remote offered them.
+        let mut s = accepted_socket(&syn_repr());
+        assert!(!s.timestamps);
         recv!(
             s,
             [TcpRepr {
@@ -9481,48 +9546,17 @@ mod test {
                 ..RECV_TEMPL
             }]
         );
-
-        // ...but enabling a generator on the accepted socket works: the SYN
-        // carried a timestamp, and the SYN|ACK echoes its tsval.
-        let (mut stack, h) = listener_stack();
-        assert!(listener_deliver(
-            &mut stack,
-            &TcpRepr {
-                timestamp: Some(TcpTimestampRepr::new(500, 0)),
-                ..syn_repr()
-            }
-        ));
-        let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
-        stack.tcp(sh).set_tsval_generator(Some(|| 1));
-        let mut s = TestSocket {
-            sockets: {
-                let mut sockets = Slab::new();
-                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
-                sockets
-            },
-            stack,
-        };
-        recv!(
-            s,
-            [TcpRepr {
-                control: TcpControl::Syn,
-                seq_number: LOCAL_SEQ,
-                ack_number: Some(REMOTE_SEQ + 1),
-                max_seg_size: Some(BASE_MSS),
-                timestamp: Some(TcpTimestampRepr::new(1, 500)),
-                ..RECV_TEMPL
-            }]
-        );
     }
 
     #[test]
-    fn test_tsval_disabled_in_remote_server() {
+    #[cfg(feature = "tcp-socket-timestamps")]
+    fn test_tsval_enabled_by_handshake() {
+        // Every connection we open offers timestamps, and a remote that answers
+        // with one keeps them on for the rest of the connection.
         let mut s = socket();
-        s.view().set_tsval_generator(Some(|| 1));
-        assert!(s.view().timestamp_enabled());
         s.local_seq_no = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END.port).unwrap();
-        assert_eq!(s.tuple, Some(TUPLE));
+        assert!(s.timestamps);
         recv!(
             s,
             [TcpRepr {
@@ -9532,7 +9566,7 @@ mod test {
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
-                timestamp: Some(TcpTimestampRepr::new(1, 0)),
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
@@ -9544,11 +9578,11 @@ mod test {
                 ack_number: Some(LOCAL_SEQ + 1),
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
-                timestamp: None,
+                timestamp: Some(TcpTimestampRepr::new(500, 0)),
                 ..SEND_TEMPL
             }
         );
-        assert!(!s.view().timestamp_enabled());
+        assert!(s.timestamps);
         s.view().send_slice(b"abcdef").unwrap();
         recv!(
             s,
@@ -9556,20 +9590,20 @@ mod test {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &b"abcdef"[..],
-                timestamp: None,
+                timestamp: Some(TcpTimestampRepr::new(0, 500)),
                 ..RECV_TEMPL
             }]
         );
     }
 
     #[test]
-    fn test_tsval_disabled_in_local_client() {
+    #[cfg(feature = "tcp-socket-timestamps")]
+    fn test_tsval_disabled_in_remote_server() {
+        // A remote that answers our SYN without a timestamp turns them off.
         let mut s = socket();
-        // s.set_timestamp(false); // commented to alert if the default state changes
-        assert!(!s.view().timestamp_enabled());
         s.local_seq_no = LOCAL_SEQ;
         s.view().connect(REMOTE_END, LOCAL_END.port).unwrap();
-        assert_eq!(s.tuple, Some(TUPLE));
+        assert!(s.timestamps);
         recv!(
             s,
             [TcpRepr {
@@ -9579,6 +9613,7 @@ mod test {
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
+                timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
         );
@@ -9590,11 +9625,11 @@ mod test {
                 ack_number: Some(LOCAL_SEQ + 1),
                 max_seg_size: Some(BASE_MSS - 80),
                 window_scale: Some(0),
-                timestamp: Some(TcpTimestampRepr::new(500, 0)),
+                timestamp: None,
                 ..SEND_TEMPL
             }
         );
-        assert!(!s.view().timestamp_enabled());
+        assert!(!s.timestamps);
         s.view().send_slice(b"abcdef").unwrap();
         recv!(
             s,
@@ -9704,6 +9739,7 @@ mod stack_test {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
+        #[cfg(feature = "tcp-socket-timestamps")]
         timestamp: None,
         payload: &[],
     };

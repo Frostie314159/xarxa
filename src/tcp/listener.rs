@@ -3,9 +3,11 @@
 use alloc::collections::VecDeque;
 use alloc::vec;
 
+#[cfg(feature = "tcp-socket-timestamps")]
+use super::TcpTimestampRepr;
 use super::{
     DEFAULT_MSS, ListenError, MIN_REMOTE_MSS, SocketBuffer, State, TcpControl, TcpHandle, TcpRepr, TcpSocketState,
-    TcpTimestampRepr, Tuple,
+    Tuple,
 };
 use crate::rand::Rand;
 use crate::slab::Slab;
@@ -39,6 +41,7 @@ struct PendingSyn {
     /// The MSS the remote advertised (clamped), or the default.
     remote_mss: usize,
     /// The timestamp option of the SYN, if present.
+    #[cfg(feature = "tcp-socket-timestamps")]
     timestamp: Option<TcpTimestampRepr>,
 }
 
@@ -104,6 +107,7 @@ impl TcpListenerState {
                 Some(mss) if mss != 0 => (mss as usize).max(MIN_REMOTE_MSS),
                 _ => DEFAULT_MSS,
             },
+            #[cfg(feature = "tcp-socket-timestamps")]
             timestamp: repr.timestamp,
         };
 
@@ -323,10 +327,11 @@ impl TcpListener<'_> {
         s.remote_win_len = syn.remote_win_len;
         s.remote_mss = syn.remote_mss;
         s.congestion_controller.inner_mut().set_mss(syn.remote_mss);
-        match syn.timestamp {
-            // Remote doesn't support timestamps, don't do it.
-            None => s.tsval_generator = None,
-            Some(ts) => s.last_remote_tsval = ts.tsval,
+        // Answer with timestamps only if the SYN offered them.
+        #[cfg(feature = "tcp-socket-timestamps")]
+        {
+            s.timestamps = syn.timestamp.is_some();
+            s.last_remote_tsval = syn.timestamp.map_or(0, |ts| ts.tsval);
         }
 
         Some(TcpHandle(self.tcp.add_with(|_| s)))

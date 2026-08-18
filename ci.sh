@@ -27,7 +27,8 @@ SOCKETS=(
 for extra in "" "defmt" "log" "std" "std,log" "std,defmt" "async" "std,log,async" \
              "icmp-error-handling" "auto-icmp-echo-reply" "async,icmp-error-handling" \
              "packetmeta-id" "packetmeta-timestamp" "packetmeta-timestamp,defmt" \
-             "std,log,async,icmp-error-handling,auto-icmp-echo-reply,packetmeta-timestamp"; do
+             "tcp-socket-timestamps" "tcp-socket-timestamps,defmt" \
+             "std,log,async,icmp-error-handling,auto-icmp-echo-reply,packetmeta-timestamp,tcp-socket-timestamps"; do
   cargo check --no-default-features \
     --features "medium-ethernet,medium-ip,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp${extra:+,$extra}"
 done
@@ -61,4 +62,7 @@ cargo test
 # Once more with packet metadata: the default feature set leaves `PacketMeta`
 # zero-sized, so the tests that exercise it are gated on the feature.
 cargo test --features packetmeta-timestamp
+# Once more with TCP timestamps: without the feature no segment carries the
+# option, so the tests that expect one are gated on it.
+cargo test --features tcp-socket-timestamps
 cargo build --examples

@@ -23,32 +23,26 @@ pub(crate) struct TcpRepr<'a> {
     pub max_seg_size: Option<u16>,
     pub sack_permitted: bool,
     pub sack_ranges: [Option<(u32, u32)>; 3],
+    #[cfg(feature = "tcp-socket-timestamps")]
     pub timestamp: Option<TcpTimestampRepr>,
     pub payload: &'a [u8],
 }
 
-/// Generator of TCP timestamp values (RFC 7323), as milliseconds from an arbitrary point.
-pub type TcpTimestampGenerator = fn() -> u32;
-
 /// The TCP timestamp option value (RFC 7323).
+#[cfg(feature = "tcp-socket-timestamps")]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct TcpTimestampRepr {
+    /// Our own clock, as milliseconds from an arbitrary point.
     pub tsval: u32,
+    /// The last `tsval` received from the peer, echoed back.
     pub tsecr: u32,
 }
 
+#[cfg(feature = "tcp-socket-timestamps")]
 impl TcpTimestampRepr {
     pub fn new(tsval: u32, tsecr: u32) -> Self {
         Self { tsval, tsecr }
-    }
-
-    pub fn generate_reply(&self, generator: Option<TcpTimestampGenerator>) -> Option<Self> {
-        Self::generate_reply_with_tsval(generator, self.tsval)
-    }
-
-    pub fn generate_reply_with_tsval(generator: Option<TcpTimestampGenerator>, tsval: u32) -> Option<Self> {
-        Some(Self::new(generator?(), tsval))
     }
 }
 
@@ -90,6 +84,7 @@ impl<'a> TcpRepr<'a> {
         let mut options = packet.options();
         let mut sack_permitted = false;
         let mut sack_ranges = [None, None, None];
+        #[cfg(feature = "tcp-socket-timestamps")]
         let mut timestamp = None;
         while !options.is_empty() {
             let (next_options, option) = TcpOption::parse(options)?;
@@ -117,6 +112,7 @@ impl<'a> TcpRepr<'a> {
                 }
                 TcpOption::SackPermitted => sack_permitted = true,
                 TcpOption::SackRange(slice) => sack_ranges = slice,
+                #[cfg(feature = "tcp-socket-timestamps")]
                 TcpOption::TimeStamp { tsval, tsecr } => {
                     timestamp = Some(TcpTimestampRepr::new(tsval, tsecr));
                 }
@@ -136,6 +132,7 @@ impl<'a> TcpRepr<'a> {
             max_seg_size,
             sack_permitted,
             sack_ranges,
+            #[cfg(feature = "tcp-socket-timestamps")]
             timestamp,
             payload: packet.payload(),
         })
@@ -156,6 +153,7 @@ impl<'a> TcpRepr<'a> {
         if self.sack_permitted {
             length += 2;
         }
+        #[cfg(feature = "tcp-socket-timestamps")]
         if self.timestamp.is_some() {
             length += 10;
         }
@@ -211,6 +209,7 @@ impl<'a> TcpRepr<'a> {
                 let tmp = options;
                 options = TcpOption::SackRange(self.sack_ranges).emit(tmp);
             }
+            #[cfg(feature = "tcp-socket-timestamps")]
             if let Some(timestamp) = self.timestamp {
                 let tmp = options;
                 options = TcpOption::TimeStamp {
@@ -294,6 +293,7 @@ mod test {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
+            #[cfg(feature = "tcp-socket-timestamps")]
             timestamp: None,
             payload: &PAYLOAD_BYTES,
         }
