@@ -116,8 +116,10 @@ impl core::error::Error for BindError {}
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SendError {
-    /// The socket is not bound, the destination address or port is unspecified, or
-    /// no matching source address is available.
+    /// The socket is not bound.
+    InvalidState,
+    /// The destination address or port is unspecified, or no matching source
+    /// address is available.
     Unaddressable,
     /// The payload does not fit in a packet buffer, or no buffer is available.
     BufferFull,
@@ -126,6 +128,7 @@ pub enum SendError {
 impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            SendError::InvalidState => write!(f, "invalid state"),
             SendError::Unaddressable => write!(f, "unaddressable"),
             SendError::BufferFull => write!(f, "buffer full"),
         }
@@ -138,6 +141,8 @@ impl core::error::Error for SendError {}
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RecvError {
+    /// The socket is not bound.
+    InvalidState,
     /// The RX queue is empty.
     Exhausted,
     /// The provided slice is smaller than the payload. (The packet is dropped by
@@ -158,6 +163,7 @@ pub enum RecvError {
 impl fmt::Display for RecvError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RecvError::InvalidState => write!(f, "invalid state"),
             RecvError::Exhausted => write!(f, "exhausted"),
             RecvError::Truncated => write!(f, "truncated"),
             #[cfg(feature = "icmp-error-handling")]
@@ -572,12 +578,16 @@ impl UdpSocket<'_> {
     ///
     /// This is zero-copy: the returned value is the buffer the datagram arrived in.
     ///
-    /// Returns `Err(RecvError::Exhausted)` if the RX queue is empty.
+    /// Returns `Err(RecvError::InvalidState)` if the socket is not bound, and
+    /// `Err(RecvError::Exhausted)` if the RX queue is empty.
     ///
     /// With the `icmp-error-handling` feature, a pending ICMP error is reported
     /// first, as `Err(RecvError::IcmpError { .. })`, once, clearing it, before
     /// any queued datagrams. See [`take_icmp_error`](Self::take_icmp_error).
     pub fn recv(&mut self) -> Result<RecvPacket, RecvError> {
+        if !self.is_open() {
+            return Err(RecvError::InvalidState);
+        }
         let state = self.inner_mut();
         #[cfg(feature = "icmp-error-handling")]
         if let Some((error, remote)) = state.pending_error.take() {
@@ -607,8 +617,12 @@ impl UdpSocket<'_> {
     /// Peek at the next received datagram without dequeueing it, returning its
     /// payload and its metadata.
     ///
-    /// Returns `Err(RecvError::Exhausted)` if the RX queue is empty.
+    /// Returns `Err(RecvError::InvalidState)` if the socket is not bound, and
+    /// `Err(RecvError::Exhausted)` if the RX queue is empty.
     pub fn peek(&mut self) -> Result<(&[u8], UdpMetadata), RecvError> {
+        if !self.is_open() {
+            return Err(RecvError::InvalidState);
+        }
         let buf = self
             .sockets
             .get_mut(self.index)
@@ -681,11 +695,11 @@ impl UdpSocket<'_> {
     /// to tag the packet with, or a request to timestamp its transmission (see
     /// [`Iface::poll_tx_timestamp`](crate::Iface::poll_tx_timestamp)).
     ///
-    /// Returns `Err(SendError::Unaddressable)` if the socket is not bound, the
-    /// destination address or port is still unspecified after defaulting, the
-    /// destination's address family does not match the source address, no source
-    /// address is available, or the source address is not assigned to any
-    /// interface.
+    /// Returns `Err(SendError::InvalidState)` if the socket is not bound.
+    /// Returns `Err(SendError::Unaddressable)` if the destination address or port
+    /// is still unspecified after defaulting, the destination's address family does
+    /// not match the source address, no source address is available, or the source
+    /// address is not assigned to any interface.
     /// Returns `Err(SendError::BufferFull)` if the payload cannot fit in a packet
     /// buffer.
     pub fn send_with(
@@ -700,7 +714,7 @@ impl UdpSocket<'_> {
         let hop_limit = self.inner().hop_limit.unwrap_or(64);
 
         if local.port == 0 {
-            return Err(SendError::Unaddressable);
+            return Err(SendError::InvalidState);
         }
 
         // Default unspecified parts of the destination from the bound remote. Only a
@@ -1319,6 +1333,12 @@ mod test {
         let handle = stack.add_udp_socket();
         let mut socket = stack.udp_socket(handle);
 
+        // Not bound yet.
+        assert_eq!(
+            socket.send_slice(b"hi", (REMOTE_ADDR, REMOTE_PORT)),
+            Err(SendError::InvalidState)
+        );
+
         // Unconnected socket: a wildcard destination is unaddressable.
         socket.bind(LOCAL_PORT, ANY).unwrap();
         assert_eq!(
@@ -1442,6 +1462,11 @@ mod test {
     fn test_recv() {
         let (mut stack, handle) = stack_with_socket();
         let mut socket = stack.udp_socket(handle);
+
+        // Not bound yet.
+        assert_eq!(socket.recv().err(), Some(RecvError::InvalidState));
+        assert_eq!(socket.peek().err(), Some(RecvError::InvalidState));
+
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
         assert!(!socket.can_recv());

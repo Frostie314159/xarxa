@@ -89,8 +89,9 @@ impl core::error::Error for BindError {}
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum SendError {
-    /// The socket is not bound, or (IP mode) there is no route to the packet's
-    /// destination.
+    /// The socket is not bound.
+    InvalidState,
+    /// (IP mode) There is no route to the packet's destination.
     Unaddressable,
     /// The packet does not fit in a packet buffer, or no buffer is available.
     BufferFull,
@@ -103,6 +104,7 @@ pub enum SendError {
 impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            SendError::InvalidState => write!(f, "invalid state"),
             SendError::Unaddressable => write!(f, "unaddressable"),
             SendError::BufferFull => write!(f, "buffer full"),
             SendError::Malformed => write!(f, "malformed"),
@@ -116,6 +118,8 @@ impl core::error::Error for SendError {}
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum RecvError {
+    /// The socket is not bound.
+    InvalidState,
     /// The RX queue is empty.
     Exhausted,
     /// The provided slice is smaller than the packet. (The packet is dropped by
@@ -126,6 +130,7 @@ pub enum RecvError {
 impl fmt::Display for RecvError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            RecvError::InvalidState => write!(f, "invalid state"),
             RecvError::Exhausted => write!(f, "exhausted"),
             RecvError::Truncated => write!(f, "truncated"),
         }
@@ -310,8 +315,12 @@ impl RawSocket<'_> {
     /// mode), headers included, exactly as received. This is zero-copy: the
     /// returned value is the buffer the packet arrived in, and dropping it frees it.
     ///
-    /// Returns `Err(RecvError::Exhausted)` if the RX queue is empty.
+    /// Returns `Err(RecvError::InvalidState)` if the socket is not bound, and
+    /// `Err(RecvError::Exhausted)` if the RX queue is empty.
     pub fn recv(&mut self) -> Result<PacketBuf, RecvError> {
+        if !self.is_open() {
+            return Err(RecvError::InvalidState);
+        }
         self.state.rx_queue.pop_front().ok_or(RecvError::Exhausted)
     }
 
@@ -335,8 +344,12 @@ impl RawSocket<'_> {
     /// Peek at the next received packet without dequeueing it, as a borrow into the
     /// queue.
     ///
-    /// Returns `Err(RecvError::Exhausted)` if the RX queue is empty.
+    /// Returns `Err(RecvError::InvalidState)` if the socket is not bound, and
+    /// `Err(RecvError::Exhausted)` if the RX queue is empty.
     pub fn peek(&self) -> Result<&[u8], RecvError> {
+        if !self.is_open() {
+            return Err(RecvError::InvalidState);
+        }
         match self.state.rx_queue.front() {
             Some(buf) => Ok(buf),
             None => Err(RecvError::Exhausted),
@@ -396,8 +409,9 @@ impl RawSocket<'_> {
     /// unresolved, the packet is queued inside the stack and sent when resolution
     /// completes. This still counts as a successful send.
     ///
-    /// Returns `Err(SendError::Unaddressable)` if the socket is not bound, or (IP
-    /// mode) if there is no route to the packet's destination.
+    /// Returns `Err(SendError::InvalidState)` if the socket is not bound.
+    /// Returns `Err(SendError::Unaddressable)` if (IP mode) there is no route to
+    /// the packet's destination.
     /// Returns `Err(SendError::Malformed)` if the packet fails basic validation (too
     /// short for an Ethernet header in Ethernet mode, malformed IP header in IP
     /// mode), or does not match the socket's bind filters.
@@ -424,7 +438,7 @@ impl RawSocket<'_> {
         f: impl FnOnce(&mut [u8]) -> usize,
     ) -> Result<(), SendError> {
         let Some(mode) = self.state.mode else {
-            return Err(SendError::Unaddressable);
+            return Err(SendError::InvalidState);
         };
 
         // Ethernet frames go out as-is. IP packets get an Ethernet header prepended
@@ -749,6 +763,11 @@ mod test {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_raw_socket();
         let mut socket = stack.raw_socket(handle);
+
+        // Not bound yet.
+        assert_eq!(socket.recv().err(), Some(RecvError::InvalidState));
+        assert_eq!(socket.peek().err(), Some(RecvError::InvalidState));
+
         socket
             .bind(RawMode::Ip {
                 version: None,
@@ -1035,10 +1054,11 @@ mod test {
         let (iface, tx) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let handle = stack.add_raw_socket();
 
+        // Not bound yet.
         let frame = eth_frame(ETHERTYPE_CUSTOM, b"hello");
         assert_eq!(
             stack.raw_socket(handle).send_slice(&frame),
-            Err(SendError::Unaddressable)
+            Err(SendError::InvalidState)
         );
 
         stack
