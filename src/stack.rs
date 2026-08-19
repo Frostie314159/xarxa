@@ -6,7 +6,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
-#[cfg(all(feature = "icmp-error-handling", any(feature = "udp", feature = "tcp")))]
+#[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
 use crate::icmp_error::{IcmpError, parse_quoted_packet};
 use crate::iface::{IfaceCapabilities, Interface, Medium};
 #[cfg(feature = "medium-ethernet")]
@@ -1312,14 +1312,14 @@ impl StackInner {
             return;
         }
 
-        #[cfg(not(feature = "auto-icmp-echo-reply"))]
+        #[cfg(not(feature = "icmp-ping-reply"))]
         let _ = (&iface, src_addr, dst_addr);
-        #[cfg(not(all(feature = "icmp-error-handling", any(feature = "udp", feature = "tcp"))))]
+        #[cfg(not(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp"))))]
         let _ = (&mut icmp_packet, &sockets);
 
         match (icmp_packet.msg_type(), icmp_packet.msg_code()) {
             // Respond to echo requests.
-            #[cfg(feature = "auto-icmp-echo-reply")]
+            #[cfg(feature = "icmp-ping-reply")]
             (Icmpv4Message::EchoRequest, 0) => {
                 // Do not send ICMP replies to non-unicast sources.
                 if !iface.is_unicast_v4(src_addr) {
@@ -1357,7 +1357,7 @@ impl StackInner {
             (Icmpv4Message::EchoReply, _) => {}
 
             // Deliver error messages to the socket whose packet provoked them.
-            #[cfg(all(feature = "icmp-error-handling", any(feature = "udp", feature = "tcp")))]
+            #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
             (msg_type, msg_code) if msg_type.is_error() => {
                 if let Some(error) = IcmpError::from_icmpv4(msg_type, msg_code) {
                     self.deliver_icmp_error(sockets, error, icmp_packet.data_mut());
@@ -1376,7 +1376,7 @@ impl StackInner {
     /// match wins). TCP demux is by exact 4-tuple, and the socket additionally
     /// validates the quoted sequence number against its send window, so blindly
     /// spoofed errors cannot reset connections (RFC 5927).
-    #[cfg(all(feature = "icmp-error-handling", any(feature = "udp", feature = "tcp")))]
+    #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
     fn deliver_icmp_error(&mut self, sockets: &mut Sockets, error: IcmpError, quote: &mut [u8]) {
         let Some(quoted) = parse_quoted_packet(quote) else {
             trace!("icmp error: quote too short to identify a flow, ignoring");
@@ -1534,7 +1534,7 @@ impl StackInner {
     ) {
         #[cfg(not(all(feature = "medium-ethernet", feature = "ipv6")))]
         let _ = (eth_src, hop_limit);
-        #[cfg(not(feature = "auto-icmp-echo-reply"))]
+        #[cfg(not(feature = "icmp-ping-reply"))]
         let _ = &iface;
 
         let mut icmp_packet = check!(Icmpv6Packet::new_checked(&mut buf));
@@ -1543,12 +1543,12 @@ impl StackInner {
             return;
         }
 
-        #[cfg(not(all(feature = "icmp-error-handling", any(feature = "udp", feature = "tcp"))))]
+        #[cfg(not(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp"))))]
         let _ = (&mut icmp_packet, &sockets);
 
         match icmp_packet.msg_type() {
             // Respond to echo requests.
-            #[cfg(feature = "auto-icmp-echo-reply")]
+            #[cfg(feature = "icmp-ping-reply")]
             Icmpv6Message::EchoRequest => {
                 let reply_src = if dst_addr.x_is_unicast() {
                     dst_addr
@@ -1575,7 +1575,7 @@ impl StackInner {
             Icmpv6Message::EchoReply => {}
 
             // Deliver error messages to the socket whose packet provoked them.
-            #[cfg(all(feature = "icmp-error-handling", any(feature = "udp", feature = "tcp")))]
+            #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
             msg_type if msg_type.is_error() => {
                 if let Some(error) = IcmpError::from_icmpv6(msg_type, icmp_packet.msg_code()) {
                     self.deliver_icmp_error(sockets, error, icmp_packet.payload_mut());
@@ -1680,7 +1680,7 @@ impl StackInner {
     /// exhausted their probes.
     #[cfg(feature = "medium-ethernet")]
     fn poll_neighbor_timers(&mut self, iface: &mut IfaceState, sockets: &mut Sockets) {
-        #[cfg(not(feature = "icmp-error-handling"))]
+        #[cfg(not(feature = "icmp-errors"))]
         let _ = &sockets;
 
         for event in self.neighbor_cache.poll_retransmit(iface.handle, self.now) {
@@ -1693,11 +1693,11 @@ impl StackInner {
                     debug!("neighbor {} resolution failed, dropping queued packets", addr);
                     // RFC 4861 §7.3.3: answer each packet queued on the failed
                     // resolution with an ICMP destination unreachable error.
-                    #[cfg(feature = "icmp-error-handling")]
+                    #[cfg(feature = "icmp-errors")]
                     for packet in self.pending.take_matching(&(iface.handle, addr)) {
                         self.deliver_neighbor_failure_error(iface, sockets, packet.buf);
                     }
-                    #[cfg(not(feature = "icmp-error-handling"))]
+                    #[cfg(not(feature = "icmp-errors"))]
                     drop(self.pending.take_matching(&(iface.handle, addr)));
                 }
             }
@@ -1712,7 +1712,7 @@ impl StackInner {
     /// where the erring TCP/UDP socket, or a raw-socket ping application,
     /// receives it, rather than transmitted to the wire. `orig` is the queued
     /// packet, a whole IP frame.
-    #[cfg(all(feature = "medium-ethernet", feature = "icmp-error-handling"))]
+    #[cfg(all(feature = "medium-ethernet", feature = "icmp-errors"))]
     fn deliver_neighbor_failure_error(&mut self, iface: &mut IfaceState, sockets: &mut Sockets, mut orig: PacketBuf) {
         match IpVersion::of_packet(&orig) {
             #[cfg(feature = "ipv4")]
@@ -2283,7 +2283,7 @@ impl IfaceState {
     }
 
     /// Get the first IPv4 address of the interface.
-    #[cfg(all(feature = "ipv4", feature = "auto-icmp-echo-reply"))]
+    #[cfg(all(feature = "ipv4", feature = "icmp-ping-reply"))]
     fn ipv4_addr(&self) -> Option<Ipv4Address> {
         self.ip_addrs.iter().find_map(|addr| match *addr {
             IpCidr::Ipv4(cidr) => Some(cidr.address()),

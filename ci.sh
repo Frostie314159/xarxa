@@ -25,11 +25,11 @@ SOCKETS=(
 # The other axes are checked against the full feature set only; combining them
 # with all of the above would be thousands of builds for no extra coverage.
 for extra in "" "defmt" "log" "std" "std,log" "std,defmt" "async" "std,log,async" \
-             "icmp-error-handling" "auto-icmp-echo-reply" "async,icmp-error-handling" \
+             "icmp-errors" "icmp-ping-reply" "async,icmp-errors" \
              "packetmeta-id" "packetmeta-timestamp" "packetmeta-timestamp,defmt" \
              "tcp-timestamps" "tcp-timestamps,defmt" \
              "tcp-reno" "tcp-cubic" \
-             "std,log,async,icmp-error-handling,auto-icmp-echo-reply,packetmeta-timestamp,tcp-timestamps"; do
+             "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps"; do
   cargo check --no-default-features \
     --features "medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp${extra:+,$extra}"
 done
@@ -41,7 +41,7 @@ for medium in "${MEDIA[@]}"; do
       # Bare, and with everything that adds code paths to the combination.
       cargo check --no-default-features --features "$features"
       cargo check --no-default-features \
-        --features "$features,std,log,async,icmp-error-handling,auto-icmp-echo-reply,packetmeta-timestamp"
+        --features "$features,std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp"
     done
   done
 done
@@ -54,7 +54,7 @@ for medium in "${MEDIA[@]}"; do
   for proto in "${PROTOS[@]}"; do
     for socket in "${SOCKETS[@]}"; do
       cargo test --lib --no-default-features \
-        --features "$medium,$proto${socket:+,$socket},std,log,async,icmp-error-handling,auto-icmp-echo-reply"
+        --features "$medium,$proto${socket:+,$socket},std,log,async,icmp-errors,icmp-ping-reply"
     done
   done
 done

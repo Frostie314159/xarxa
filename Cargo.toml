@@ -8,8 +8,8 @@ features = [
     "std",
     "log",
     "async",
-    "auto-icmp-echo-reply",
-    "icmp-error-handling",
+    "icmp-ping-reply",
+    "icmp-errors",
     "medium-ethernet",
     "medium-ip",
     "ipv4",
@@ -27,8 +27,8 @@ features = [
 default = [
     "std",
     "log",
-    "auto-icmp-echo-reply",
-    "icmp-error-handling",
+    "icmp-ping-reply",
+    "icmp-errors",
     "medium-ethernet",
     "medium-ip",
     "ipv4",
@@ -65,15 +65,11 @@ tcp = []
 tcp-listener = ["tcp"]
 ## Send and receive the TCP timestamp option (RFC 7323).
 tcp-timestamps = ["tcp"]
-## Automatically reply to ICMP echo requests. Disable to handle echo requests
-## yourself through a raw socket.
-auto-icmp-echo-reply = []
-## Deliver ICMP error messages (destination unreachable, packet too big, ...) to
-## the TCP and UDP sockets whose packets provoked them — both errors received
-## from the network and the destination-unreachable errors the stack generates
-## itself when neighbor resolution (ARP/NDISC) fails. Disabling this also
-## disables generating the latter.
-icmp-error-handling = []
+## Automatically reply to pings (ICMP echo requests).
+icmp-ping-reply = []
+## Deliver incoming ICMP error messages (destination unreachable, packet too big, ...) to
+## the sockets that provoked them.
+icmp-errors = []
 
 #! ### TCP congestion control
 #! Enable one of these features to enable congestion control. No feature enabled means

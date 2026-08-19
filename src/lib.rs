@@ -23,7 +23,7 @@ mod fmt;
 mod macros;
 
 pub mod buf;
-#[cfg(feature = "icmp-error-handling")]
+#[cfg(feature = "icmp-errors")]
 mod icmp_error;
 pub mod iface;
 pub mod meta;
@@ -45,7 +45,7 @@ mod waker;
 pub mod wire;
 
 pub use buf::{PACKET_BUF_SIZE, PacketBuf};
-#[cfg(feature = "icmp-error-handling")]
+#[cfg(feature = "icmp-errors")]
 pub use icmp_error::IcmpError;
 pub use meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]

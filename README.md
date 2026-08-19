@@ -86,8 +86,8 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - IPv4 (feature `ipv4`)
 - IPv6 (feature `ipv6`)
 - ICMP
-  - Automatically replies to pings. (feature `auto-icmp-echo-reply`)
-  - Incoming ICMP errors are routed to the socket that caused them. (feature `icmp-error-handling`)
+  - Automatically replies to pings. (feature `icmp-ping-reply`)
+  - Incoming ICMP errors are routed to the socket that caused them. (feature `icmp-errors`)
 - UDP sockets (feature `udp`)
   - **zero-copy** on both TX and RX
   - Supports all binding modes Linux supports, including unconnected (receives from any IP) and connected sockets (receives from one fixed remote IP+port).

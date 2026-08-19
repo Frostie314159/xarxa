@@ -8,7 +8,7 @@ use core::fmt::Display;
 use core::{fmt, mem};
 
 use crate::buf::PacketBuf;
-#[cfg(feature = "icmp-error-handling")]
+#[cfg(feature = "icmp-errors")]
 use crate::icmp_error::IcmpError;
 use crate::rand::Rand;
 use crate::slab::Slab;
@@ -514,7 +514,7 @@ pub(crate) struct TcpSocketState {
     tuple: Option<Tuple>,
     /// The last ICMP error reported against this connection. A single slot: a
     /// newer error overwrites an unread older one.
-    #[cfg(feature = "icmp-error-handling")]
+    #[cfg(feature = "icmp-errors")]
     icmp_error: Option<IcmpError>,
     /// The sequence number corresponding to the beginning of the transmit buffer.
     /// I.e. an ACK(local_seq_no+n) packet removes n bytes from the transmit buffer.
@@ -636,7 +636,7 @@ impl TcpSocketState {
             keep_alive: None,
             hop_limit: None,
             tuple: None,
-            #[cfg(feature = "icmp-error-handling")]
+            #[cfg(feature = "icmp-errors")]
             icmp_error: None,
             local_seq_no: TcpSeqNumber::default(),
             remote_seq_no: TcpSeqNumber::default(),
@@ -710,7 +710,7 @@ impl TcpSocketState {
         self.rx_buffer.clear();
         self.rx_fin_received = false;
         self.tuple = None;
-        #[cfg(feature = "icmp-error-handling")]
+        #[cfg(feature = "icmp-errors")]
         {
             self.icmp_error = None;
         }
@@ -933,7 +933,7 @@ impl TcpSocketState {
     /// RFC 5927 recommends, to resist off-path connection-reset attacks): it is
     /// recorded for [`take_icmp_error`](TcpSocket::take_icmp_error) and the
     /// connection carries on.
-    #[cfg(feature = "icmp-error-handling")]
+    #[cfg(feature = "icmp-errors")]
     pub(crate) fn process_icmp_error(&mut self, error: IcmpError, seq: TcpSeqNumber) {
         // The quoted segment must be one we actually have in flight.
         if seq < self.local_seq_no || seq > self.remote_last_seq {
@@ -2122,7 +2122,7 @@ pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_add
 /// 4-tuple match against the flow quoted in the error. `local`/`remote` are the
 /// quoted packet's source and destination, since the quote is a segment this
 /// stack sent.
-#[cfg(feature = "icmp-error-handling")]
+#[cfg(feature = "icmp-errors")]
 pub(crate) fn process_icmp_error(
     sockets: &mut Slab<TcpSocketState>,
     error: IcmpError,
@@ -2776,7 +2776,7 @@ impl TcpSocket<'_> {
 
     /// Take the pending ICMP error, if one has been reported against this
     /// connection.
-    #[cfg(feature = "icmp-error-handling")]
+    #[cfg(feature = "icmp-errors")]
     pub fn take_icmp_error(&mut self) -> Option<IcmpError> {
         self.inner_mut().icmp_error.take()
     }
