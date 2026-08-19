@@ -893,7 +893,7 @@ mod test {
         assert_eq!(stack.raw(handle).send_slice(&v6), Err(SendError::Malformed));
         // Too big for a packet buffer (IP mode leaves room for the Ethernet header).
         assert_eq!(
-            stack.raw(handle).send_with(1501, |_| unreachable!()),
+            stack.raw(handle).send_with(1503, |_| unreachable!()),
             Err(SendError::BufferFull)
         );
         assert_eq!(tx.borrow().len(), 1);

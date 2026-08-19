@@ -6,11 +6,13 @@ use core::ops::{Deref, DerefMut};
 
 /// Size of the buffer in a [`PacketBuf`].
 ///
-/// This is the maximum size of an Ethernet frame: 14 bytes of header plus 1500 bytes of
-/// payload. (The 4-byte FCS is not counted, it is typically added/checked/stripped by
-/// hardware.)
-pub const PACKET_BUF_SIZE: usize = 1514;
+/// Currently hardcoded to 1514 (max size of an Ethernet frame without FCS)
+/// rounded up to nearest 4 multiple.
+pub const PACKET_BUF_SIZE: usize = 1516;
 
+// Align is needed by some DMA engines.
+// TODO: find a more generic way to do this. Maybe let the user set a custom packet pool impl.
+#[repr(C, align(4))]
 struct PacketBufInner {
     /// Offset of the first valid byte within `data`.
     headroom: u16,
@@ -106,6 +108,13 @@ impl PacketBuf {
     pub fn set_len(&mut self, len: usize) {
         assert!(self.headroom() + len <= PACKET_BUF_SIZE);
         self.inner.len = len as u16;
+    }
+
+    /// The whole underlying storage, ignoring headroom and length.
+    ///
+    /// The returned slice is guaranteed to be 4-byte aligned.
+    pub fn storage_mut(&mut self) -> &mut [u8] {
+        &mut self.inner.data
     }
 }
 

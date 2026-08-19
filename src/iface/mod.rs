@@ -61,7 +61,7 @@ impl Default for IfaceCapabilities {
     fn default() -> Self {
         Self {
             medium: Medium::Ethernet,
-            max_transmission_unit: crate::buf::PACKET_BUF_SIZE,
+            max_transmission_unit: 1514,
         }
     }
 }

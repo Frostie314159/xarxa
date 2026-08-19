@@ -7,7 +7,7 @@
 use core::fmt::Display;
 use core::{fmt, mem};
 
-use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
+use crate::buf::PacketBuf;
 use crate::rand::Rand;
 use crate::slab::Slab;
 use crate::stack::{TxContext, alloc_ephemeral_port};
@@ -30,9 +30,9 @@ pub(crate) use self::repr::TcpRepr;
 pub use self::repr::{TcpTimestampGenerator, TcpTimestampRepr};
 use self::ring_buffer::RingBuffer;
 
-/// The IP MTU assumed for TCP segment sizing: a full packet buffer minus the
-/// Ethernet header. (Per-interface MTUs below this are not consulted yet.)
-const IP_MTU: usize = PACKET_BUF_SIZE - ETHERNET_HEADER_LEN;
+/// Hardcode MTU for now.
+/// TODO: get it from the interface capabilities instead.
+const IP_MTU: usize = 1500;
 
 /// Gives an indication on the next time the socket should be polled.
 ///
