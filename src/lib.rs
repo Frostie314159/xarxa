@@ -55,12 +55,16 @@ pub use raw::{RawHandle, RawMode, RawSocket};
 pub use route::{Route, Routes};
 #[cfg(feature = "raw")]
 pub use stack::RawSocketIter;
+#[cfg(feature = "tcp-listener")]
+pub use stack::TcpListenerIter;
+#[cfg(feature = "tcp")]
+pub use stack::TcpSocketIter;
 #[cfg(feature = "udp")]
 pub use stack::UdpSocketIter;
 pub use stack::{Iface, IfaceHandle, IfaceIter, Stack};
 #[cfg(feature = "tcp")]
-pub use stack::{TcpListenerIter, TcpSocketIter};
-#[cfg(feature = "tcp")]
-pub use tcp::{TcpHandle, TcpListener, TcpListenerHandle, TcpSocket};
+pub use tcp::{TcpHandle, TcpSocket};
+#[cfg(feature = "tcp-listener")]
+pub use tcp::{TcpListener, TcpListenerHandle};
 #[cfg(feature = "udp")]
 pub use udp::{UdpHandle, UdpSocket};

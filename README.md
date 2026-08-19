@@ -98,7 +98,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - IP headers are byte-copied instead of parsed+re-emitted, so all fields and options are kept, even those unsupported by _xarxa_.
 - TCP sockets (feature `tcp`)
   - Full TCP implementation
-  - TcpListener implements an accept queue. Buffers are not allocated until you `accept()` a connection.
+  - TCP listeners implement an accept queue. Buffers are not allocated until you `accept()` a connection. (feature `tcp-listener`)
   - Window scaling
   - Configurable keepalive.
   - RTT estimation automatically tunes retransmission timeout

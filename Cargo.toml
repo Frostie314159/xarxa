@@ -17,6 +17,7 @@ features = [
     "raw",
     "udp",
     "tcp",
+    "tcp-listener",
     "tcp-reno",
     "tcp-timestamps",
     "packetmeta-timestamp",
@@ -35,6 +36,7 @@ default = [
     "raw",
     "udp",
     "tcp",
+    "tcp-listener",
 ]
 ## Enable functionality that requires the Rust standard library: the
 ## `TunTapInterface` device, `iface::wait`, and `Instant::now()`.
@@ -57,8 +59,10 @@ ipv6 = []
 raw = []
 ## UDP sockets.
 udp = []
-## TCP sockets and listeners.
+## TCP sockets.
 tcp = []
+## TCP listeners, for accepting incoming connections.
+tcp-listener = ["tcp"]
 ## Send and receive the TCP timestamp option (RFC 7323).
 tcp-timestamps = ["tcp"]
 ## Automatically reply to ICMP echo requests. Disable to handle echo requests
@@ -114,7 +118,7 @@ required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6
 
 [[example]]
 name = "tcp_server"
-required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "tcp"]
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "tcp-listener"]
 
 [[example]]
 name = "tcp_client"

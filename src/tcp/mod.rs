@@ -27,13 +27,16 @@ use crate::wire::{
 
 mod assembler;
 mod congestion;
+#[cfg(feature = "tcp-listener")]
 mod listener;
 mod repr;
 mod ring_buffer;
 
 use self::assembler::Assembler;
 use self::congestion::Controller as _;
+#[cfg(feature = "tcp-listener")]
 pub use self::listener::{TcpListener, TcpListenerHandle};
+#[cfg(feature = "tcp-listener")]
 pub(crate) use self::listener::{TcpListenerState, process_listeners};
 pub(crate) use self::repr::TcpRepr;
 #[cfg(feature = "tcp-timestamps")]
@@ -69,6 +72,9 @@ pub(crate) enum PollAt {
 pub struct TcpHandle(pub(crate) usize);
 
 /// Error returned by [`TcpListener::listen`]
+///
+/// Requires the `tcp-listener` feature.
+#[cfg(feature = "tcp-listener")]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ListenError {
@@ -78,6 +84,7 @@ pub enum ListenError {
     InUse,
 }
 
+#[cfg(feature = "tcp-listener")]
 impl Display for ListenError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
@@ -88,6 +95,7 @@ impl Display for ListenError {
     }
 }
 
+#[cfg(feature = "tcp-listener")]
 impl core::error::Error for ListenError {}
 
 /// Error returned by [`TcpSocket::connect`]
@@ -157,9 +165,13 @@ pub(crate) type SocketBuffer = RingBuffer<u8>;
 
 /// The state of a TCP socket, according to [RFC 793].
 ///
-/// There is no `LISTEN` state: passive open is the job of [`TcpListener`], and
-/// a `TcpSocket` only ever represents a single connection (its 4-tuple is fully
-/// set from the start).
+/// There is no `LISTEN` state: a `TcpSocket` only ever represents a single
+/// connection (its 4-tuple is fully set from the start).
+#[cfg_attr(
+    feature = "tcp-listener",
+    doc = "",
+    doc = "Passive open is the job of [`TcpListener`]."
+)]
 ///
 /// [RFC 793]: https://tools.ietf.org/html/rfc793
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -2163,9 +2175,17 @@ pub(crate) fn flush(state: &mut TcpSocketState, cx: &mut TxContext<'_>) {
 /// A Transmission Control Protocol socket, borrowed from a [`Stack`] by
 /// [`Stack::tcp_socket`].
 ///
-/// A TCP socket represents a single connection (connecting or connected): its
-/// 4-tuple is fully set from the start, by [`connect`](Self::connect) or by
-/// [`TcpListener::accept`]. Passive open lives in [`TcpListener`].
+#[cfg_attr(
+    not(feature = "tcp-listener"),
+    doc = "A TCP socket represents a single connection (connecting or connected): its",
+    doc = "4-tuple is fully set from the start, by [`connect`](Self::connect)."
+)]
+#[cfg_attr(
+    feature = "tcp-listener",
+    doc = "A TCP socket represents a single connection (connecting or connected): its",
+    doc = "4-tuple is fully set from the start, by [`connect`](Self::connect) or by",
+    doc = "[`TcpListener::accept`]. Passive open lives in [`TcpListener`]."
+)]
 ///
 /// [`Stack`]: crate::Stack
 /// [`Stack::tcp_socket`]: crate::Stack::tcp_socket
@@ -3195,6 +3215,7 @@ mod test {
     // =========================================================================================//
 
     /// A stack with a listener on `LOCAL_PORT` (any address).
+    #[cfg(feature = "tcp-listener")]
     fn listener_stack() -> (Stack, TcpListenerHandle) {
         let mut stack = test_stack();
         let h = stack.add_tcp_listener();
@@ -3204,11 +3225,13 @@ mod test {
 
     /// Offer a segment from `REMOTE_END` to `LOCAL_END` to the stack's
     /// listeners the way `process_tcp` does, returning whether it was consumed.
+    #[cfg(feature = "tcp-listener")]
     fn listener_deliver(stack: &mut Stack, repr: &TcpRepr) -> bool {
         listener_deliver_to(stack, LOCAL_ADDR, repr)
     }
 
     /// Like [`listener_deliver`], with an explicit destination address.
+    #[cfg(feature = "tcp-listener")]
     fn listener_deliver_to(stack: &mut Stack, dst_addr: Ipv4Address, repr: &TcpRepr) -> bool {
         process_listeners(
             &mut stack.sockets.tcp_listeners,
@@ -3218,6 +3241,7 @@ mod test {
         )
     }
 
+    #[cfg(feature = "tcp-listener")]
     fn syn_repr() -> TcpRepr<'static> {
         TcpRepr {
             control: TcpControl::Syn,
@@ -3227,6 +3251,7 @@ mod test {
         }
     }
 
+    #[cfg(feature = "tcp-listener")]
     #[test]
     fn test_listener_listen_validation() {
         let mut stack = test_stack();
@@ -3252,6 +3277,7 @@ mod test {
         assert_eq!(stack.tcp_listener(h3).listen(81), Ok(()));
     }
 
+    #[cfg(feature = "tcp-listener")]
     #[test]
     fn test_listener_syn_and_accept() {
         let (mut stack, h) = listener_stack();
@@ -3302,6 +3328,7 @@ mod test {
         sanity!(s, socket_established());
     }
 
+    #[cfg(feature = "tcp-listener")]
     #[test]
     fn test_listener_syn_dedup() {
         let (mut stack, h) = listener_stack();
@@ -3325,6 +3352,7 @@ mod test {
         assert_eq!(stack.sockets.tcp.get(sh.0).remote_seq_no, REMOTE_SEQ + 101);
     }
 
+    #[cfg(feature = "tcp-listener")]
     #[test]
     fn test_listener_rst_cancels_syn() {
         let (mut stack, h) = listener_stack();
@@ -3356,6 +3384,7 @@ mod test {
         assert!(!stack.tcp_listener(h).can_accept());
     }
 
+    #[cfg(feature = "tcp-listener")]
     #[test]
     fn test_listener_addr_filter() {
         // A listener bound to a specific address ignores SYNs to other
@@ -3372,6 +3401,7 @@ mod test {
         assert!(stack.tcp_listener(h).can_accept());
     }
 
+    #[cfg(feature = "tcp-listener")]
     #[test]
     fn test_listener_priority() {
         // Among listeners on the same port, an exact local-address match beats
@@ -3392,6 +3422,7 @@ mod test {
         assert!(stack.tcp_listener(h_any).can_accept());
     }
 
+    #[cfg(feature = "tcp-listener")]
     #[test]
     fn test_listener_syn_mss() {
         // A tiny MSS is clamped, and a zero MSS is treated as absent.
@@ -3414,6 +3445,7 @@ mod test {
         }
     }
 
+    #[cfg(feature = "tcp-listener")]
     #[test]
     fn test_listener_window_scaling() {
         // When the remote offers window scaling, the accepted socket's shift
@@ -3482,6 +3514,7 @@ mod test {
         );
     }
 
+    #[cfg(feature = "tcp-listener")]
     #[test]
     fn test_listener_close_drops_syns() {
         let (mut stack, h) = listener_stack();
@@ -9693,6 +9726,7 @@ mod stack_test {
 
     const REMOTE_SEQ: TcpSeqNumber = TcpSeqNumber(100);
     /// The fixed initial sequence number `random_seq_no` returns in test builds.
+    #[cfg_attr(not(feature = "tcp-listener"), allow(dead_code))]
     const LOCAL_SEQ: TcpSeqNumber = TcpSeqNumber(10000);
 
     const SEND_TEMPL: TcpRepr<'static> = TcpRepr {
@@ -9784,6 +9818,7 @@ mod stack_test {
     }
 
     #[test]
+    #[cfg(feature = "tcp-listener")]
     fn test_stack_handshake_data_and_close() {
         let (mut stack, queues) = stack();
         let lh = stack.add_tcp_listener();
@@ -9899,6 +9934,7 @@ mod stack_test {
     }
 
     #[test]
+    #[cfg(feature = "tcp-listener")]
     fn test_stack_established_socket_beats_listener() {
         // Set up an established connection through the listener.
         let (mut stack, queues) = stack();

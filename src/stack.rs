@@ -17,10 +17,9 @@ use crate::raw::{RawHandle, RawSocket, RawSocketState};
 use crate::route::Routes;
 use crate::slab::Slab;
 #[cfg(feature = "tcp")]
-use crate::tcp::{
-    PollAt, SocketBuffer, TcpHandle, TcpListener, TcpListenerHandle, TcpListenerState, TcpRepr, TcpSocket,
-    TcpSocketState,
-};
+use crate::tcp::{PollAt, SocketBuffer, TcpHandle, TcpRepr, TcpSocket, TcpSocketState};
+#[cfg(feature = "tcp-listener")]
+use crate::tcp::{TcpListener, TcpListenerHandle, TcpListenerState};
 use crate::time::Instant;
 #[cfg(feature = "udp")]
 use crate::udp::{UdpHandle, UdpSocket, UdpSocketState};
@@ -58,7 +57,7 @@ pub(crate) struct Sockets {
     pub(crate) raw: Slab<RawSocketState>,
     #[cfg(feature = "tcp")]
     pub(crate) tcp: Slab<TcpSocketState>,
-    #[cfg(feature = "tcp")]
+    #[cfg(feature = "tcp-listener")]
     pub(crate) tcp_listeners: Slab<TcpListenerState>,
 }
 
@@ -482,7 +481,7 @@ impl Stack {
                 raw: Slab::new(),
                 #[cfg(feature = "tcp")]
                 tcp: Slab::new(),
-                #[cfg(feature = "tcp")]
+                #[cfg(feature = "tcp-listener")]
                 tcp_listeners: Slab::new(),
             },
         }
@@ -665,7 +664,7 @@ impl Stack {
     }
 
     /// Add a TCP listener to the stack, returning a handle to it.
-    #[cfg(feature = "tcp")]
+    #[cfg(feature = "tcp-listener")]
     pub fn add_tcp_listener(&mut self) -> TcpListenerHandle {
         TcpListenerHandle(self.sockets.tcp_listeners.add_with(|_| TcpListenerState::new()))
     }
@@ -674,7 +673,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the listener was already removed).
-    #[cfg(feature = "tcp")]
+    #[cfg(feature = "tcp-listener")]
     pub fn remove_tcp_listener(&mut self, handle: TcpListenerHandle) {
         self.sockets.tcp_listeners.remove(handle.0);
     }
@@ -683,7 +682,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the listener was already removed).
-    #[cfg(feature = "tcp")]
+    #[cfg(feature = "tcp-listener")]
     pub fn tcp_listener(&mut self, handle: TcpListenerHandle) -> TcpListener<'_> {
         self.sockets.tcp_listeners.get(handle.0); // Stale handles panic here, not on first use.
         TcpListener {
@@ -737,7 +736,7 @@ impl Stack {
     /// Iterate over the TCP listeners added to the stack.
     ///
     /// See [`TcpListenerIter`] for how to use it.
-    #[cfg(feature = "tcp")]
+    #[cfg(feature = "tcp-listener")]
     pub fn tcp_listeners(&mut self) -> TcpListenerIter<'_> {
         TcpListenerIter { stack: self, next: 0 }
     }
@@ -948,13 +947,13 @@ impl TcpSocketIter<'_> {
 /// }
 /// # }
 /// ```
-#[cfg(feature = "tcp")]
+#[cfg(feature = "tcp-listener")]
 pub struct TcpListenerIter<'a> {
     stack: &'a mut Stack,
     next: usize,
 }
 
-#[cfg(feature = "tcp")]
+#[cfg(feature = "tcp-listener")]
 impl TcpListenerIter<'_> {
     /// Get the next TCP listener, with its handle.
     ///
@@ -1185,8 +1184,7 @@ impl StackInner {
             #[cfg(feature = "tcp")]
             IpProtocol::Tcp => self.process_tcp(
                 iface,
-                &mut sockets.tcp,
-                &mut sockets.tcp_listeners,
+                sockets,
                 IpAddress::Ipv4(src_addr),
                 IpAddress::Ipv4(dst_addr),
                 buf,
@@ -1220,8 +1218,7 @@ impl StackInner {
     fn process_tcp(
         &mut self,
         iface: &mut IfaceState,
-        sockets: &mut Slab<TcpSocketState>,
-        listeners: &mut Slab<TcpListenerState>,
+        sockets: &mut Sockets,
         src_addr: IpAddress,
         dst_addr: IpAddress,
         mut buf: PacketBuf,
@@ -1247,7 +1244,7 @@ impl StackInner {
         };
 
         // Connected sockets: exact 4-tuple match.
-        for (_, socket) in sockets.iter_mut() {
+        for (_, socket) in sockets.tcp.iter_mut() {
             if socket.accepts(&src_addr, &dst_addr, &tcp_repr) {
                 if let Some(reply) = socket.process(self.now, &src_addr, &dst_addr, &tcp_repr) {
                     // Replies go back the way the segment came in.
@@ -1262,7 +1259,8 @@ impl StackInner {
         // beats wildcard), and an RST aimed at a recorded SYN cancels it.
         // Nothing is replied, the handshake starts when the connection is
         // accepted.
-        if crate::tcp::process_listeners(listeners, &src_addr, &dst_addr, &tcp_repr) {
+        #[cfg(feature = "tcp-listener")]
+        if crate::tcp::process_listeners(&mut sockets.tcp_listeners, &src_addr, &dst_addr, &tcp_repr) {
             return;
         }
 
@@ -1499,8 +1497,7 @@ impl StackInner {
             #[cfg(feature = "tcp")]
             IpProtocol::Tcp => self.process_tcp(
                 iface,
-                &mut sockets.tcp,
-                &mut sockets.tcp_listeners,
+                sockets,
                 IpAddress::Ipv6(src_addr),
                 IpAddress::Ipv6(dst_addr),
                 buf,
