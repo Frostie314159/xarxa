@@ -3,6 +3,25 @@ name = "xarxa"
 version = "0.1.0"
 edition = "2024"
 
+[package.metadata.docs.rs]
+features = [
+    "std",
+    "log",
+    "async",
+    "auto-icmp-echo-reply",
+    "icmp-error-handling",
+    "medium-ethernet",
+    "medium-ip",
+    "ipv4",
+    "ipv6",
+    "raw",
+    "udp",
+    "tcp",
+    "tcp-reno",
+    "tcp-timestamps",
+    "packetmeta-timestamp",
+]
+
 [features]
 default = [
     "std",
@@ -20,6 +39,10 @@ default = [
 ## Enable functionality that requires the Rust standard library: the
 ## `TunTapInterface` device, `iface::wait`, and `Instant::now()`.
 std = ["dep:libc"]
+## Waker registration on sockets, for building `Future`s on top of the stack.
+async = []
+
+#! ### Protocol support
 ## Support interfaces that send and receive Ethernet frames, with the link-layer
 ## machinery that goes with them (ARP, NDISC, the neighbor cache).
 medium-ethernet = []
@@ -36,30 +59,8 @@ raw = []
 udp = []
 ## TCP sockets and listeners.
 tcp = []
-## Use the Reno congestion control algorithm on TCP sockets. Mutually exclusive
-## with `tcp-cubic`; with neither, TCP does no congestion control.
-tcp-reno = ["tcp"]
-## Use the CUBIC congestion control algorithm on TCP sockets. Mutually exclusive
-## with `tcp-reno`; with neither, TCP does no congestion control.
-##
-## CUBIC uses `f64` arithmetic, which is slow on targets without a double
-## precision FPU and pulls in soft-float code. Prefer `tcp-reno` there.
-tcp-cubic = ["tcp"]
 ## Send and receive the TCP timestamp option (RFC 7323).
 tcp-timestamps = ["tcp"]
-## Waker registration on sockets, for building `Future`s on top of the stack.
-async = []
-## Enable the `PacketMeta::id` field: an opaque number that travels with a packet
-## through the whole stack, set by the driver on receive and by the application on
-## send. Costs 4 bytes in every packet buffer.
-packetmeta-id = []
-## Enable the `PacketMeta::timestamp` and `PacketMeta::request_timestamp` fields, and
-## `Interface::poll_tx_timestamp`: hardware timestamping of received and transmitted
-## packets.
-##
-## Transmit timestamps are correlated back to the packet that produced them by
-## `PacketMeta::id`, so this implies `packetmeta-id`.
-packetmeta-timestamp = ["packetmeta-id"]
 ## Automatically reply to ICMP echo requests. Disable to handle echo requests
 ## yourself through a raw socket.
 auto-icmp-echo-reply = []
@@ -69,10 +70,31 @@ auto-icmp-echo-reply = []
 ## itself when neighbor resolution (ARP/NDISC) fails. Disabling this also
 ## disables generating the latter.
 icmp-error-handling = []
-## Log with the `defmt` crate.
-defmt = ["dep:defmt"]
+
+#! ### TCP congestion control
+#! Enable one of these features to enable congestion control. No feature enabled means
+#! no congestion control. You may enable at most one.
+## Use the Reno congestion control algorithm on TCP sockets.
+tcp-reno = ["tcp"]
+## Use the CUBIC congestion control algorithm on TCP sockets. Warning: it uses `f64` arithmetic which can be slow and pull in soft-float code depending on the target.
+tcp-cubic = ["tcp"]
+
+#! ### Packet metadata
+## Enable the `PacketMeta::id` field: an opaque number that travels with a packet
+## through the whole stack.
+packetmeta-id = []
+## Enable the `PacketMeta::timestamp` and `PacketMeta::request_timestamp` fields, and
+## `Interface::poll_tx_timestamp`.
+##
+## Transmit timestamps are correlated back to the packet that produced them by
+## `PacketMeta::id`, so this implies `packetmeta-id`.
+packetmeta-timestamp = ["packetmeta-id"]
+
+#! ### Logging
 ## Log with the `log` crate.
 log = ["dep:log"]
+## Log with the `defmt` crate.
+defmt = ["dep:defmt"]
 
 [dependencies]
 document-features = "0.2.11"

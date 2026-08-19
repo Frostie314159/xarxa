@@ -66,7 +66,7 @@ pub use self::ethernet::{
 ///
 /// The Ethernet header in a build that drives Ethernet interfaces, since an IP
 /// packet may end up going out of one. Zero in a build that only drives
-/// [`Medium::Ip`](crate::iface::Medium::Ip) interfaces, which prepend nothing.
+/// [`Medium::Ip`] interfaces, which prepend nothing.
 #[cfg(feature = "medium-ethernet")]
 pub const LINK_HEADER_LEN: usize = ETHERNET_HEADER_LEN;
 
@@ -74,7 +74,7 @@ pub const LINK_HEADER_LEN: usize = ETHERNET_HEADER_LEN;
 ///
 /// The Ethernet header in a build that drives Ethernet interfaces, since an IP
 /// packet may end up going out of one. Zero in a build that only drives
-/// [`Medium::Ip`](crate::iface::Medium::Ip) interfaces, which prepend nothing.
+/// [`Medium::Ip`] interfaces, which prepend nothing.
 #[cfg(not(feature = "medium-ethernet"))]
 pub const LINK_HEADER_LEN: usize = 0;
 
@@ -159,8 +159,8 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// A hardware (link-layer) address.
 ///
 /// Which variants exist depends on the enabled `medium-*` features. In a build
-/// that only drives [`Medium::Ip`](crate::iface::Medium::Ip) interfaces this
-/// type has a single variant and takes up no space.
+/// that only drives [`Medium::Ip`] interfaces this type has a single variant and
+/// takes up no space.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HardwareAddress {
