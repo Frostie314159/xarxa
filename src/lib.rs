@@ -1,4 +1,8 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
+#![doc = include_str!("../README.md")]
+//!
+//! ## Feature flags
+#![doc = document_features::document_features!(feature_label = r#"<span class="stab portability"><code>{feature}</code></span>"#)]
 
 extern crate alloc;
 

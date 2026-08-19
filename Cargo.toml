@@ -17,6 +17,8 @@ default = [
     "udp",
     "tcp",
 ]
+## Enable functionality that requires the Rust standard library: the
+## `TunTapInterface` device, `iface::wait`, and `Instant::now()`.
 std = ["dep:libc"]
 ## Support interfaces that send and receive Ethernet frames, with the link-layer
 ## machinery that goes with them (ARP, NDISC, the neighbor cache).
@@ -67,10 +69,13 @@ auto-icmp-echo-reply = []
 ## itself when neighbor resolution (ARP/NDISC) fails. Disabling this also
 ## disables generating the latter.
 icmp-error-handling = []
+## Log with the `defmt` crate.
 defmt = ["dep:defmt"]
+## Log with the `log` crate.
 log = ["dep:log"]
 
 [dependencies]
+document-features = "0.2.11"
 bitflags = { version = "2", default-features = false }
 byteorder = { version = "1", default-features = false }
 libc = { version = "0.2", optional = true }
