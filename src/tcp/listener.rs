@@ -13,6 +13,7 @@ use crate::rand::Rand;
 use crate::slab::Slab;
 use crate::stack::addr_score;
 use crate::tcp::TcpSeqNumber;
+use crate::tcp::congestion::Controller as _;
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
 use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
@@ -326,7 +327,7 @@ impl TcpListener<'_> {
         }
         s.remote_win_len = syn.remote_win_len;
         s.remote_mss = syn.remote_mss;
-        s.congestion_controller.inner_mut().set_mss(syn.remote_mss);
+        s.congestion_controller.set_mss(syn.remote_mss);
         // Answer with timestamps only if the SYN offered them.
         #[cfg(feature = "tcp-socket-timestamps")]
         {

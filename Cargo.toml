@@ -34,6 +34,15 @@ socket-raw = ["socket"]
 socket-udp = ["socket"]
 ## TCP sockets and listeners.
 socket-tcp = ["socket"]
+## Use the Reno congestion control algorithm on TCP sockets. Mutually exclusive
+## with `socket-tcp-cubic`; with neither, TCP does no congestion control.
+socket-tcp-reno = ["socket-tcp"]
+## Use the CUBIC congestion control algorithm on TCP sockets. Mutually exclusive
+## with `socket-tcp-reno`; with neither, TCP does no congestion control.
+##
+## CUBIC uses `f64` arithmetic, which is slow on targets without a double
+## precision FPU and pulls in soft-float code. Prefer `socket-tcp-reno` there.
+socket-tcp-cubic = ["socket-tcp"]
 ## Send and receive the TCP timestamp option (RFC 7323).
 tcp-socket-timestamps = ["socket-tcp"]
 ## Enabled automatically by the `socket-*` features: "this build has sockets at

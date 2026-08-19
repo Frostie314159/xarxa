@@ -8,6 +8,9 @@ compile_error!("You must enable at least one of the following features: medium-e
 #[cfg(not(any(feature = "proto-ipv4", feature = "proto-ipv6")))]
 compile_error!("You must enable at least one of the following features: proto-ipv4, proto-ipv6");
 
+#[cfg(all(feature = "socket-tcp-reno", feature = "socket-tcp-cubic"))]
+compile_error!("The features socket-tcp-reno and socket-tcp-cubic are mutually exclusive.");
+
 // Must go first so other modules see its macros.
 #[macro_use]
 mod fmt;

@@ -2,10 +2,13 @@ use crate::time::Instant;
 
 use super::RttEstimator;
 
+#[cfg(not(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic")))]
 pub(super) mod no_control;
 
+#[cfg(feature = "socket-tcp-cubic")]
 pub(super) mod cubic;
 
+#[cfg(feature = "socket-tcp-reno")]
 pub(super) mod reno;
 
 #[allow(unused_variables)]
@@ -35,45 +38,13 @@ pub(super) trait Controller {
     fn set_mss(&mut self, mss: usize) {}
 }
 
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug)]
-pub(super) enum AnyController {
-    None(no_control::NoControl),
+/// The congestion controller this build uses, picked by the `socket-tcp-reno` and
+/// `socket-tcp-cubic` cargo features.
+#[cfg(not(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic")))]
+pub(super) type Congestion = no_control::NoControl;
 
-    Reno(reno::Reno),
+#[cfg(feature = "socket-tcp-reno")]
+pub(super) type Congestion = reno::Reno;
 
-    Cubic(cubic::Cubic),
-}
-
-impl AnyController {
-    /// Create a new congestion controller, defaulting to no congestion control.
-    ///
-    /// Users can select a congestion controller manually with
-    /// [`super::TcpSocket::set_congestion_control()`] at run-time.
-    #[inline]
-    pub fn new() -> Self {
-        AnyController::None(no_control::NoControl)
-    }
-
-    #[inline]
-    pub fn inner_mut(&mut self) -> &mut dyn Controller {
-        match self {
-            AnyController::None(n) => n,
-
-            AnyController::Reno(r) => r,
-
-            AnyController::Cubic(c) => c,
-        }
-    }
-
-    #[inline]
-    pub fn inner(&self) -> &dyn Controller {
-        match self {
-            AnyController::None(n) => n,
-
-            AnyController::Reno(r) => r,
-
-            AnyController::Cubic(c) => c,
-        }
-    }
-}
+#[cfg(feature = "socket-tcp-cubic")]
+pub(super) type Congestion = cubic::Cubic;

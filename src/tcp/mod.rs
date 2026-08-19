@@ -32,6 +32,7 @@ mod repr;
 mod ring_buffer;
 
 use self::assembler::Assembler;
+use self::congestion::Controller as _;
 pub use self::listener::{TcpListener, TcpListenerHandle};
 pub(crate) use self::listener::{TcpListenerState, process_listeners};
 pub(crate) use self::repr::TcpRepr;
@@ -249,6 +250,7 @@ impl RttEstimator {
         Duration::from_millis(self.rto as _)
     }
 
+    #[cfg(feature = "socket-tcp-cubic")]
     fn smoothed_rtt(&self) -> u32 {
         if self.have_measurement { self.srtt } else { 0 }
     }
@@ -479,17 +481,6 @@ impl Display for Tuple {
     }
 }
 
-/// A congestion control algorithm.
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Copy, Clone, Eq, PartialEq)]
-pub enum CongestionControl {
-    None,
-
-    Reno,
-
-    Cubic,
-}
-
 /// The state of a TCP socket, stored in the stack's socket slab. The public API
 /// lives on [`TcpSocket`], the view of one of these borrowed from the stack.
 #[derive(Debug)]
@@ -569,7 +560,7 @@ pub(crate) struct TcpSocketState {
     nagle: bool,
 
     /// The congestion control algorithm.
-    congestion_controller: congestion::AnyController,
+    congestion_controller: congestion::Congestion,
 
     /// Whether the TCP timestamp option (RFC 7323) is in use on this connection.
     /// We offer it in the SYN of every connection we open, and answer with it if
@@ -661,7 +652,7 @@ impl TcpSocketState {
             last_remote_tsval: 0,
             #[cfg(feature = "tcp-socket-timestamps")]
             tsval_offset: 0,
-            congestion_controller: congestion::AnyController::new(),
+            congestion_controller: congestion::Congestion::new(),
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -758,10 +749,7 @@ impl TcpSocketState {
     }
 
     fn cwnd_remaining(&self) -> usize {
-        self.congestion_controller
-            .inner()
-            .window()
-            .saturating_sub(self.flight_size())
+        self.congestion_controller.window().saturating_sub(self.flight_size())
     }
 
     fn set_state(&mut self, state: State) {
@@ -1249,7 +1237,7 @@ impl TcpSocketState {
                     // Treat a zero MSS as if the option were absent, like Linux does.
                     if max_seg_size != 0 {
                         self.remote_mss = (max_seg_size as usize).max(MIN_REMOTE_MSS);
-                        self.congestion_controller.inner_mut().set_mss(self.remote_mss);
+                        self.congestion_controller.set_mss(self.remote_mss);
                     }
                 }
 
@@ -1358,9 +1346,7 @@ impl TcpSocketState {
         let is_window_update = new_remote_win_len != self.remote_win_len;
         self.remote_win_len = new_remote_win_len;
 
-        self.congestion_controller
-            .inner_mut()
-            .set_remote_window(new_remote_win_len);
+        self.congestion_controller.set_remote_window(new_remote_win_len);
 
         if ack_len > 0 {
             // Dequeue acknowledged octets.
@@ -1408,9 +1394,7 @@ impl TcpSocketState {
 
                     // Notify of duplicate ACK
                     let in_flight = self.flight_size();
-                    self.congestion_controller
-                        .inner_mut()
-                        .on_dup_ack(now, self.remote_mss, in_flight);
+                    self.congestion_controller.on_dup_ack(now, self.remote_mss, in_flight);
                 }
 
                 // No duplicate ACK means we reset the duplicate ACK count
@@ -1426,7 +1410,6 @@ impl TcpSocketState {
                     self.rtte.on_ack(now, ack_number);
                     let new_flight_size = self.flight_size().saturating_sub(ack_len);
                     self.congestion_controller
-                        .inner_mut()
                         .on_ack(now, ack_len, new_flight_size, &self.rtte);
                 }
             };
@@ -1719,7 +1702,7 @@ impl TcpSocketState {
             self.remote_last_ts = Some(cx.now());
         }
 
-        self.congestion_controller.inner_mut().pre_transmit(cx.now());
+        self.congestion_controller.pre_transmit(cx.now());
 
         // Check if any state needs to be changed because of a timer.
         if self.timed_out(cx.now()) {
@@ -1733,7 +1716,7 @@ impl TcpSocketState {
 
                 // Inform the congestion controller that we're retransmitting and should enter the slow start state
                 let in_flight = self.flight_size();
-                self.congestion_controller.inner_mut().on_rto(cx.now(), in_flight);
+                self.congestion_controller.on_rto(cx.now(), in_flight);
 
                 // Rewind "last sequence number sent", as if we never
                 // had sent them. This will cause all data in the queue
@@ -1748,7 +1731,7 @@ impl TcpSocketState {
 
                 // Inform the congestion controller that we're doing a fast retransmit and should enter the fast recovery state
                 let in_flight = self.flight_size();
-                self.congestion_controller.inner_mut().on_loss(cx.now(), in_flight);
+                self.congestion_controller.on_loss(cx.now(), in_flight);
 
                 self.pending_fast_retransmit = true;
             }
@@ -2039,9 +2022,7 @@ impl TcpSocketState {
 
         if repr.segment_len() > 0 {
             self.rtte.on_send(cx.now(), repr.seq_number + repr.segment_len());
-            self.congestion_controller
-                .inner_mut()
-                .post_transmit(cx.now(), repr.segment_len());
+            self.congestion_controller.post_transmit(cx.now(), repr.segment_len());
         }
 
         if repr.segment_len() > 0 && !self.timer.is_retransmit() {
@@ -2242,49 +2223,6 @@ impl TcpSocket<'_> {
     #[cfg(feature = "async")]
     pub fn register_send_waker(&mut self, waker: &core::task::Waker) {
         self.inner_mut().tx_waker.register(waker)
-    }
-
-    /// Set an algorithm for congestion control.
-    ///
-    /// `CongestionControl::None` indicates that no congestion control is applied.
-    /// Options `CongestionControl::Cubic` and `CongestionControl::Reno` are also available.
-    ///
-    /// `CongestionControl::Reno` is a classic congestion control algorithm valued for its simplicity.
-    /// Despite having a lower algorithmic complexity than `Cubic`,
-    /// it is less efficient in terms of bandwidth usage.
-    ///
-    /// `CongestionControl::Cubic` represents a modern congestion control algorithm designed to
-    /// be more efficient and fair compared to `CongestionControl::Reno`.
-    /// It is the default choice for Linux, Windows, and macOS.
-    /// `CongestionControl::Cubic` relies on double precision (`f64`) floating point operations, which may cause issues in some contexts:
-    /// * Small embedded processors (such as Cortex-M0, Cortex-M1, and Cortex-M3) do not have an FPU, and floating point operations consume significant amounts of CPU time and Flash space.
-    /// * Interrupt handlers should almost always avoid floating-point operations.
-    /// * Kernel-mode code on desktop processors usually avoids FPU operations to reduce the penalty of saving and restoring FPU registers.
-    ///
-    /// In all these cases, `CongestionControl::Reno` is a better choice of congestion control algorithm.
-    pub fn set_congestion_control(&mut self, congestion_control: CongestionControl) {
-        use congestion::*;
-
-        self.inner_mut().congestion_controller = match congestion_control {
-            CongestionControl::None => AnyController::None(no_control::NoControl),
-
-            CongestionControl::Reno => AnyController::Reno(reno::Reno::new()),
-
-            CongestionControl::Cubic => AnyController::Cubic(cubic::Cubic::new()),
-        }
-    }
-
-    /// Return the current congestion control algorithm.
-    pub fn congestion_control(&self) -> CongestionControl {
-        use congestion::*;
-
-        match self.inner().congestion_controller {
-            AnyController::None(_) => CongestionControl::None,
-
-            AnyController::Reno(_) => CongestionControl::Reno,
-
-            AnyController::Cubic(_) => CongestionControl::Cubic,
-        }
     }
 
     /// Return the timeout duration.
@@ -6426,10 +6364,10 @@ mod test {
         }));
     }
 
+    #[cfg(feature = "socket-tcp-reno")]
     #[test]
     fn test_congestion_window_limits_data_in_flight() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
-        s.view().set_congestion_control(CongestionControl::Reno);
         s.remote_win_len = 65535;
         s.remote_mss = 1024;
 
@@ -6468,10 +6406,10 @@ mod test {
         }));
     }
 
+    #[cfg(feature = "socket-tcp-reno")]
     #[test]
     fn test_congestion_window_doesnt_limit_fast_retransmit() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
-        s.view().set_congestion_control(CongestionControl::Reno);
         s.remote_win_len = 65535;
         s.remote_mss = 1024;
 
@@ -8207,10 +8145,10 @@ mod test {
         );
     }
 
+    #[cfg(feature = "socket-tcp-reno")]
     #[test]
     fn test_zero_window_probe_not_capped_by_cwnd() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
-        s.view().set_congestion_control(CongestionControl::Reno);
         s.remote_win_len = 65535;
         s.remote_mss = 1024;
 
@@ -9441,24 +9379,6 @@ mod test {
             r.sample(2000);
             assert_eq!(r.retransmission_timeout(), Duration::from_millis(rto));
         }
-    }
-
-    #[test]
-    fn test_set_get_congestion_control() {
-        let mut s = socket_established();
-
-        {
-            s.view().set_congestion_control(CongestionControl::Reno);
-            assert_eq!(s.view().congestion_control(), CongestionControl::Reno);
-        }
-
-        {
-            s.view().set_congestion_control(CongestionControl::Cubic);
-            assert_eq!(s.view().congestion_control(), CongestionControl::Cubic);
-        }
-
-        s.view().set_congestion_control(CongestionControl::None);
-        assert_eq!(s.view().congestion_control(), CongestionControl::None);
     }
 
     // =========================================================================================//

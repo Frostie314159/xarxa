@@ -4,6 +4,12 @@ use super::Controller;
 #[derive(Debug)]
 pub struct NoControl;
 
+impl NoControl {
+    pub fn new() -> Self {
+        NoControl
+    }
+}
+
 impl Controller for NoControl {
     fn window(&self) -> usize {
         usize::MAX
