@@ -713,6 +713,45 @@ impl Stack {
         }
     }
 
+    /// Iterate over the interfaces added to the stack.
+    ///
+    /// See [`IfaceIter`] for how to use it.
+    pub fn ifaces(&mut self) -> IfaceIter<'_> {
+        IfaceIter { stack: self, next: 0 }
+    }
+
+    /// Iterate over the UDP sockets added to the stack.
+    ///
+    /// See [`UdpSocketIter`] for how to use it.
+    #[cfg(feature = "socket-udp")]
+    pub fn udp_sockets(&mut self) -> UdpSocketIter<'_> {
+        UdpSocketIter { stack: self, next: 0 }
+    }
+
+    /// Iterate over the raw sockets added to the stack.
+    ///
+    /// See [`RawSocketIter`] for how to use it.
+    #[cfg(feature = "socket-raw")]
+    pub fn raw_sockets(&mut self) -> RawSocketIter<'_> {
+        RawSocketIter { stack: self, next: 0 }
+    }
+
+    /// Iterate over the TCP sockets added to the stack.
+    ///
+    /// See [`TcpSocketIter`] for how to use it.
+    #[cfg(feature = "socket-tcp")]
+    pub fn tcp_sockets(&mut self) -> TcpSocketIter<'_> {
+        TcpSocketIter { stack: self, next: 0 }
+    }
+
+    /// Iterate over the TCP listeners added to the stack.
+    ///
+    /// See [`TcpListenerIter`] for how to use it.
+    #[cfg(feature = "socket-tcp")]
+    pub fn tcp_listeners(&mut self) -> TcpListenerIter<'_> {
+        TcpListenerIter { stack: self, next: 0 }
+    }
+
     /// Process all pending ingress packets on all ifaces, advance the stack's
     /// internal timers, and transmit everything the TCP sockets have made due.
     ///
@@ -768,6 +807,174 @@ impl Stack {
         let timers: [Option<Instant>; 0] = [];
 
         timers.into_iter().flatten().chain(tcp_poll_at).min()
+    }
+}
+
+/// Iterator over the interfaces of a [`Stack`], returned by [`Stack::ifaces`].
+///
+/// Each item borrows the stack, so only one can exist at a time. That is why this is
+/// not an [`Iterator`] and cannot be used in a `for` loop. Use `while let`:
+///
+/// ```no_run
+/// # use xarxa::Stack;
+/// # fn f(stack: &mut Stack) {
+/// let mut iter = stack.ifaces();
+/// while let Some((handle, item)) = iter.next() {
+///     let _ = (handle, item.hardware_addr());
+/// }
+/// # }
+/// ```
+pub struct IfaceIter<'a> {
+    stack: &'a mut Stack,
+    next: usize,
+}
+
+impl IfaceIter<'_> {
+    /// Get the next interface, with its handle.
+    ///
+    /// Returns `None` when there are no more.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<(IfaceHandle, Iface<'_>)> {
+        let index = self.stack.ifaces.next_occupied(self.next)?;
+        self.next = index + 1;
+        let handle = IfaceHandle(index);
+        Some((handle, self.stack.iface(handle)))
+    }
+}
+
+/// Iterator over the UDP sockets of a [`Stack`], returned by [`Stack::udp_sockets`].
+///
+/// Each item borrows the stack, so only one can exist at a time. That is why this is
+/// not an [`Iterator`] and cannot be used in a `for` loop. Use `while let`:
+///
+/// ```no_run
+/// # use xarxa::Stack;
+/// # fn f(stack: &mut Stack) {
+/// let mut iter = stack.udp_sockets();
+/// while let Some((handle, item)) = iter.next() {
+///     let _ = (handle, item.can_recv());
+/// }
+/// # }
+/// ```
+#[cfg(feature = "socket-udp")]
+pub struct UdpSocketIter<'a> {
+    stack: &'a mut Stack,
+    next: usize,
+}
+
+#[cfg(feature = "socket-udp")]
+impl UdpSocketIter<'_> {
+    /// Get the next UDP socket, with its handle.
+    ///
+    /// Returns `None` when there are no more.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<(UdpHandle, UdpSocket<'_>)> {
+        let index = self.stack.sockets.udp.next_occupied(self.next)?;
+        self.next = index + 1;
+        let handle = UdpHandle(index);
+        Some((handle, self.stack.udp_socket(handle)))
+    }
+}
+
+/// Iterator over the raw sockets of a [`Stack`], returned by [`Stack::raw_sockets`].
+///
+/// Each item borrows the stack, so only one can exist at a time. That is why this is
+/// not an [`Iterator`] and cannot be used in a `for` loop. Use `while let`:
+///
+/// ```no_run
+/// # use xarxa::Stack;
+/// # fn f(stack: &mut Stack) {
+/// let mut iter = stack.raw_sockets();
+/// while let Some((handle, item)) = iter.next() {
+///     let _ = (handle, item.can_recv());
+/// }
+/// # }
+/// ```
+#[cfg(feature = "socket-raw")]
+pub struct RawSocketIter<'a> {
+    stack: &'a mut Stack,
+    next: usize,
+}
+
+#[cfg(feature = "socket-raw")]
+impl RawSocketIter<'_> {
+    /// Get the next raw socket, with its handle.
+    ///
+    /// Returns `None` when there are no more.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<(RawHandle, RawSocket<'_>)> {
+        let index = self.stack.sockets.raw.next_occupied(self.next)?;
+        self.next = index + 1;
+        let handle = RawHandle(index);
+        Some((handle, self.stack.raw_socket(handle)))
+    }
+}
+
+/// Iterator over the TCP sockets of a [`Stack`], returned by [`Stack::tcp_sockets`].
+///
+/// Each item borrows the stack, so only one can exist at a time. That is why this is
+/// not an [`Iterator`] and cannot be used in a `for` loop. Use `while let`:
+///
+/// ```no_run
+/// # use xarxa::Stack;
+/// # fn f(stack: &mut Stack) {
+/// let mut iter = stack.tcp_sockets();
+/// while let Some((handle, item)) = iter.next() {
+///     let _ = (handle, item.state());
+/// }
+/// # }
+/// ```
+#[cfg(feature = "socket-tcp")]
+pub struct TcpSocketIter<'a> {
+    stack: &'a mut Stack,
+    next: usize,
+}
+
+#[cfg(feature = "socket-tcp")]
+impl TcpSocketIter<'_> {
+    /// Get the next TCP socket, with its handle.
+    ///
+    /// Returns `None` when there are no more.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<(TcpHandle, TcpSocket<'_>)> {
+        let index = self.stack.sockets.tcp.next_occupied(self.next)?;
+        self.next = index + 1;
+        let handle = TcpHandle(index);
+        Some((handle, self.stack.tcp_socket(handle)))
+    }
+}
+
+/// Iterator over the TCP listeners of a [`Stack`], returned by [`Stack::tcp_listeners`].
+///
+/// Each item borrows the stack, so only one can exist at a time. That is why this is
+/// not an [`Iterator`] and cannot be used in a `for` loop. Use `while let`:
+///
+/// ```no_run
+/// # use xarxa::Stack;
+/// # fn f(stack: &mut Stack) {
+/// let mut iter = stack.tcp_listeners();
+/// while let Some((handle, item)) = iter.next() {
+///     let _ = (handle, item.is_open());
+/// }
+/// # }
+/// ```
+#[cfg(feature = "socket-tcp")]
+pub struct TcpListenerIter<'a> {
+    stack: &'a mut Stack,
+    next: usize,
+}
+
+#[cfg(feature = "socket-tcp")]
+impl TcpListenerIter<'_> {
+    /// Get the next TCP listener, with its handle.
+    ///
+    /// Returns `None` when there are no more.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<(TcpListenerHandle, TcpListener<'_>)> {
+        let index = self.stack.sockets.tcp_listeners.next_occupied(self.next)?;
+        self.next = index + 1;
+        let handle = TcpListenerHandle(index);
+        Some((handle, self.stack.tcp_listener(handle)))
     }
 }
 

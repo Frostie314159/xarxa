@@ -46,7 +46,13 @@ pub use meta::{Timestamp, TxTimestamp};
 #[cfg(feature = "socket-raw")]
 pub use raw::{RawHandle, RawMode, RawSocket};
 pub use route::{Route, Routes};
-pub use stack::{Iface, IfaceHandle, Stack};
+#[cfg(feature = "socket-raw")]
+pub use stack::RawSocketIter;
+#[cfg(feature = "socket-udp")]
+pub use stack::UdpSocketIter;
+pub use stack::{Iface, IfaceHandle, IfaceIter, Stack};
+#[cfg(feature = "socket-tcp")]
+pub use stack::{TcpListenerIter, TcpSocketIter};
 #[cfg(feature = "socket-tcp")]
 pub use tcp::{TcpHandle, TcpListener, TcpListenerHandle, TcpSocket};
 #[cfg(feature = "socket-udp")]

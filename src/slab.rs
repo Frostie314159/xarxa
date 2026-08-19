@@ -53,6 +53,12 @@ impl<T> Slab<T> {
         self.slots[index].as_mut().expect("no item at this index")
     }
 
+    /// Index of the first occupied slot at or after `from`, if any.
+    pub fn next_occupied(&self, from: usize) -> Option<usize> {
+        let slots = self.slots.get(from..)?;
+        slots.iter().position(|slot| slot.is_some()).map(|i| from + i)
+    }
+
     /// Iterate over all occupied slots, with their indexes.
     #[cfg(feature = "socket")]
     pub fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
