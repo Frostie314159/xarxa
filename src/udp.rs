@@ -31,9 +31,9 @@ use crate::slab::Slab;
 use crate::stack::{IfaceState, StackInner, TxContext, addr_score, alloc_ephemeral_port};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
-#[cfg(feature = "proto-ipv4")]
+#[cfg(feature = "ipv4")]
 use crate::wire::{IPV4_HEADER_LEN, Icmpv4DstUnreachable, Icmpv4Message, Ipv4Packet};
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 use crate::wire::{IPV6_HEADER_LEN, Icmpv6DstUnreachable, Icmpv6Message, Ipv6ExtHeader, Ipv6Packet};
 use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, LINK_HEADER_LEN, UDP_HEADER_LEN, UdpPacket,
@@ -308,7 +308,7 @@ impl Deref for RecvPacket {
 fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
     let (src_addr, dst_addr, header_len): (IpAddress, IpAddress, usize) =
         match IpVersion::of_packet(buf).expect("queued packet was validated on ingress") {
-            #[cfg(feature = "proto-ipv4")]
+            #[cfg(feature = "ipv4")]
             IpVersion::Ipv4 => {
                 let packet = Ipv4Packet::new_unchecked(&mut buf[..]);
                 (
@@ -317,7 +317,7 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
                     packet.header_len() as usize,
                 )
             }
-            #[cfg(feature = "proto-ipv6")]
+            #[cfg(feature = "ipv6")]
             IpVersion::Ipv6 => {
                 let packet = Ipv6Packet::new_unchecked(&mut buf[..]);
                 let src_addr = packet.src_addr();
@@ -764,9 +764,9 @@ impl UdpSocket<'_> {
         // Build the datagram: reserve headroom for the headers below, write the
         // payload, prepend the UDP header.
         let ip_header_len = match meta.endpoint.addr {
-            #[cfg(feature = "proto-ipv4")]
+            #[cfg(feature = "ipv4")]
             IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
-            #[cfg(feature = "proto-ipv6")]
+            #[cfg(feature = "ipv6")]
             IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
         };
         let headroom = LINK_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
@@ -874,14 +874,14 @@ impl StackInner {
         // would sabotage its exchange.
         if !handled_by_raw {
             match dst_addr {
-                #[cfg(feature = "proto-ipv4")]
+                #[cfg(feature = "ipv4")]
                 IpAddress::Ipv4(_) => self.transmit_icmpv4_error(
                     iface,
                     &mut buf,
                     Icmpv4Message::DstUnreachable,
                     Icmpv4DstUnreachable::PortUnreachable.into(),
                 ),
-                #[cfg(feature = "proto-ipv6")]
+                #[cfg(feature = "ipv6")]
                 IpAddress::Ipv6(_) => self.transmit_icmpv6_error(
                     iface,
                     &mut buf,
@@ -926,7 +926,7 @@ pub(crate) fn process_icmp_error(
     }
 }
 
-#[cfg(all(test, feature = "medium-ip", feature = "proto-ipv4", feature = "proto-ipv6"))]
+#[cfg(all(test, feature = "medium-ip", feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface, Medium};

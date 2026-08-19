@@ -30,27 +30,27 @@ mod field {
     pub type Rest = ::core::ops::RangeFrom<usize>;
 }
 
-#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+#[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 mod arp;
 mod ethernet;
-#[cfg(feature = "proto-ipv4")]
+#[cfg(feature = "ipv4")]
 mod icmpv4;
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 mod icmpv6;
 pub(crate) mod ip;
-#[cfg(feature = "proto-ipv4")]
+#[cfg(feature = "ipv4")]
 pub(crate) mod ipv4;
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 pub(crate) mod ipv6;
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 mod ipv6ext;
-#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
+#[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
 mod ndisc;
-#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
+#[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
 mod ndiscoption;
-#[cfg(feature = "socket-tcp")]
+#[cfg(feature = "tcp")]
 mod tcp;
-#[cfg(feature = "socket-udp")]
+#[cfg(feature = "udp")]
 mod udp;
 
 use core::fmt;
@@ -78,7 +78,7 @@ pub const LINK_HEADER_LEN: usize = ETHERNET_HEADER_LEN;
 #[cfg(not(feature = "medium-ethernet"))]
 pub const LINK_HEADER_LEN: usize = 0;
 
-#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv4"))]
+#[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 pub use self::arp::{
     BUFFER_LEN as ARP_BUFFER_LEN, Hardware as ArpHardware, Operation as ArpOperation, Packet as ArpPacket,
 };
@@ -89,54 +89,54 @@ pub use self::ip::{
     Protocol as IpProtocol, Version as IpVersion,
 };
 
-#[cfg(feature = "proto-ipv4")]
+#[cfg(feature = "ipv4")]
 pub use self::ipv4::{
     Address as Ipv4Address, Cidr as Ipv4Cidr, HEADER_LEN as IPV4_HEADER_LEN, MIN_MTU as IPV4_MIN_MTU,
     Packet as Ipv4Packet,
 };
 
-#[cfg(feature = "proto-ipv4")]
+#[cfg(feature = "ipv4")]
 pub(crate) use self::ipv4::AddressExt as Ipv4AddressExt;
 
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 pub use self::ipv6::{
     Address as Ipv6Address, Cidr as Ipv6Cidr, HEADER_LEN as IPV6_HEADER_LEN,
     LINK_LOCAL_ALL_NODES as IPV6_LINK_LOCAL_ALL_NODES, LINK_LOCAL_ALL_ROUTERS as IPV6_LINK_LOCAL_ALL_ROUTERS,
     MIN_MTU as IPV6_MIN_MTU, Packet as Ipv6Packet,
 };
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 pub(crate) use self::ipv6::{AddressExt as Ipv6AddressExt, MulticastScope as Ipv6MulticastScope};
 
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 pub use self::ipv6ext::{
     ExtHeader as Ipv6ExtHeader, OptionFailureAction as Ipv6OptionFailureAction, OptionType as Ipv6OptionType,
     OptionsIter as Ipv6OptionsIter,
 };
 
-#[cfg(feature = "proto-ipv4")]
+#[cfg(feature = "ipv4")]
 pub use self::icmpv4::{
     DstUnreachable as Icmpv4DstUnreachable, Message as Icmpv4Message, Packet as Icmpv4Packet,
     ParamProblem as Icmpv4ParamProblem, Redirect as Icmpv4Redirect, TimeExceeded as Icmpv4TimeExceeded,
 };
 
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 pub use self::icmpv6::{
     DstUnreachable as Icmpv6DstUnreachable, Message as Icmpv6Message, Packet as Icmpv6Packet,
     ParamProblem as Icmpv6ParamProblem, TimeExceeded as Icmpv6TimeExceeded,
 };
 
-#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
+#[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
 pub use self::ndisc::{NeighborFlags as NdiscNeighborFlags, RouterFlags as NdiscRouterFlags};
 
-#[cfg(all(feature = "medium-ethernet", feature = "proto-ipv6"))]
+#[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
 pub use self::ndiscoption::{NdiscOption, PrefixInfoFlags as NdiscPrefixInfoFlags, Type as NdiscOptionType};
 
-#[cfg(feature = "socket-tcp")]
+#[cfg(feature = "tcp")]
 pub use self::tcp::{
     Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, Packet as TcpPacket, SeqNumber as TcpSeqNumber, TcpOption,
 };
 
-#[cfg(feature = "socket-udp")]
+#[cfg(feature = "udp")]
 pub use self::udp::{HEADER_LEN as UDP_HEADER_LEN, Packet as UdpPacket};
 
 /// Parsing a packet failed.

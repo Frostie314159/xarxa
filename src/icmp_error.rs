@@ -4,13 +4,13 @@
 //! arrives (from the network or generated locally when neighbor resolution fails)
 //! it contains a "quoted" packet inside we can use to identify which socket was the cause.
 
-#[cfg(feature = "socket-tcp")]
+#[cfg(feature = "tcp")]
 use crate::wire::TcpSeqNumber;
-#[cfg(all(feature = "proto-ipv4", any(feature = "socket-udp", feature = "socket-tcp")))]
+#[cfg(all(feature = "ipv4", any(feature = "udp", feature = "tcp")))]
 use crate::wire::{IPV4_HEADER_LEN, Icmpv4DstUnreachable, Icmpv4Message, Ipv4Packet};
-#[cfg(all(feature = "proto-ipv6", any(feature = "socket-udp", feature = "socket-tcp")))]
+#[cfg(all(feature = "ipv6", any(feature = "udp", feature = "tcp")))]
 use crate::wire::{IPV6_HEADER_LEN, Icmpv6DstUnreachable, Icmpv6Message, Ipv6ExtHeader, Ipv6Packet};
-#[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
+#[cfg(any(feature = "udp", feature = "tcp"))]
 use crate::wire::{IpAddress, IpProtocol, IpVersion};
 
 /// ICMP error reported against a socket.
@@ -56,7 +56,7 @@ impl core::fmt::Display for IcmpError {
 impl IcmpError {
     /// Condense an ICMPv4 error message's type and code, `None` if the message is
     /// not an error to be delivered to sockets (informational messages, redirects).
-    #[cfg(all(feature = "proto-ipv4", any(feature = "socket-udp", feature = "socket-tcp")))]
+    #[cfg(all(feature = "ipv4", any(feature = "udp", feature = "tcp")))]
     pub(crate) fn from_icmpv4(msg_type: Icmpv4Message, msg_code: u8) -> Option<IcmpError> {
         match msg_type {
             Icmpv4Message::DstUnreachable => Some(match Icmpv4DstUnreachable(msg_code) {
@@ -83,7 +83,7 @@ impl IcmpError {
 
     /// Condense an ICMPv6 error message's type and code, `None` if the message is
     /// not an error to be delivered to sockets.
-    #[cfg(all(feature = "proto-ipv6", any(feature = "socket-udp", feature = "socket-tcp")))]
+    #[cfg(all(feature = "ipv6", any(feature = "udp", feature = "tcp")))]
     pub(crate) fn from_icmpv6(msg_type: Icmpv6Message, msg_code: u8) -> Option<IcmpError> {
         match msg_type {
             Icmpv6Message::DstUnreachable => Some(match Icmpv6DstUnreachable(msg_code) {
@@ -103,7 +103,7 @@ impl IcmpError {
 ///
 /// The quoted packet is one *we sent*: its source is the local end of the flow,
 /// its destination the remote end.
-#[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
+#[cfg(any(feature = "udp", feature = "tcp"))]
 pub(crate) struct QuotedPacket {
     pub src_addr: IpAddress,
     pub dst_addr: IpAddress,
@@ -113,7 +113,7 @@ pub(crate) struct QuotedPacket {
     /// The first 4 bytes past the ports, as a TCP sequence number. Only
     /// meaningful when `protocol` is TCP (for UDP these bytes are the length and
     /// checksum fields).
-    #[cfg(feature = "socket-tcp")]
+    #[cfg(feature = "tcp")]
     pub tcp_seq: TcpSeqNumber,
 }
 
@@ -123,11 +123,11 @@ pub(crate) struct QuotedPacket {
 /// payload, which is enough for the ports (and, for TCP, the sequence number) that
 /// identify the flow. Returns `None` if the quote is too truncated or malformed to
 /// identify one.
-#[cfg(any(feature = "socket-udp", feature = "socket-tcp"))]
+#[cfg(any(feature = "udp", feature = "tcp"))]
 pub(crate) fn parse_quoted_packet(quote: &mut [u8]) -> Option<QuotedPacket> {
     let (src_addr, dst_addr, protocol, l4_offset): (IpAddress, IpAddress, _, _) =
         match IpVersion::of_packet(quote).ok()? {
-            #[cfg(feature = "proto-ipv4")]
+            #[cfg(feature = "ipv4")]
             IpVersion::Ipv4 => {
                 if quote.len() < IPV4_HEADER_LEN {
                     return None;
@@ -144,7 +144,7 @@ pub(crate) fn parse_quoted_packet(quote: &mut [u8]) -> Option<QuotedPacket> {
                     header_len,
                 )
             }
-            #[cfg(feature = "proto-ipv6")]
+            #[cfg(feature = "ipv6")]
             IpVersion::Ipv6 => {
                 if quote.len() < IPV6_HEADER_LEN {
                     return None;
@@ -172,17 +172,12 @@ pub(crate) fn parse_quoted_packet(quote: &mut [u8]) -> Option<QuotedPacket> {
         protocol,
         src_port: u16::from_be_bytes([l4[0], l4[1]]),
         dst_port: u16::from_be_bytes([l4[2], l4[3]]),
-        #[cfg(feature = "socket-tcp")]
+        #[cfg(feature = "tcp")]
         tcp_seq: TcpSeqNumber(i32::from_be_bytes([l4[4], l4[5], l4[6], l4[7]])),
     })
 }
 
-#[cfg(all(
-    test,
-    feature = "proto-ipv4",
-    feature = "proto-ipv6",
-    any(feature = "socket-udp", feature = "socket-tcp")
-))]
+#[cfg(all(test, feature = "ipv4", feature = "ipv6", any(feature = "udp", feature = "tcp")))]
 mod test {
     use super::*;
     use crate::wire::{Ipv4Address, Ipv6Address};

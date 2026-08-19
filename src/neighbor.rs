@@ -65,7 +65,7 @@ pub(crate) enum Answer {
 
 impl Answer {
     /// Returns whether a valid address was found.
-    #[cfg(feature = "proto-ipv6")]
+    #[cfg(feature = "ipv6")]
     pub(crate) fn found(&self) -> bool {
         match self {
             Answer::Found(_) => true,
@@ -351,7 +351,7 @@ impl PendingQueue {
     }
 }
 
-#[cfg(all(test, feature = "proto-ipv6"))]
+#[cfg(all(test, feature = "ipv6"))]
 mod test {
     use super::*;
     use crate::stack::IfaceHandle;

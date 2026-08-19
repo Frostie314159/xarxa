@@ -19,14 +19,14 @@ use alloc::vec::Vec;
 use crate::stack::IfaceHandle;
 use crate::time::Instant;
 use crate::wire::{IpAddress, IpCidr};
-#[cfg(feature = "proto-ipv4")]
+#[cfg(feature = "ipv4")]
 use crate::wire::{Ipv4Address, Ipv4Cidr};
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 use crate::wire::{Ipv6Address, Ipv6Cidr};
 
-#[cfg(feature = "proto-ipv4")]
+#[cfg(feature = "ipv4")]
 const IPV4_DEFAULT: IpCidr = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(0, 0, 0, 0), 0));
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 const IPV6_DEFAULT: IpCidr = IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 0), 0));
 
 /// A prefix of addresses that should be routed via a router, out of an interface.
@@ -45,7 +45,7 @@ pub struct Route {
 
 impl Route {
     /// Returns a route to 0.0.0.0/0 via the `gateway`, out of `iface`, with no expiry.
-    #[cfg(feature = "proto-ipv4")]
+    #[cfg(feature = "ipv4")]
     pub fn new_ipv4_gateway(gateway: Ipv4Address, iface: IfaceHandle) -> Route {
         Route {
             cidr: IPV4_DEFAULT,
@@ -57,7 +57,7 @@ impl Route {
     }
 
     /// Returns a route to ::/0 via the `gateway`, out of `iface`, with no expiry.
-    #[cfg(feature = "proto-ipv6")]
+    #[cfg(feature = "ipv6")]
     pub fn new_ipv6_gateway(gateway: Ipv6Address, iface: IfaceHandle) -> Route {
         Route {
             cidr: IPV6_DEFAULT,
@@ -69,13 +69,13 @@ impl Route {
     }
 
     /// Returns `true` if the route is a default route for IPv4.
-    #[cfg(feature = "proto-ipv4")]
+    #[cfg(feature = "ipv4")]
     pub fn is_ipv4_gateway(&self) -> bool {
         self.cidr == IPV4_DEFAULT
     }
 
     /// Returns `true` if the route is a default route for IPv6.
-    #[cfg(feature = "proto-ipv6")]
+    #[cfg(feature = "ipv6")]
     pub fn is_ipv6_gateway(&self) -> bool {
         self.cidr == IPV6_DEFAULT
     }
@@ -101,7 +101,7 @@ impl Routes {
     /// Add a default ipv4 gateway (ie. "ip route add 0.0.0.0/0 via `gateway` dev `iface`").
     ///
     /// Returns the previous default route, if any.
-    #[cfg(feature = "proto-ipv4")]
+    #[cfg(feature = "ipv4")]
     pub fn add_default_ipv4_route(&mut self, gateway: Ipv4Address, iface: IfaceHandle) -> Option<Route> {
         let old = self.remove_default_ipv4_route();
         self.storage.push(Route::new_ipv4_gateway(gateway, iface));
@@ -111,7 +111,7 @@ impl Routes {
     /// Add a default ipv6 gateway (ie. "ip -6 route add ::/0 via `gateway` dev `iface`").
     ///
     /// Returns the previous default route, if any.
-    #[cfg(feature = "proto-ipv6")]
+    #[cfg(feature = "ipv6")]
     pub fn add_default_ipv6_route(&mut self, gateway: Ipv6Address, iface: IfaceHandle) -> Option<Route> {
         let old = self.remove_default_ipv6_route();
         self.storage.push(Route::new_ipv6_gateway(gateway, iface));
@@ -119,26 +119,26 @@ impl Routes {
     }
 
     /// Returns the ipv4 default route if there is one in the route table.
-    #[cfg(feature = "proto-ipv4")]
+    #[cfg(feature = "ipv4")]
     pub fn get_default_ipv4_route(&self) -> Option<Route> {
         self.storage.iter().find(|r| r.is_ipv4_gateway()).copied()
     }
 
     /// Returns the ipv6 default route if there is one in the route table.
-    #[cfg(feature = "proto-ipv6")]
+    #[cfg(feature = "ipv6")]
     pub fn get_default_ipv6_route(&self) -> Option<Route> {
         self.storage.iter().find(|r| r.is_ipv6_gateway()).copied()
     }
 
     /// Remove the default ipv4 gateway, returning it if it existed.
-    #[cfg(feature = "proto-ipv4")]
+    #[cfg(feature = "ipv4")]
     pub fn remove_default_ipv4_route(&mut self) -> Option<Route> {
         let index = self.storage.iter().position(|r| r.is_ipv4_gateway())?;
         Some(self.storage.remove(index))
     }
 
     /// Remove the default ipv6 gateway, returning it if it existed.
-    #[cfg(feature = "proto-ipv6")]
+    #[cfg(feature = "ipv6")]
     pub fn remove_default_ipv6_route(&mut self) -> Option<Route> {
         let index = self.storage.iter().position(|r| r.is_ipv6_gateway())?;
         Some(self.storage.remove(index))
@@ -170,7 +170,7 @@ impl Routes {
     }
 }
 
-#[cfg(all(test, feature = "proto-ipv4", feature = "proto-ipv6"))]
+#[cfg(all(test, feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
 

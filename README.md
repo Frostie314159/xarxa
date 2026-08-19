@@ -83,20 +83,20 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Neighbor cache with expiry, renewal on use.
   - The network stack buffers egress packets pending network resolution. Unreachable neighbors don't [clog sockets](https://github.com/smoltcp-rs/smoltcp/issues/594).
 - Pure IP interface medium (feature `medium-ip`)
-- IPv4 (feature `proto-ipv4`)
-- IPv6 (feature `proto-ipv6`)
+- IPv4 (feature `ipv4`)
+- IPv6 (feature `ipv6`)
 - ICMP
   - Automatically replies to pings. (feature `auto-icmp-echo-reply`)
   - Incoming ICMP errors are routed to the socket that caused them. (feature `icmp-error-handling`)
-- UDP sockets (feature `socket-udp`)
+- UDP sockets (feature `udp`)
   - **zero-copy** on both TX and RX
   - Supports all binding modes Linux supports, including unconnected (receives from any IP) and connected sockets (receives from one fixed remote IP+port).
-- Raw sockets (feature `socket-raw`)
+- Raw sockets (feature `raw`)
   - **zero-copy** on both TX and RX
   - Ethernet-layer raw sockets transmit/receive raw Ethernet frames. No routing, you choose the interface manually.
   - IP-layer raw sockets transmit/receive raw IP packets. The stack handles routing same as other socket types.
   - IP headers are byte-copied instead of parsed+re-emitted, so all fields and options are kept, even those unsupported by _xarxa_.
-- TCP sockets (feature `socket-tcp`)
+- TCP sockets (feature `tcp`)
   - Full TCP implementation
   - TcpListener implements an accept queue. Buffers are not allocated until you `accept()` a connection.
   - Window scaling
@@ -106,7 +106,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Nagle's algorithm (defaults to enabled, can be turned off)
   - Delayed ACK (defaults to enabled, can be turned off)
   - Zero-window probes
-  - TCP Timestamps (feature `tcp-socket-timestamps`)
+  - TCP Timestamps (feature `tcp-timestamps`)
 - Packet metadata
   - Support for hardware timestamping on both RX and TX. Allows implementing protocols like PTP, NTP. (feature `packetmeta-timestamp`)
   - Opaque ID for correlating packets through the stack. (feature `packetmeta-id`)

@@ -22,9 +22,9 @@ use crate::stack::{IfaceHandle, IfaceState};
 use crate::stack::{StackInner, TxContext};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
-#[cfg(feature = "proto-ipv4")]
+#[cfg(feature = "ipv4")]
 use crate::wire::Ipv4Packet;
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 use crate::wire::Ipv6Packet;
 #[cfg(feature = "medium-ethernet")]
 use crate::wire::{EthernetFrame, EthernetProtocol};
@@ -191,12 +191,12 @@ fn parse_ip_headers(buf: &mut [u8]) -> Option<(IpAddress, IpProtocol)> {
         return None;
     }
     match IpVersion::of_packet(buf).ok()? {
-        #[cfg(feature = "proto-ipv4")]
+        #[cfg(feature = "ipv4")]
         IpVersion::Ipv4 => {
             let packet = Ipv4Packet::new_checked(buf).ok()?;
             Some((packet.dst_addr().into(), packet.next_header()))
         }
-        #[cfg(feature = "proto-ipv6")]
+        #[cfg(feature = "ipv6")]
         IpVersion::Ipv6 => {
             let packet = Ipv6Packet::new_checked(buf).ok()?;
             Some((packet.dst_addr().into(), packet.next_header()))
@@ -589,8 +589,8 @@ impl StackInner {
     test,
     feature = "medium-ethernet",
     feature = "medium-ip",
-    feature = "proto-ipv4",
-    feature = "proto-ipv6"
+    feature = "ipv4",
+    feature = "ipv6"
 ))]
 mod test {
     use std::cell::RefCell;

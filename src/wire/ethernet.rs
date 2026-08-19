@@ -203,7 +203,7 @@ impl<'a> fmt::Display for Frame<'a> {
 #[cfg(test)]
 mod test {
     // Tests that are valid with any combination of
-    // "proto-*" features.
+    // "ipv4"/"ipv6" features.
     use super::*;
 
     #[test]
@@ -217,7 +217,7 @@ mod test {
 
 #[cfg(test)]
 mod test_ipv4 {
-    // Tests that are valid only with "proto-ipv4"
+    // Tests that are valid only with "ipv4"
     use super::*;
 
     static FRAME_BYTES: [u8; 64] = [
@@ -257,7 +257,7 @@ mod test_ipv4 {
 
 #[cfg(test)]
 mod test_ipv6 {
-    // Tests that are valid only with "proto-ipv6"
+    // Tests that are valid only with "ipv6"
     use super::*;
 
     static FRAME_BYTES: [u8; 54] = [

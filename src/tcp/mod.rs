@@ -16,9 +16,9 @@ use crate::stack::{EgressRoute, TxContext, alloc_ephemeral_port};
 use crate::time::{Duration, Instant};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
-#[cfg(feature = "proto-ipv4")]
+#[cfg(feature = "ipv4")]
 use crate::wire::IPV4_HEADER_LEN;
-#[cfg(feature = "proto-ipv6")]
+#[cfg(feature = "ipv6")]
 use crate::wire::IPV6_HEADER_LEN;
 use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, LINK_HEADER_LEN, TCP_HEADER_LEN, TcpControl, TcpPacket,
@@ -36,7 +36,7 @@ use self::congestion::Controller as _;
 pub use self::listener::{TcpListener, TcpListenerHandle};
 pub(crate) use self::listener::{TcpListenerState, process_listeners};
 pub(crate) use self::repr::TcpRepr;
-#[cfg(feature = "tcp-socket-timestamps")]
+#[cfg(feature = "tcp-timestamps")]
 pub(crate) use self::repr::TcpTimestampRepr;
 use self::ring_buffer::RingBuffer;
 
@@ -250,7 +250,7 @@ impl RttEstimator {
         Duration::from_millis(self.rto as _)
     }
 
-    #[cfg(feature = "socket-tcp-cubic")]
+    #[cfg(feature = "tcp-cubic")]
     fn smoothed_rtt(&self) -> u32 {
         if self.have_measurement { self.srtt } else { 0 }
     }
@@ -565,18 +565,18 @@ pub(crate) struct TcpSocketState {
     /// Whether the TCP timestamp option (RFC 7323) is in use on this connection.
     /// We offer it in the SYN of every connection we open, and answer with it if
     /// the peer offered it; it stays on only if both ends did.
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     timestamps: bool,
 
     /// The last tsval received from the peer, echoed back as tsecr in every
     /// segment we send. Zero until the first segment carrying a timestamp.
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     last_remote_tsval: u32,
 
     /// Random offset added to every tsval this connection sends.
     /// - Avoids leaking system uptime
     /// - Prevents correlating connections for hosts behind NAT.
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     tsval_offset: u32,
 
     #[cfg(feature = "async")]
@@ -646,11 +646,11 @@ impl TcpSocketState {
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
             nagle: true,
-            #[cfg(feature = "tcp-socket-timestamps")]
+            #[cfg(feature = "tcp-timestamps")]
             timestamps: false,
-            #[cfg(feature = "tcp-socket-timestamps")]
+            #[cfg(feature = "tcp-timestamps")]
             last_remote_tsval: 0,
-            #[cfg(feature = "tcp-socket-timestamps")]
+            #[cfg(feature = "tcp-timestamps")]
             tsval_offset: 0,
             congestion_controller: congestion::Congestion::new(),
             #[cfg(feature = "async")]
@@ -733,12 +733,12 @@ impl TcpSocketState {
         TcpSeqNumber(rand.rand_u32() as i32)
     }
 
-    #[cfg(all(test, feature = "tcp-socket-timestamps"))]
+    #[cfg(all(test, feature = "tcp-timestamps"))]
     fn random_tsval_offset(_rand: &mut Rand) -> u32 {
         0
     }
 
-    #[cfg(all(not(test), feature = "tcp-socket-timestamps"))]
+    #[cfg(all(not(test), feature = "tcp-timestamps"))]
     fn random_tsval_offset(rand: &mut Rand) -> u32 {
         rand.rand_u32()
     }
@@ -781,7 +781,7 @@ impl TcpSocketState {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
-            #[cfg(feature = "tcp-socket-timestamps")]
+            #[cfg(feature = "tcp-timestamps")]
             timestamp: None,
             payload: &[],
         }
@@ -808,7 +808,7 @@ impl TcpSocketState {
     /// `None` if timestamps are not in use on this connection. The tsval is the
     /// poll clock in milliseconds, offset by this connection's random value:
     /// monotonic, and at the granularity RFC 7323 asks for.
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn timestamp_repr(&self, now: Instant, tsecr: u32) -> Option<TcpTimestampRepr> {
         self.timestamps.then(|| {
             let tsval = (now.total_millis() as u32).wrapping_add(self.tsval_offset);
@@ -819,7 +819,7 @@ impl TcpSocketState {
     fn ack_reply(&mut self, _now: Instant, repr: &TcpRepr) -> TcpRepr<'static> {
         let mut reply_repr = Self::reply(repr);
         // Echo the incoming tsval, if the segment we are replying to carried one.
-        #[cfg(feature = "tcp-socket-timestamps")]
+        #[cfg(feature = "tcp-timestamps")]
         {
             reply_repr.timestamp = repr
                 .timestamp
@@ -1251,7 +1251,7 @@ impl TcpSocketState {
                     self.remote_win_shift = 0;
                 }
                 // Timestamps stay on only if the remote offered them too.
-                #[cfg(feature = "tcp-socket-timestamps")]
+                #[cfg(feature = "tcp-timestamps")]
                 {
                     self.timestamps = repr.timestamp.is_some();
                 }
@@ -1429,7 +1429,7 @@ impl TcpSocketState {
         }
 
         // update last remote tsval
-        #[cfg(feature = "tcp-socket-timestamps")]
+        #[cfg(feature = "tcp-timestamps")]
         if let Some(timestamp) = repr.timestamp {
             self.last_remote_tsval = timestamp.tsval;
         }
@@ -1559,16 +1559,16 @@ impl TcpSocketState {
         }
 
         let ip_header_len = match self.tuple.unwrap().local.addr {
-            #[cfg(feature = "proto-ipv4")]
+            #[cfg(feature = "ipv4")]
             IpAddress::Ipv4(_) => crate::wire::IPV4_HEADER_LEN,
-            #[cfg(feature = "proto-ipv6")]
+            #[cfg(feature = "ipv6")]
             IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
         };
 
         // The effective max segment size, taking into account the options and the local and remote limits.
-        #[cfg(feature = "tcp-socket-timestamps")]
+        #[cfg(feature = "tcp-timestamps")]
         let options_len = if self.timestamps { 12 } else { 0 };
-        #[cfg(not(feature = "tcp-socket-timestamps"))]
+        #[cfg(not(feature = "tcp-timestamps"))]
         let options_len = 0;
 
         let local_mss = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
@@ -1801,9 +1801,9 @@ impl TcpSocketState {
         // The hop limit, and the IP header length that feeds the MSS calculation.
         let hop_limit = self.hop_limit.unwrap_or(64);
         let ip_header_len = match tuple.local.addr {
-            #[cfg(feature = "proto-ipv4")]
+            #[cfg(feature = "ipv4")]
             IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
-            #[cfg(feature = "proto-ipv6")]
+            #[cfg(feature = "ipv6")]
             IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
         };
 
@@ -1820,7 +1820,7 @@ impl TcpSocketState {
             max_seg_size: None,
             sack_permitted: false,
             sack_ranges: [None, None, None],
-            #[cfg(feature = "tcp-socket-timestamps")]
+            #[cfg(feature = "tcp-timestamps")]
             timestamp: self.timestamp_repr(cx.now(), self.last_remote_tsval),
             payload: &[],
         };
@@ -2093,9 +2093,9 @@ impl TcpSocketState {
 /// headroom reserved for the IP and Ethernet headers below it.
 pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_addr: &IpAddress) -> PacketBuf {
     let ip_header_len = match dst_addr {
-        #[cfg(feature = "proto-ipv4")]
+        #[cfg(feature = "ipv4")]
         IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
-        #[cfg(feature = "proto-ipv6")]
+        #[cfg(feature = "ipv6")]
         IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
     };
     let mut buf = PacketBuf::new();
@@ -2433,7 +2433,7 @@ impl TcpSocket<'_> {
             return Err(ConnectError::InUse);
         }
         let seq = TcpSocketState::random_seq_no(self.tx.rand());
-        #[cfg(feature = "tcp-socket-timestamps")]
+        #[cfg(feature = "tcp-timestamps")]
         let tsval_offset = TcpSocketState::random_tsval_offset(self.tx.rand());
 
         let s = self.inner_mut();
@@ -2447,7 +2447,7 @@ impl TcpSocket<'_> {
         s.remote_last_seq = seq;
         // Every connection we open offers timestamps; the SYN|ACK decides
         // whether they stay on.
-        #[cfg(feature = "tcp-socket-timestamps")]
+        #[cfg(feature = "tcp-timestamps")]
         {
             s.timestamps = true;
             s.last_remote_tsval = 0;
@@ -2773,7 +2773,7 @@ impl fmt::Write for TcpSocket<'_> {
     }
 }
 
-#[cfg(all(test, feature = "medium-ip", feature = "proto-ipv4", feature = "proto-ipv6"))]
+#[cfg(all(test, feature = "medium-ip", feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
     use crate::iface::{IfaceCapabilities, Interface, Medium};
@@ -2825,7 +2825,7 @@ mod test {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
-        #[cfg(feature = "tcp-socket-timestamps")]
+        #[cfg(feature = "tcp-timestamps")]
         timestamp: None,
         payload: &[],
     };
@@ -2840,7 +2840,7 @@ mod test {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
-        #[cfg(feature = "tcp-socket-timestamps")]
+        #[cfg(feature = "tcp-timestamps")]
         timestamp: None,
         payload: &[],
     };
@@ -3704,7 +3704,7 @@ mod test {
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
-                #[cfg(feature = "tcp-socket-timestamps")]
+                #[cfg(feature = "tcp-timestamps")]
                 timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
@@ -3737,7 +3737,7 @@ mod test {
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
-                #[cfg(feature = "tcp-socket-timestamps")]
+                #[cfg(feature = "tcp-timestamps")]
                 timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
@@ -3771,7 +3771,7 @@ mod test {
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
                 sack_permitted: true,
-                #[cfg(feature = "tcp-socket-timestamps")]
+                #[cfg(feature = "tcp-timestamps")]
                 timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
             }]
@@ -4308,7 +4308,7 @@ mod test {
                     window_scale: Some(*shift_amt),
                     window_len: u16::try_from(*buffer_size).unwrap_or(u16::MAX),
                     sack_permitted: true,
-                    #[cfg(feature = "tcp-socket-timestamps")]
+                    #[cfg(feature = "tcp-timestamps")]
                     timestamp: Some(TcpTimestampRepr::new(0, 0)),
                     ..RECV_TEMPL
                 }]
@@ -5102,7 +5102,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn test_established_options_reduce_payload_when_local_mss_limited() {
         const EFFECTIVE_MSS: usize = 64;
 
@@ -5126,7 +5126,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn test_established_options_reduce_payload_when_remote_mss_limited() {
         const EFFECTIVE_MSS: usize = BASE_MSS as usize;
 
@@ -5242,7 +5242,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn test_established_tiny_mss_with_options_makes_progress() {
         // Connect with timestamps enabled to a remote advertising an absurdly
         // small MSS. Without the MIN_SND_MSS clamp, an MSS smaller than the
@@ -6364,7 +6364,7 @@ mod test {
         }));
     }
 
-    #[cfg(feature = "socket-tcp-reno")]
+    #[cfg(feature = "tcp-reno")]
     #[test]
     fn test_congestion_window_limits_data_in_flight() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
@@ -6406,7 +6406,7 @@ mod test {
         }));
     }
 
-    #[cfg(feature = "socket-tcp-reno")]
+    #[cfg(feature = "tcp-reno")]
     #[test]
     fn test_congestion_window_doesnt_limit_fast_retransmit() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
@@ -8145,7 +8145,7 @@ mod test {
         );
     }
 
-    #[cfg(feature = "socket-tcp-reno")]
+    #[cfg(feature = "tcp-reno")]
     #[test]
     fn test_zero_window_probe_not_capped_by_cwnd() {
         let mut s = socket_established_with_buffer_sizes(8192, 64);
@@ -8391,7 +8391,7 @@ mod test {
             max_seg_size: Some(BASE_MSS),
             window_scale: Some(0),
             sack_permitted: true,
-            #[cfg(feature = "tcp-socket-timestamps")]
+            #[cfg(feature = "tcp-timestamps")]
             timestamp: Some(TcpTimestampRepr::new(150, 0)),
             ..RECV_TEMPL
         }));
@@ -8402,7 +8402,7 @@ mod test {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(TcpSeqNumber(0)),
             window_scale: None,
-            #[cfg(feature = "tcp-socket-timestamps")]
+            #[cfg(feature = "tcp-timestamps")]
             timestamp: Some(TcpTimestampRepr::new(250, 0)),
             ..RECV_TEMPL
         }));
@@ -9217,7 +9217,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn test_nagle_works_with_reduced_payload_from_options() {
         const EFFECTIVE_MSS: usize = 64;
 
@@ -9386,7 +9386,7 @@ mod test {
     // =========================================================================================//
 
     #[test]
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn test_tsval_established_connection() {
         let mut s = socket_established();
         s.timestamps = true;
@@ -9440,7 +9440,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn test_tsval_offset() {
         // The tsval is the clock plus the connection's random offset, so it
         // does not leak the time since boot. The sum wraps.
@@ -9462,7 +9462,7 @@ mod test {
         );
     }
 
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn accepted_socket(syn: &TcpRepr) -> TestSocket {
         let (mut stack, h) = listener_stack();
         assert!(listener_deliver(&mut stack, syn));
@@ -9478,7 +9478,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn test_tsval_in_accepted_socket() {
         // A SYN carrying a timestamp gets a SYN|ACK echoing its tsval.
         let mut s = accepted_socket(&TcpRepr {
@@ -9516,7 +9516,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn test_tsval_enabled_by_handshake() {
         // Every connection we open offers timestamps, and a remote that answers
         // with one keeps them on for the rest of the connection.
@@ -9564,7 +9564,7 @@ mod test {
     }
 
     #[test]
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     fn test_tsval_disabled_in_remote_server() {
         // A remote that answers our SYN without a timestamp turns them off.
         let mut s = socket();
@@ -9672,7 +9672,7 @@ mod test {
     }
 }
 
-#[cfg(all(test, feature = "medium-ip", feature = "proto-ipv4"))]
+#[cfg(all(test, feature = "medium-ip", feature = "ipv4"))]
 mod stack_test {
     //! Stack-level tests: TCP segments travelling through the full ingress
     //! (`Stack::poll`) and egress paths, IP headers and checksums
@@ -9706,7 +9706,7 @@ mod stack_test {
         max_seg_size: None,
         sack_permitted: false,
         sack_ranges: [None, None, None],
-        #[cfg(feature = "tcp-socket-timestamps")]
+        #[cfg(feature = "tcp-timestamps")]
         timestamp: None,
         payload: &[],
     };

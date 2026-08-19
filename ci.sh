@@ -10,16 +10,16 @@ export RUSTFLAGS="${RUSTFLAGS:-} -D warnings"
 # media and protocol axes need at least one feature each (the crate root says so
 # with a `compile_error!`); the socket axis may be empty.
 MEDIA=("medium-ethernet" "medium-ip" "medium-ethernet,medium-ip")
-PROTOS=("proto-ipv4" "proto-ipv6" "proto-ipv4,proto-ipv6")
+PROTOS=("ipv4" "ipv6" "ipv4,ipv6")
 SOCKETS=(
   ""
-  "socket-raw"
-  "socket-udp"
-  "socket-tcp"
-  "socket-raw,socket-udp"
-  "socket-raw,socket-tcp"
-  "socket-udp,socket-tcp"
-  "socket-raw,socket-udp,socket-tcp"
+  "raw"
+  "udp"
+  "tcp"
+  "raw,udp"
+  "raw,tcp"
+  "udp,tcp"
+  "raw,udp,tcp"
 )
 
 # The other axes are checked against the full feature set only; combining them
@@ -27,11 +27,11 @@ SOCKETS=(
 for extra in "" "defmt" "log" "std" "std,log" "std,defmt" "async" "std,log,async" \
              "icmp-error-handling" "auto-icmp-echo-reply" "async,icmp-error-handling" \
              "packetmeta-id" "packetmeta-timestamp" "packetmeta-timestamp,defmt" \
-             "tcp-socket-timestamps" "tcp-socket-timestamps,defmt" \
-             "socket-tcp-reno" "socket-tcp-cubic" \
-             "std,log,async,icmp-error-handling,auto-icmp-echo-reply,packetmeta-timestamp,tcp-socket-timestamps"; do
+             "tcp-timestamps" "tcp-timestamps,defmt" \
+             "tcp-reno" "tcp-cubic" \
+             "std,log,async,icmp-error-handling,auto-icmp-echo-reply,packetmeta-timestamp,tcp-timestamps"; do
   cargo check --no-default-features \
-    --features "medium-ethernet,medium-ip,proto-ipv4,proto-ipv6,socket-raw,socket-udp,socket-tcp${extra:+,$extra}"
+    --features "medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp${extra:+,$extra}"
 done
 
 for medium in "${MEDIA[@]}"; do
@@ -65,10 +65,10 @@ cargo test
 cargo test --features packetmeta-timestamp
 # Once more with TCP timestamps: without the feature no segment carries the
 # option, so the tests that expect one are gated on it.
-cargo test --features tcp-socket-timestamps
+cargo test --features tcp-timestamps
 # Once more with each congestion control algorithm: without either feature TCP
 # does no congestion control, so the tests that exercise a congestion window are
-# gated on `socket-tcp-reno`.
-cargo test --features socket-tcp-reno
-cargo test --features socket-tcp-cubic
+# gated on `tcp-reno`.
+cargo test --features tcp-reno
+cargo test --features tcp-cubic
 cargo build --examples

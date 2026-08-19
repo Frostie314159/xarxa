@@ -11,11 +11,11 @@ default = [
     "icmp-error-handling",
     "medium-ethernet",
     "medium-ip",
-    "proto-ipv4",
-    "proto-ipv6",
-    "socket-raw",
-    "socket-udp",
-    "socket-tcp",
+    "ipv4",
+    "ipv6",
+    "raw",
+    "udp",
+    "tcp",
 ]
 std = ["dep:libc"]
 ## Support interfaces that send and receive Ethernet frames, with the link-layer
@@ -25,26 +25,26 @@ medium-ethernet = []
 ## header.
 medium-ip = []
 ## Support IPv4 (and, with `medium-ethernet`, ARP).
-proto-ipv4 = []
+ipv4 = []
 ## Support IPv6 (and, with `medium-ethernet`, NDISC).
-proto-ipv6 = []
+ipv6 = []
 ## Raw sockets.
-socket-raw = []
+raw = []
 ## UDP sockets.
-socket-udp = []
+udp = []
 ## TCP sockets and listeners.
-socket-tcp = []
+tcp = []
 ## Use the Reno congestion control algorithm on TCP sockets. Mutually exclusive
-## with `socket-tcp-cubic`; with neither, TCP does no congestion control.
-socket-tcp-reno = ["socket-tcp"]
+## with `tcp-cubic`; with neither, TCP does no congestion control.
+tcp-reno = ["tcp"]
 ## Use the CUBIC congestion control algorithm on TCP sockets. Mutually exclusive
-## with `socket-tcp-reno`; with neither, TCP does no congestion control.
+## with `tcp-reno`; with neither, TCP does no congestion control.
 ##
 ## CUBIC uses `f64` arithmetic, which is slow on targets without a double
-## precision FPU and pulls in soft-float code. Prefer `socket-tcp-reno` there.
-socket-tcp-cubic = ["socket-tcp"]
+## precision FPU and pulls in soft-float code. Prefer `tcp-reno` there.
+tcp-cubic = ["tcp"]
 ## Send and receive the TCP timestamp option (RFC 7323).
-tcp-socket-timestamps = ["socket-tcp"]
+tcp-timestamps = ["tcp"]
 ## Waker registration on sockets, for building `Future`s on top of the stack.
 async = []
 ## Enable the `PacketMeta::id` field: an opaque number that travels with a packet
@@ -83,15 +83,15 @@ rand = "0.8"
 
 [[example]]
 name = "tuntap"
-required-features = ["std", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp"]
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "udp"]
 
 [[example]]
 name = "tcp_server"
-required-features = ["std", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"]
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "tcp"]
 
 [[example]]
 name = "tcp_client"
-required-features = ["std", "log", "medium-ethernet", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-tcp"]
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "tcp"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

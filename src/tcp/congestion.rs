@@ -2,13 +2,13 @@ use crate::time::Instant;
 
 use super::RttEstimator;
 
-#[cfg(not(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic")))]
+#[cfg(not(any(feature = "tcp-reno", feature = "tcp-cubic")))]
 pub(super) mod no_control;
 
-#[cfg(feature = "socket-tcp-cubic")]
+#[cfg(feature = "tcp-cubic")]
 pub(super) mod cubic;
 
-#[cfg(feature = "socket-tcp-reno")]
+#[cfg(feature = "tcp-reno")]
 pub(super) mod reno;
 
 #[allow(unused_variables)]
@@ -38,13 +38,13 @@ pub(super) trait Controller {
     fn set_mss(&mut self, mss: usize) {}
 }
 
-/// The congestion controller this build uses, picked by the `socket-tcp-reno` and
-/// `socket-tcp-cubic` cargo features.
-#[cfg(not(any(feature = "socket-tcp-reno", feature = "socket-tcp-cubic")))]
+/// The congestion controller this build uses, picked by the `tcp-reno` and
+/// `tcp-cubic` cargo features.
+#[cfg(not(any(feature = "tcp-reno", feature = "tcp-cubic")))]
 pub(super) type Congestion = no_control::NoControl;
 
-#[cfg(feature = "socket-tcp-reno")]
+#[cfg(feature = "tcp-reno")]
 pub(super) type Congestion = reno::Reno;
 
-#[cfg(feature = "socket-tcp-cubic")]
+#[cfg(feature = "tcp-cubic")]
 pub(super) type Congestion = cubic::Cubic;

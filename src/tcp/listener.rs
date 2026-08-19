@@ -3,7 +3,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec;
 
-#[cfg(feature = "tcp-socket-timestamps")]
+#[cfg(feature = "tcp-timestamps")]
 use super::TcpTimestampRepr;
 use super::{
     DEFAULT_MSS, ListenError, MIN_REMOTE_MSS, SocketBuffer, State, TcpControl, TcpHandle, TcpRepr, TcpSocketState,
@@ -42,7 +42,7 @@ struct PendingSyn {
     /// The MSS the remote advertised (clamped), or the default.
     remote_mss: usize,
     /// The timestamp option of the SYN, if present.
-    #[cfg(feature = "tcp-socket-timestamps")]
+    #[cfg(feature = "tcp-timestamps")]
     timestamp: Option<TcpTimestampRepr>,
 }
 
@@ -108,7 +108,7 @@ impl TcpListenerState {
                 Some(mss) if mss != 0 => (mss as usize).max(MIN_REMOTE_MSS),
                 _ => DEFAULT_MSS,
             },
-            #[cfg(feature = "tcp-socket-timestamps")]
+            #[cfg(feature = "tcp-timestamps")]
             timestamp: repr.timestamp,
         };
 
@@ -329,7 +329,7 @@ impl TcpListener<'_> {
         s.remote_mss = syn.remote_mss;
         s.congestion_controller.set_mss(syn.remote_mss);
         // Answer with timestamps only if the SYN offered them.
-        #[cfg(feature = "tcp-socket-timestamps")]
+        #[cfg(feature = "tcp-timestamps")]
         {
             s.timestamps = syn.timestamp.is_some();
             s.last_remote_tsval = syn.timestamp.map_or(0, |ts| ts.tsval);
