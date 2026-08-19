@@ -32,6 +32,17 @@ pub enum Medium {
 }
 
 /// A description of iface capabilities.
+///
+/// This is `#[non_exhaustive]` so that capabilities can be added later without breaking
+/// every driver. Drivers live outside this crate and so cannot use a struct expression,
+/// they start from [`Default`] and overwrite the fields they care about:
+///
+/// ```
+/// # use xarxa::iface::{IfaceCapabilities, Medium};
+/// let mut caps = IfaceCapabilities::default();
+/// caps.medium = Medium::Ethernet;
+/// caps.max_transmission_unit = 1514;
+/// ```
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -44,6 +55,15 @@ pub struct IfaceCapabilities {
     /// The network device is unable to send or receive frames larger than the value returned
     /// by this function.
     pub max_transmission_unit: usize,
+}
+
+impl Default for IfaceCapabilities {
+    fn default() -> Self {
+        Self {
+            medium: Medium::Ethernet,
+            max_transmission_unit: crate::buf::PACKET_BUF_SIZE,
+        }
+    }
 }
 
 /// An interface for sending and receiving raw network frames.
