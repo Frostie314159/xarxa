@@ -146,7 +146,6 @@ impl Routes {
 
     /// Look up the route for `addr`: the most specific matching prefix that has not
     /// expired.
-    #[cfg(any(feature = "socket", feature = "medium-ethernet"))]
     pub(crate) fn lookup(&self, addr: &IpAddress, timestamp: Instant) -> Option<&Route> {
         assert!(addr.is_unicast());
 
@@ -171,13 +170,7 @@ impl Routes {
     }
 }
 
-// The tests exercise `lookup`, which only exists where something routes.
-#[cfg(all(
-    test,
-    feature = "proto-ipv4",
-    feature = "proto-ipv6",
-    any(feature = "socket", feature = "medium-ethernet")
-))]
+#[cfg(all(test, feature = "proto-ipv4", feature = "proto-ipv6"))]
 mod test {
     use super::*;
 

@@ -29,11 +29,11 @@ proto-ipv4 = []
 ## Support IPv6 (and, with `medium-ethernet`, NDISC).
 proto-ipv6 = []
 ## Raw sockets.
-socket-raw = ["socket"]
+socket-raw = []
 ## UDP sockets.
-socket-udp = ["socket"]
+socket-udp = []
 ## TCP sockets and listeners.
-socket-tcp = ["socket"]
+socket-tcp = []
 ## Use the Reno congestion control algorithm on TCP sockets. Mutually exclusive
 ## with `socket-tcp-cubic`; with neither, TCP does no congestion control.
 socket-tcp-reno = ["socket-tcp"]
@@ -45,10 +45,6 @@ socket-tcp-reno = ["socket-tcp"]
 socket-tcp-cubic = ["socket-tcp"]
 ## Send and receive the TCP timestamp option (RFC 7323).
 tcp-socket-timestamps = ["socket-tcp"]
-## Enabled automatically by the `socket-*` features: "this build has sockets at
-## all", which is what the socket-side stack machinery (the egress context,
-## ephemeral port allocation, demux scoring) is gated on. Do not enable directly.
-socket = []
 ## Waker registration on sockets, for building `Future`s on top of the stack.
 async = []
 ## Enable the `PacketMeta::id` field: an opaque number that travels with a packet

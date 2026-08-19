@@ -64,7 +64,6 @@ pub(crate) struct Sockets {
 
 /// An interface added to the stack, with its configuration.
 pub(crate) struct IfaceState {
-    #[cfg_attr(not(any(feature = "socket", feature = "medium-ethernet")), allow(dead_code))]
     handle: IfaceHandle,
     dev: Box<dyn Interface>,
     hardware_addr: HardwareAddress,
@@ -242,7 +241,6 @@ pub(crate) struct StackInner {
 /// Sockets hand fully-built L4 packets to [`TxContext::transmit_ip`]. Picking the
 /// egress interface, building the IP header and resolving the neighbor all happen
 /// in here, so socket code doesn't have to care about any of it.
-#[cfg(feature = "socket")]
 pub(crate) struct TxContext<'a> {
     pub(crate) inner: &'a mut StackInner,
     pub(crate) ifaces: &'a mut Slab<IfaceState>,
@@ -258,7 +256,6 @@ pub(crate) struct TxContext<'a> {
 /// twice.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
-#[cfg(feature = "socket")]
 pub(crate) struct EgressRoute {
     pub(crate) iface: IfaceHandle,
     /// The address to resolve on the link: the destination itself when on-link
@@ -269,7 +266,6 @@ pub(crate) struct EgressRoute {
     pub(crate) ip_mtu: usize,
 }
 
-#[cfg(feature = "socket")]
 impl TxContext<'_> {
     /// The current time, as last set by [`Stack::poll`].
     #[cfg(feature = "socket-tcp")]
@@ -2291,7 +2287,6 @@ impl IfaceState {
         self.ip_addrs.iter().any(|probe| probe.address() == addr)
     }
 
-    #[cfg(any(feature = "socket", feature = "medium-ethernet"))]
     fn in_same_network(&self, addr: &IpAddress) -> bool {
         self.ip_addrs.iter().any(|cidr| cidr.contains_addr(addr))
     }

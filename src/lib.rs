@@ -36,7 +36,7 @@ pub mod tcp;
 pub mod time;
 #[cfg(feature = "socket-udp")]
 pub mod udp;
-#[cfg(all(feature = "async", feature = "socket"))]
+#[cfg(feature = "async")]
 mod waker;
 pub mod wire;
 
