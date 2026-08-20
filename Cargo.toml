@@ -41,6 +41,7 @@ default = [
     "tcp",
     "tcp-listener",
     "dhcpv4",
+    "slaac",
     "dns",
 ]
 ## Enable functionality that requires the Rust standard library: the
@@ -70,6 +71,8 @@ tcp = []
 tcp-listener = ["tcp"]
 ## DHCPv4 client, built into the interface. Needs `ipv4` and `medium-ethernet`.
 dhcpv4 = ["ipv4", "medium-ethernet"]
+## IPv6 stateless address autoconfiguration (SLAAC). Needs `ipv6` and `medium-ethernet`.
+slaac = ["ipv6", "medium-ethernet"]
 ## DNS client.
 dns = ["udp"]
 ## Resolve `.local` names with multicast DNS in the DNS client.

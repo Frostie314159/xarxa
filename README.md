@@ -87,6 +87,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - DHCP client (feature `dhcpv4`)
 - IPv6 (feature `ipv6`)
   - Link-local address automatically derived from the MAC address (EUI-64).
+  - SLAAC: addresses and default routes from router advertisements, with lifetimes. (feature `slaac`)
 - ICMP
   - Automatically replies to pings. (feature `icmp-ping-reply`)
   - Incoming ICMP errors are routed to the socket that caused them. (feature `icmp-errors`)
@@ -121,7 +122,8 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 All of the below is planned. Please open an issue or reach out on [the Matrix chat](https://matrix.to/#/#xarxa:matrix.org) if you want to work on one of these so we don't duplicate work.
 
 - DHCP server
-- IPv6 SLAAC
+- IPv6 DAD (duplicate address detection)
+- IPv6 RDNSS (DNS servers from router advertisements)
 - an equivalent to smoltcp's `any_ip`
 - Multicast (IGMP, MLD)
 - 6LoWPAN

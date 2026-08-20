@@ -75,6 +75,9 @@ pub enum AddrOrigin {
     /// The IPv6 link-local address the stack derives from the hardware address.
     #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
     LinkLocal,
+    /// Formed by SLAAC from a router-advertised prefix.
+    #[cfg(feature = "slaac")]
+    Slaac,
 }
 
 /// An IP address assigned to an interface.
@@ -128,6 +131,8 @@ pub(crate) struct IfaceState {
     config_waker: crate::waker::WakerRegistration,
     #[cfg(feature = "dhcpv4")]
     pub(crate) dhcpv4: Option<crate::dhcpv4::Client>,
+    #[cfg(feature = "slaac")]
+    pub(crate) slaac: Option<crate::slaac::Slaac>,
 }
 
 /// An interface borrowed from a [`Stack`], returned by [`Stack::iface`].
@@ -298,9 +303,8 @@ impl Iface<'_> {
         self.state_mut().config_changed();
     }
 
-    /// A counter that goes up every time the interface's configuration changes:
-    /// an address added or removed by you or by the DHCP client, or a lease
-    /// obtained, renewed or lost.
+    /// A counter that goes up every time the interface's configuration changes
+    /// for any reason (manual changes, DHCP, SLAAC)
     ///
     /// Compare it with a saved value to find out whether anything changed since.
     pub fn config_generation(&self) -> u32 {
@@ -337,6 +341,36 @@ impl Iface<'_> {
         let iface = ifaces.get_mut(*index);
         iface.dhcpv4_reset(inner);
         iface.dhcpv4 = config.map(crate::dhcpv4::Client::new);
+    }
+
+    /// Turn IPv6 stateless address autoconfiguration on, with the given
+    /// configuration, or off with `None`.
+    ///
+    /// While on, the stack sends router solicitations from [`Stack::poll`]. Every
+    /// prefix a router advertises for autoconfiguration becomes an address on the
+    /// interface (the prefix plus the EUI-64 of the hardware address), and every
+    /// advertising router becomes a default route. Both are removed when their
+    /// lifetime runs out or when SLAAC is turned off. Turning it on when it is
+    /// already on restarts it.
+    ///
+    /// # Panics
+    /// Panics if the interface is not an Ethernet interface.
+    #[cfg(feature = "slaac")]
+    pub fn set_slaac(&mut self, config: Option<crate::slaac::SlaacConfig>) {
+        assert!(
+            matches!(self.state().hardware_addr, HardwareAddress::Ethernet(_)),
+            "SLAAC needs an Ethernet interface"
+        );
+        let Iface { inner, ifaces, index } = self;
+        let iface = ifaces.get_mut(*index);
+        iface.slaac_reset(inner);
+        iface.slaac = config.map(crate::slaac::Slaac::new);
+    }
+
+    /// What SLAAC has learned from the routers on the link, or `None` if SLAAC is off.
+    #[cfg(feature = "slaac")]
+    pub fn slaac(&self) -> Option<&crate::slaac::SlaacState> {
+        self.state().slaac.as_ref().map(|s| s.state())
     }
 
     /// The lease the DHCPv4 client currently holds, if any.
@@ -700,6 +734,8 @@ impl Stack {
             config_waker: crate::waker::WakerRegistration::new(),
             #[cfg(feature = "dhcpv4")]
             dhcpv4: None,
+            #[cfg(feature = "slaac")]
+            slaac: None,
         });
         IfaceHandle(index)
     }
@@ -959,6 +995,15 @@ impl Stack {
 
             #[cfg(feature = "dhcpv4")]
             self.ifaces.get_mut(index).dhcpv4_dispatch(&mut self.inner);
+
+            #[cfg(feature = "slaac")]
+            {
+                let iface = self.ifaces.get_mut(index);
+                iface.ndisc_rs_egress(&mut self.inner);
+                if iface.slaac.as_ref().is_some_and(|s| s.sync_required(timestamp)) {
+                    iface.sync_slaac_state(&mut self.inner);
+                }
+            }
         }
 
         #[allow(unused_mut)]
@@ -997,6 +1042,15 @@ impl Stack {
                 .ifaces
                 .iter()
                 .filter_map(|(_, iface)| iface.dhcpv4.as_ref().map(|client| client.poll_at()))
+                .fold(deadline, Instant::min);
+        }
+
+        #[cfg(feature = "slaac")]
+        {
+            deadline = self
+                .ifaces
+                .iter()
+                .filter_map(|(_, iface)| iface.slaac.as_ref().map(|s| s.poll_at(timestamp)))
                 .fold(deadline, Instant::min);
         }
 
@@ -1735,6 +1789,20 @@ impl Stack {
                     .process_ndisc_advert(self.ifaces.get_mut(iface.0), src_addr, &mut icmp_packet)
             }
 
+            // RFC 4861 §6.1.2: a router advertisement is only valid from a link-local
+            // source, with the un-decremented hop limit.
+            #[cfg(feature = "slaac")]
+            Icmpv6Message::RouterAdvert
+                if hop_limit == 0xff
+                    && eth_src.is_some()
+                    && src_addr.is_link_local()
+                    && (dst_addr == IPV6_LINK_LOCAL_ALL_NODES || dst_addr.is_link_local()) =>
+            {
+                self.ifaces
+                    .get_mut(iface.0)
+                    .slaac_process_advertisement(&mut self.inner, src_addr, &mut icmp_packet)
+            }
+
             _ => {}
         }
     }
@@ -2105,7 +2173,7 @@ impl StackInner {
     /// Fill the neighbor cache, and flush any packets that were queued waiting for
     /// this neighbor to resolve.
     #[cfg(feature = "medium-ethernet")]
-    fn fill_neighbor(&mut self, iface: &mut IfaceState, addr: IpAddress, hardware_addr: EthernetAddress) {
+    pub(crate) fn fill_neighbor(&mut self, iface: &mut IfaceState, addr: IpAddress, hardware_addr: EthernetAddress) {
         let key = (iface.handle, addr);
         self.neighbor_cache.fill(key, hardware_addr, self.now);
 
@@ -2229,7 +2297,7 @@ impl StackInner {
     /// NDISC is link-scoped: the packet is never routed, and the next hop is the
     /// destination itself (an on-link neighbor or a multicast group).
     #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
-    fn transmit_ndisc(
+    pub(crate) fn transmit_ndisc(
         &mut self,
         iface: &mut IfaceState,
         mut buf: PacketBuf,
@@ -2816,6 +2884,9 @@ mod test {
     use crate::iface::IfaceCapabilities;
     use crate::neighbor::MAX_MULTICAST_SOLICIT;
     use crate::raw::RawMode;
+    use crate::route::RouteOrigin;
+    #[cfg(feature = "slaac")]
+    use crate::slaac::{SlaacConfig, SlaacState};
     use crate::tcp::State as TcpState;
     use crate::time::Duration;
     use crate::udp::RecvError as UdpRecvError;
@@ -2952,6 +3023,242 @@ mod test {
                 .iter()
                 .any(|a| a.origin == AddrOrigin::LinkLocal)
         );
+    }
+
+    /// An Ethernet frame carrying a router advertisement from `router_hw`/`router_ll`
+    /// to all nodes: hop limit 255, source link-layer option, one prefix information
+    /// option for `prefix`/64 with the A and L flags.
+    #[cfg(feature = "slaac")]
+    fn router_advert(
+        router_hw: EthernetAddress,
+        router_ll: Ipv6Address,
+        router_lifetime: Duration,
+        prefix: Ipv6Address,
+        valid_lifetime: Duration,
+        preferred_lifetime: Duration,
+    ) -> Vec<u8> {
+        let mut icmp = vec![0; 16 + 8 + 32];
+        {
+            let mut ra = Icmpv6Packet::new_unchecked(&mut icmp[..]);
+            ra.set_msg_type(Icmpv6Message::RouterAdvert);
+            ra.set_msg_code(0);
+            ra.set_current_hop_limit(64);
+            ra.set_router_flags(NdiscRouterFlags::OTHER);
+            ra.set_router_lifetime(router_lifetime);
+            ra.set_reachable_time(Duration::ZERO);
+            ra.set_retrans_time(Duration::ZERO);
+            let options = ra.payload_mut();
+            {
+                let mut opt = NdiscOption::new_unchecked(&mut options[..8]);
+                opt.set_option_type(NdiscOptionType::SourceLinkLayerAddr);
+                opt.set_data_len(1);
+                opt.set_link_layer_addr(RawHardwareAddress::from(router_hw));
+            }
+            {
+                let mut opt = NdiscOption::new_unchecked(&mut options[8..]);
+                opt.set_option_type(NdiscOptionType::PrefixInformation);
+                opt.set_data_len(4);
+                opt.set_prefix_len(64);
+                opt.set_prefix_flags(NdiscPrefixInfoFlags::ON_LINK | NdiscPrefixInfoFlags::ADDRCONF);
+                opt.set_valid_lifetime(valid_lifetime);
+                opt.set_preferred_lifetime(preferred_lifetime);
+                opt.clear_prefix_reserved();
+                opt.set_prefix(prefix);
+            }
+            ra.fill_checksum(&router_ll, &IPV6_LINK_LOCAL_ALL_NODES);
+        }
+        let mut ip = ipv6_packet(router_ll, IPV6_LINK_LOCAL_ALL_NODES, IpProtocol::Icmpv6, &icmp);
+        Ipv6Packet::new_unchecked(&mut ip[..]).set_hop_limit(255);
+
+        let mut frame = vec![0; ETHERNET_HEADER_LEN];
+        {
+            let mut eth = EthernetFrame::new_unchecked(&mut frame[..]);
+            eth.set_dst_addr(EthernetAddress([0x33, 0x33, 0, 0, 0, 1]));
+            eth.set_src_addr(router_hw);
+            eth.set_ethertype(EthernetProtocol::Ipv6);
+        }
+        frame.extend_from_slice(&ip);
+        frame
+    }
+
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
+        let iface = IfaceHandle(0);
+        let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let router_ll = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+        let prefix = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        let our_addr = IpCidr::new(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0xff, 0xfe00, 0x1).into(), 64);
+
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+        assert_eq!(stack.iface(iface).slaac(), Some(&SlaacState::default()));
+        let generation = stack.iface(iface).config_generation();
+
+        // The first poll solicits routers, from the link-local address to all
+        // routers, with our link-layer address attached.
+        let deadline = stack.poll(Instant::from_secs(1));
+        assert_eq!(tx.borrow().len(), 1);
+        {
+            let frame = &tx.borrow()[0];
+            let mut eth_bytes = frame.clone();
+            let eth = EthernetFrame::new_unchecked(&mut eth_bytes[..]);
+            assert_eq!(eth.dst_addr(), EthernetAddress([0x33, 0x33, 0, 0, 0, 2]));
+            assert_eq!(eth.src_addr(), OUR_HW);
+            let mut ip_bytes = frame[ETHERNET_HEADER_LEN..].to_vec();
+            assert_eq!(Ipv6Packet::new_unchecked(&mut ip_bytes[..]).hop_limit(), 255);
+            let (msg_type, _, _, options) = parse_icmpv6_reply(
+                &frame[ETHERNET_HEADER_LEN..],
+                OUR_LINK_LOCAL,
+                IPV6_LINK_LOCAL_ALL_ROUTERS,
+            );
+            assert_eq!(msg_type, Icmpv6Message::RouterSolicit);
+            assert_eq!(options, [&[1, 1][..], OUR_HW.as_bytes()].concat());
+        }
+        // Retransmitted every 4 s, three times in total.
+        assert_eq!(deadline, Instant::from_secs(5));
+        stack.poll(Instant::from_secs(5));
+        assert_eq!(tx.borrow().len(), 2);
+
+        // A router answers: the address, the default route and the router's
+        // link-layer address are all installed, and solicitation stops.
+        let now = Instant::from_secs(6);
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        ));
+        let deadline = stack.poll(now);
+        assert_eq!(tx.borrow().len(), 2);
+        assert_eq!(deadline, now + Duration::from_secs(1800));
+        assert!(stack.iface(iface).ip_addrs().contains(&IfaceAddr {
+            cidr: our_addr,
+            origin: AddrOrigin::Slaac,
+        }));
+        let route = stack.routes().get_default_ipv6_route().unwrap();
+        assert_eq!(route.via_router, IpAddress::Ipv6(router_ll));
+        assert_eq!(route.iface, iface);
+        assert_eq!(route.origin, RouteOrigin::Slaac);
+        assert_eq!(route.expires_at, Some(now + Duration::from_secs(1800)));
+        assert_ne!(stack.iface(iface).config_generation(), generation);
+        let state = *stack.iface(iface).slaac().unwrap();
+        assert!(state.routers_seen);
+        assert!(!state.managed);
+        assert!(state.other_config);
+        stack.poll(Instant::from_secs(9));
+        assert_eq!(tx.borrow().len(), 2);
+
+        // Off-link traffic goes via the router, whose address is already resolved.
+        let udp = stack.add_udp_socket();
+        stack.udp_socket(udp).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack
+            .udp_socket(udp)
+            .send_slice(b"hi", (Ipv6Address::new(0x2001, 0xdb8, 1, 0, 0, 0, 0, 1), 1000))
+            .unwrap();
+        assert_eq!(tx.borrow().len(), 3);
+        {
+            let frame = &tx.borrow()[2];
+            let mut eth_bytes = frame.clone();
+            let eth = EthernetFrame::new_unchecked(&mut eth_bytes[..]);
+            assert_eq!(eth.dst_addr(), router_hw);
+            let mut ip_bytes = frame[ETHERNET_HEADER_LEN..].to_vec();
+            assert_eq!(
+                IpAddress::Ipv6(Ipv6Packet::new_unchecked(&mut ip_bytes[..]).src_addr()),
+                our_addr.address()
+            );
+        }
+
+        // A refresh extends the lifetimes.
+        let now = Instant::from_secs(600);
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        ));
+        let deadline = stack.poll(now);
+        assert_eq!(deadline, now + Duration::from_secs(1800));
+        let route = stack.routes().get_default_ipv6_route().unwrap();
+        assert_eq!(route.expires_at, Some(now + Duration::from_secs(1800)));
+
+        // The route expires first, then the address.
+        let generation = stack.iface(iface).config_generation();
+        let deadline = stack.poll(now + Duration::from_secs(1801));
+        assert!(stack.routes().get_default_ipv6_route().is_none());
+        assert!(stack.iface(iface).has_ip_addr(our_addr.address()));
+        assert_ne!(stack.iface(iface).config_generation(), generation);
+        assert_eq!(deadline, now + Duration::from_secs(7200));
+        let deadline = stack.poll(now + Duration::from_secs(7201));
+        assert!(!stack.iface(iface).has_ip_addr(our_addr.address()));
+        assert_eq!(deadline, Instant::MAX);
+
+        // A router can withdraw with zero lifetimes.
+        let now = now + Duration::from_secs(7300);
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        ));
+        stack.poll(now);
+        assert!(stack.iface(iface).has_ip_addr(our_addr.address()));
+        assert!(stack.routes().get_default_ipv6_route().is_some());
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::ZERO,
+            prefix,
+            Duration::ZERO,
+            Duration::ZERO,
+        ));
+        stack.poll(now + Duration::from_secs(1));
+        assert!(!stack.iface(iface).has_ip_addr(our_addr.address()));
+        assert!(stack.routes().get_default_ipv6_route().is_none());
+
+        // Turning SLAAC off removes what it installed, and nothing else.
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        ));
+        stack.poll(now + Duration::from_secs(2));
+        assert!(stack.iface(iface).has_ip_addr(our_addr.address()));
+        stack.iface(iface).set_slaac(None);
+        assert!(stack.iface(iface).slaac().is_none());
+        assert!(!stack.iface(iface).has_ip_addr(our_addr.address()));
+        assert!(stack.routes().get_default_ipv6_route().is_none());
+        assert!(stack.iface(iface).has_ip_addr(OUR_V6));
+        assert!(stack.iface(iface).has_ip_addr(OUR_LINK_LOCAL));
+    }
+
+    /// A router advertisement that is not from a link-local source is ignored.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_ignores_invalid_advert() {
+        let (mut stack, rx, _tx) = test_stack(Medium::Ethernet);
+        let iface = IfaceHandle(0);
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+        rx.borrow_mut().push_back(router_advert(
+            EthernetAddress([0x02, 0, 0, 0, 0, 0x02]),
+            Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0xbad),
+            Duration::from_secs(1800),
+            Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0),
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        ));
+        stack.poll(Instant::from_secs(1));
+        assert!(!stack.iface(iface).slaac().unwrap().routers_seen);
+        assert!(stack.routes().get_default_ipv6_route().is_none());
     }
 
     /// Inject a packet into the device and poll the stack to process it.

@@ -39,6 +39,8 @@ mod rand;
 #[cfg(feature = "raw")]
 pub mod raw;
 pub mod route;
+#[cfg(feature = "slaac")]
+pub mod slaac;
 mod slab;
 pub mod stack;
 #[cfg(feature = "tcp")]
@@ -63,6 +65,8 @@ pub use meta::{Timestamp, TxTimestamp};
 #[cfg(feature = "raw")]
 pub use raw::{RawHandle, RawMode, RawSocket};
 pub use route::{Route, RouteOrigin, Routes};
+#[cfg(feature = "slaac")]
+pub use slaac::{SlaacConfig, SlaacState};
 #[cfg(feature = "raw")]
 pub use stack::RawSocketIter;
 #[cfg(feature = "tcp-listener")]

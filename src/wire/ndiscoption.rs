@@ -2,6 +2,7 @@ use bitflags::bitflags;
 use byteorder::{ByteOrder, NetworkEndian};
 
 use super::{Error, Result};
+use crate::time::Duration;
 use crate::wire::{Ipv6Address, MAX_HARDWARE_ADDRESS_LEN};
 
 use crate::wire::RawHardwareAddress;
@@ -92,6 +93,10 @@ mod field {
     pub const PREFIX_LEN: usize = 2;
     // Flags field of prefix header.
     pub const FLAGS: usize = 3;
+    // Valid lifetime.
+    pub const VALID_LT: Field = 4..8;
+    // Preferred lifetime.
+    pub const PREF_LT: Field = 8..12;
     // Reserved bits
     pub const PREF_RESERVED: Field = 12..16;
     // Prefix
@@ -219,6 +224,18 @@ impl<'a> NdiscOption<'a> {
         PrefixInfoFlags::from_bits_truncate(self.buffer[field::FLAGS])
     }
 
+    /// Return the valid lifetime of the prefix.
+    #[inline]
+    pub fn valid_lifetime(&self) -> Duration {
+        Duration::from_secs(NetworkEndian::read_u32(&self.buffer[field::VALID_LT]) as u64)
+    }
+
+    /// Return the preferred lifetime of the prefix.
+    #[inline]
+    pub fn preferred_lifetime(&self) -> Duration {
+        Duration::from_secs(NetworkEndian::read_u32(&self.buffer[field::PREF_LT]) as u64)
+    }
+
     /// Return the prefix.
     #[inline]
     pub fn prefix(&self) -> Ipv6Address {
@@ -280,6 +297,18 @@ impl<'a> NdiscOption<'a> {
     #[inline]
     pub fn set_prefix_flags(&mut self, flags: PrefixInfoFlags) {
         self.buffer[field::FLAGS] = flags.bits();
+    }
+
+    /// Set the valid lifetime of the prefix.
+    #[inline]
+    pub fn set_valid_lifetime(&mut self, time: Duration) {
+        NetworkEndian::write_u32(&mut self.buffer[field::VALID_LT], time.secs() as u32);
+    }
+
+    /// Set the preferred lifetime of the prefix.
+    #[inline]
+    pub fn set_preferred_lifetime(&mut self, time: Duration) {
+        NetworkEndian::write_u32(&mut self.buffer[field::PREF_LT], time.secs() as u32);
     }
 
     /// Clear the reserved bits.

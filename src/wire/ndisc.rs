@@ -1,5 +1,7 @@
 use bitflags::bitflags;
+use byteorder::{ByteOrder, NetworkEndian};
 
+use crate::time::Duration;
 use crate::wire::Ipv6Address;
 use crate::wire::icmpv6::{Packet, field};
 
@@ -35,6 +37,24 @@ impl<'a> Packet<'a> {
     #[inline]
     pub fn router_flags(&self) -> RouterFlags {
         RouterFlags::from_bits_truncate(self.buffer[field::ROUTER_FLAGS])
+    }
+
+    /// Return the router lifetime field.
+    #[inline]
+    pub fn router_lifetime(&self) -> Duration {
+        Duration::from_secs(NetworkEndian::read_u16(&self.buffer[field::ROUTER_LT]) as u64)
+    }
+
+    /// Return the reachable time field.
+    #[inline]
+    pub fn reachable_time(&self) -> Duration {
+        Duration::from_millis(NetworkEndian::read_u32(&self.buffer[field::REACHABLE_TM]) as u64)
+    }
+
+    /// Return the retransmit time field.
+    #[inline]
+    pub fn retrans_time(&self) -> Duration {
+        Duration::from_millis(NetworkEndian::read_u32(&self.buffer[field::RETRANS_TM]) as u64)
     }
 }
 
@@ -91,6 +111,24 @@ impl<'a> Packet<'a> {
     #[inline]
     pub fn set_router_flags(&mut self, flags: RouterFlags) {
         self.buffer[field::ROUTER_FLAGS] = flags.bits();
+    }
+
+    /// Set the router lifetime field.
+    #[inline]
+    pub fn set_router_lifetime(&mut self, value: Duration) {
+        NetworkEndian::write_u16(&mut self.buffer[field::ROUTER_LT], value.secs() as u16);
+    }
+
+    /// Set the reachable time field.
+    #[inline]
+    pub fn set_reachable_time(&mut self, value: Duration) {
+        NetworkEndian::write_u32(&mut self.buffer[field::REACHABLE_TM], value.total_millis() as u32);
+    }
+
+    /// Set the retransmit time field.
+    #[inline]
+    pub fn set_retrans_time(&mut self, value: Duration) {
+        NetworkEndian::write_u32(&mut self.buffer[field::RETRANS_TM], value.total_millis() as u32);
     }
 }
 
@@ -151,6 +189,9 @@ mod test {
         assert_eq!(packet.msg_code(), 0);
         assert_eq!(packet.current_hop_limit(), 64);
         assert_eq!(packet.router_flags(), RouterFlags::MANAGED);
+        assert_eq!(packet.router_lifetime(), Duration::from_secs(900));
+        assert_eq!(packet.reachable_time(), Duration::from_millis(900));
+        assert_eq!(packet.retrans_time(), Duration::from_millis(900));
         assert_eq!(packet.payload(), &SOURCE_LINK_LAYER_OPT[..]);
     }
 }

@@ -39,6 +39,9 @@ pub enum RouteOrigin {
     /// Learned from a DHCPv4 lease.
     #[cfg(feature = "dhcpv4")]
     Dhcpv4,
+    /// Learned from an IPv6 router advertisement.
+    #[cfg(feature = "slaac")]
+    Slaac,
 }
 
 /// A prefix of addresses that should be routed via a router, out of an interface.
