@@ -1549,7 +1549,12 @@ impl Stack {
     /// exhausted their probes.
     #[cfg(feature = "medium-ethernet")]
     fn poll_neighbor_timers(&mut self, iface: IfaceHandle) {
-        for event in self.inner.neighbor_cache.poll_retransmit(iface, self.inner.now) {
+        let mut cursor = 0;
+        while let Some(event) = self
+            .inner
+            .neighbor_cache
+            .poll_retransmit(iface, self.inner.now, &mut cursor)
+        {
             match event {
                 ProbeEvent::Retransmit(addr) => {
                     debug!("neighbor {} still unresolved, retransmitting solicitation", addr);

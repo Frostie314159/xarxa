@@ -74,7 +74,7 @@ impl Answer {
     }
 }
 
-/// A resolution timer event, returned by [Cache::poll_retransmit].
+/// A due resolution timer, returned by [Cache::poll_retransmit].
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeEvent {
@@ -129,40 +129,44 @@ impl Cache {
         );
     }
 
-    /// Advance the retransmission timers of the INCOMPLETE entries of `iface`.
+    /// Advance the retransmission timers of the neighbors being resolved on `iface`,
+    /// one entry per call.
     ///
-    /// Entries whose retransmission timer is due get their probe counter bumped and
-    /// are returned as [ProbeEvent::Retransmit] so the caller sends another
-    /// solicitation; entries that exhausted their probes are removed and returned as
-    /// [ProbeEvent::Failed] so the caller drops the packets queued on them.
-    pub(crate) fn poll_retransmit(&mut self, iface: IfaceHandle, timestamp: Instant) -> Vec<ProbeEvent> {
-        let mut events = Vec::new();
-        self.storage.retain_mut(|(key, state)| {
-            if key.0 != iface {
-                return true;
+    /// `cursor` is the scan position. Start it at 0 and call in a loop until `None`
+    /// is returned: each call resumes the scan where the previous one stopped, so
+    /// the whole loop is one pass over the cache.
+    ///
+    /// An entry with probes left gets its probe counter bumped and its timer
+    /// rearmed, and is returned as [ProbeEvent::Retransmit] so the caller sends
+    /// another solicitation; an entry that exhausted its probes is removed and
+    /// returned as [ProbeEvent::Failed] so the caller drops the packets queued on it.
+    pub(crate) fn poll_retransmit(
+        &mut self,
+        iface: IfaceHandle,
+        timestamp: Instant,
+        cursor: &mut usize,
+    ) -> Option<ProbeEvent> {
+        while let Some((key, state)) = self.storage.get_mut(*cursor) {
+            let addr = key.1;
+            match state {
+                State::Incomplete {
+                    probes_sent,
+                    retrans_at,
+                } if key.0 == iface && timestamp >= *retrans_at => {
+                    if *probes_sent >= MAX_MULTICAST_SOLICIT {
+                        // The last entry moves into `cursor`; examine it next.
+                        self.storage.swap_remove(*cursor);
+                        return Some(ProbeEvent::Failed(addr));
+                    }
+                    *probes_sent += 1;
+                    *retrans_at = timestamp + RETRANS_TIMER;
+                    *cursor += 1;
+                    return Some(ProbeEvent::Retransmit(addr));
+                }
+                _ => *cursor += 1,
             }
-            let State::Incomplete {
-                probes_sent,
-                retrans_at,
-            } = state
-            else {
-                return true;
-            };
-            if timestamp < *retrans_at {
-                return true;
-            }
-
-            if *probes_sent >= MAX_MULTICAST_SOLICIT {
-                events.push(ProbeEvent::Failed(key.1));
-                false
-            } else {
-                *probes_sent += 1;
-                *retrans_at = timestamp + RETRANS_TIMER;
-                events.push(ProbeEvent::Retransmit(key.1));
-                true
-            }
-        });
-        events
+        }
+        None
     }
 
     /// The earliest retransmission timer in the cache, if any.
@@ -273,12 +277,6 @@ impl Cache {
             .iter_mut()
             .find(|(probe, _)| probe == key)
             .map(|(_, state)| state)
-    }
-}
-
-impl Default for Cache {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -481,23 +479,23 @@ mod test {
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), t0), Answer::Pending);
 
         // First probe was sent at t0; nothing to do before the retransmission timer.
-        assert_eq!(cache.poll_retransmit(IF_0, t0), vec![]);
+        assert_eq!(cache.poll_retransmit(IF_0, t0, &mut 0), None);
         assert_eq!(cache.poll_at(), Some(t0 + RETRANS_TIMER));
 
         // Second and third probes.
         assert_eq!(
-            cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER),
-            vec![ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into())]
+            cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0),
+            Some(ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into()))
         );
         assert_eq!(
-            cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER * 2),
-            vec![ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into())]
+            cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER * 2, &mut 0),
+            Some(ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into()))
         );
 
         // Probe limit reached: resolution fails, the entry is removed.
         assert_eq!(
-            cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER * 3),
-            vec![ProbeEvent::Failed(MOCK_IP_ADDR_1.into())]
+            cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER * 3, &mut 0),
+            Some(ProbeEvent::Failed(MOCK_IP_ADDR_1.into()))
         );
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), t0), Answer::NotFound);
         assert_eq!(cache.poll_at(), None);
@@ -515,7 +513,7 @@ mod test {
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), t0), Answer::Found(HADDR_A));
 
         // The resolved entry has no retransmission timer anymore.
-        assert_eq!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER), vec![]);
+        assert_eq!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0), None);
         assert_eq!(cache.poll_at(), None);
     }
 
@@ -526,10 +524,10 @@ mod test {
 
         cache.start_resolution((IF_1, MOCK_IP_ADDR_1.into()), t0);
         // Polling one interface's timers doesn't touch another's entries.
-        assert_eq!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER), vec![]);
+        assert_eq!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0), None);
         assert_eq!(
-            cache.poll_retransmit(IF_1, t0 + RETRANS_TIMER),
-            vec![ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into())]
+            cache.poll_retransmit(IF_1, t0 + RETRANS_TIMER, &mut 0),
+            Some(ProbeEvent::Retransmit(MOCK_IP_ADDR_1.into()))
         );
     }
 
