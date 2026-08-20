@@ -32,6 +32,8 @@ mod field {
 
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 mod arp;
+#[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
+mod dhcpv4;
 #[cfg(feature = "dns")]
 pub mod dns;
 mod ethernet;
@@ -52,7 +54,7 @@ mod ndisc;
 mod ndiscoption;
 #[cfg(feature = "tcp")]
 mod tcp;
-#[cfg(feature = "udp")]
+#[cfg(any(feature = "udp", feature = "dhcpv4"))]
 mod udp;
 
 use core::fmt;
@@ -83,6 +85,16 @@ pub const LINK_HEADER_LEN: usize = 0;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 pub use self::arp::{
     BUFFER_LEN as ARP_BUFFER_LEN, Hardware as ArpHardware, Operation as ArpOperation, Packet as ArpPacket,
+};
+
+#[cfg(feature = "dhcpv4")]
+pub(crate) use self::dhcpv4::field as dhcpv4_field;
+#[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
+pub use self::dhcpv4::{
+    CLIENT_PORT as DHCP_CLIENT_PORT, DhcpOption, Flags as DhcpFlags, HEADER_LEN as DHCP_HEADER_LEN,
+    MAGIC_NUMBER as DHCP_MAGIC_NUMBER, MAX_DNS_SERVER_COUNT as DHCP_MAX_DNS_SERVER_COUNT,
+    MessageType as DhcpMessageType, OpCode as DhcpOpCode, OptionWriter as DhcpOptionWriter, Packet as DhcpPacket,
+    SERVER_PORT as DHCP_SERVER_PORT,
 };
 
 pub use self::ip::checksum;
@@ -138,7 +150,7 @@ pub use self::tcp::{
     Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, Packet as TcpPacket, SeqNumber as TcpSeqNumber, TcpOption,
 };
 
-#[cfg(feature = "udp")]
+#[cfg(any(feature = "udp", feature = "dhcpv4"))]
 pub use self::udp::{HEADER_LEN as UDP_HEADER_LEN, Packet as UdpPacket};
 
 #[cfg(feature = "dns")]

@@ -84,6 +84,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - The network stack buffers egress packets pending network resolution. Unreachable neighbors don't [clog sockets](https://github.com/smoltcp-rs/smoltcp/issues/594).
 - Pure IP interface medium (feature `medium-ip`)
 - IPv4 (feature `ipv4`)
+  - DHCP client (feature `dhcpv4`)
 - IPv6 (feature `ipv6`)
 - ICMP
   - Automatically replies to pings. (feature `icmp-ping-reply`)
@@ -118,7 +119,6 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 
 All of the below is planned. Please open an issue or reach out on [the Matrix chat](https://matrix.to/#/#xarxa:matrix.org) if you want to work on one of these so we don't duplicate work.
 
-- DHCP client
 - DHCP server
 - IPv6 SLAAC
 - an equivalent to smoltcp's `any_ip`

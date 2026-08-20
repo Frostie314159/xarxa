@@ -18,6 +18,9 @@ open_enum! {
 pub struct Address(pub [u8; 6]);
 
 impl Address {
+    /// The length of an Ethernet address, in octets.
+    pub const SIZE: usize = 6;
+
     /// The broadcast address.
     pub const BROADCAST: Address = Address([0xff; 6]);
 

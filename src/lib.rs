@@ -23,6 +23,8 @@ mod fmt;
 mod macros;
 
 pub mod buf;
+#[cfg(feature = "dhcpv4")]
+pub mod dhcpv4;
 #[cfg(feature = "dns")]
 pub mod dns;
 #[cfg(feature = "icmp-errors")]
@@ -49,6 +51,8 @@ mod waker;
 pub mod wire;
 
 pub use buf::{PACKET_BUF_SIZE, PacketBuf};
+#[cfg(feature = "dhcpv4")]
+pub use dhcpv4::{DhcpConfig, DhcpLease, DhcpServerInfo};
 #[cfg(feature = "dns")]
 pub use dns::{DnsClient, DnsQueryHandle};
 #[cfg(feature = "icmp-errors")]

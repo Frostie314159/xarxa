@@ -36,6 +36,9 @@ const IPV6_DEFAULT: IpCidr = IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::new(0, 0, 0
 pub enum RouteOrigin {
     /// Added by the application.
     Manual,
+    /// Learned from a DHCPv4 lease.
+    #[cfg(feature = "dhcpv4")]
+    Dhcpv4,
 }
 
 /// A prefix of addresses that should be routed via a router, out of an interface.

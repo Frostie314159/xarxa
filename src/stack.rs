@@ -69,6 +69,9 @@ pub(crate) struct Sockets {
 pub enum AddrOrigin {
     /// Assigned by the application.
     Manual,
+    /// Learned from a DHCPv4 lease.
+    #[cfg(feature = "dhcpv4")]
+    Dhcpv4,
 }
 
 /// An IP address assigned to an interface.
@@ -93,10 +96,16 @@ impl IfaceAddr {
 
 /// An interface added to the stack, with its configuration.
 pub(crate) struct IfaceState {
-    handle: IfaceHandle,
+    pub(crate) handle: IfaceHandle,
     dev: Box<dyn Interface>,
-    hardware_addr: HardwareAddress,
+    pub(crate) hardware_addr: HardwareAddress,
     pub(crate) ip_addrs: Vec<IfaceAddr>,
+    /// Bumped whenever the interface's addresses or routes change.
+    config_generation: u32,
+    #[cfg(feature = "async")]
+    config_waker: crate::waker::WakerRegistration,
+    #[cfg(feature = "dhcpv4")]
+    pub(crate) dhcpv4: Option<crate::dhcpv4::Client>,
 }
 
 /// An interface borrowed from a [`Stack`], returned by [`Stack::iface`].
@@ -202,6 +211,7 @@ impl Iface<'_> {
             }
             None => {
                 ip_addrs.push(IfaceAddr::manual(cidr));
+                self.state_mut().config_changed();
                 None
             }
         }
@@ -241,12 +251,66 @@ impl Iface<'_> {
 
     /// Purge state associated to this interface.
     fn invalidate(&mut self) {
-        #[cfg(feature = "medium-ethernet")]
-        {
-            let handle = IfaceHandle(self.index);
-            self.inner.neighbor_cache.purge_iface(handle);
-            self.inner.pending.purge_iface(handle);
-        }
+        let handle = IfaceHandle(self.index);
+        self.inner.purge_iface_link_state(handle);
+        self.state_mut().config_changed();
+    }
+
+    /// A counter that goes up every time the interface's configuration changes:
+    /// an address added or removed by you or by the DHCP client, or a lease
+    /// obtained, renewed or lost.
+    ///
+    /// Compare it with a saved value to find out whether anything changed since.
+    pub fn config_generation(&self) -> u32 {
+        self.state().config_generation
+    }
+
+    /// Register a waker to be woken when [`config_generation`](Self::config_generation)
+    /// changes.
+    ///
+    /// Only one waker is kept. Registering another replaces it. A woken waker must
+    /// be registered again to be woken again.
+    #[cfg(feature = "async")]
+    pub fn register_config_waker(&mut self, waker: &core::task::Waker) {
+        self.state_mut().config_waker.register(waker)
+    }
+
+    /// Turn the DHCPv4 client on, with the given configuration, or off with `None`.
+    ///
+    /// While on, the client runs from [`Stack::poll`]. When it gets a lease the
+    /// leased address and the default route via the leased router are installed on
+    /// the interface, and removed again when the lease is lost or the client is
+    /// turned off. Turning it on when it is already on restarts it with the new
+    /// configuration.
+    ///
+    /// # Panics
+    /// Panics if the interface is not an Ethernet interface.
+    #[cfg(feature = "dhcpv4")]
+    pub fn set_dhcpv4(&mut self, config: Option<crate::dhcpv4::DhcpConfig>) {
+        assert!(
+            matches!(self.state().hardware_addr, HardwareAddress::Ethernet(_)),
+            "the DHCPv4 client needs an Ethernet interface"
+        );
+        let Iface { inner, ifaces, index } = self;
+        let iface = ifaces.get_mut(*index);
+        iface.dhcpv4_reset(inner);
+        iface.dhcpv4 = config.map(crate::dhcpv4::Client::new);
+    }
+
+    /// The lease the DHCPv4 client currently holds, if any.
+    #[cfg(feature = "dhcpv4")]
+    pub fn dhcpv4_lease(&self) -> Option<&crate::dhcpv4::DhcpLease> {
+        self.state().dhcpv4.as_ref().and_then(|client| client.lease())
+    }
+
+    /// Drop the DHCPv4 lease, if any, and look for a server again.
+    ///
+    /// Call this when the link went down and came back up, so an address on the
+    /// new network is obtained right away. Does nothing if the client is off.
+    #[cfg(feature = "dhcpv4")]
+    pub fn restart_dhcpv4(&mut self) {
+        let Iface { inner, ifaces, index } = self;
+        ifaces.get_mut(*index).dhcpv4_reset(inner);
     }
 }
 
@@ -262,7 +326,21 @@ pub(crate) struct StackInner {
     neighbor_cache: NeighborCache,
     #[cfg(feature = "medium-ethernet")]
     pending: PendingQueue,
-    routes: Routes,
+    pub(crate) routes: Routes,
+}
+
+impl StackInner {
+    /// Forget everything the link layer learned about an interface: its neighbor
+    /// cache entries and the packets parked on them.
+    pub(crate) fn purge_iface_link_state(&mut self, handle: IfaceHandle) {
+        #[cfg(not(feature = "medium-ethernet"))]
+        let _ = handle;
+        #[cfg(feature = "medium-ethernet")]
+        {
+            self.neighbor_cache.purge_iface(handle);
+            self.pending.purge_iface(handle);
+        }
+    }
 }
 
 /// Borrowed stack context for socket egress.
@@ -571,6 +649,11 @@ impl Stack {
             dev,
             hardware_addr,
             ip_addrs: Vec::new(),
+            config_generation: 0,
+            #[cfg(feature = "async")]
+            config_waker: crate::waker::WakerRegistration::new(),
+            #[cfg(feature = "dhcpv4")]
+            dhcpv4: None,
         });
         IfaceHandle(index)
     }
@@ -827,6 +910,9 @@ impl Stack {
                 }
                 self.process(handle, buf);
             }
+
+            #[cfg(feature = "dhcpv4")]
+            self.ifaces.get_mut(index).dhcpv4_dispatch(&mut self.inner);
         }
 
         #[allow(unused_mut)]
@@ -857,6 +943,15 @@ impl Stack {
         {
             deadline = deadline.min(self.inner.neighbor_cache.poll_at());
             deadline = deadline.min(self.inner.pending.poll_at());
+        }
+
+        #[cfg(feature = "dhcpv4")]
+        {
+            deadline = self
+                .ifaces
+                .iter()
+                .filter_map(|(_, iface)| iface.dhcpv4.as_ref().map(|client| client.poll_at()))
+                .fold(deadline, Instant::min);
         }
 
         deadline
@@ -1119,6 +1214,30 @@ impl Stack {
         let next_header = ipv4_packet.next_header();
         let header_len = ipv4_packet.header_len() as usize;
         let total_len = ipv4_packet.total_len() as usize;
+
+        // The DHCP client sees its replies before the destination check: they may
+        // be addressed to the address being leased, which isn't ours yet, or to
+        // broadcast.
+        #[cfg(feature = "dhcpv4")]
+        if next_header == IpProtocol::Udp && self.ifaces.get(iface.0).dhcpv4.is_some() {
+            let udp_len = match buf.get_mut(header_len..total_len).map(UdpPacket::new_checked) {
+                Some(Ok(udp)) if udp.src_port() == DHCP_SERVER_PORT && udp.dst_port() == DHCP_CLIENT_PORT => {
+                    if !udp.verify_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr)) {
+                        trace!("dhcp: udp checksum incorrect");
+                        return;
+                    }
+                    Some(udp.len() as usize)
+                }
+                _ => None,
+            };
+            if let Some(udp_len) = udp_len {
+                let payload = &mut buf[header_len + UDP_HEADER_LEN..header_len + udp_len];
+                self.ifaces
+                    .get_mut(iface.0)
+                    .dhcpv4_process(&mut self.inner, src_addr, payload);
+                return;
+            }
+        }
 
         {
             let iface = self.ifaces.get(iface.0);
@@ -2089,6 +2208,33 @@ impl StackInner {
     ///
     /// If the neighbor is not resolved yet, the packet is queued in the interface's
     /// pending queue and flushed when resolution completes.
+    /// Transmit a fully-built UDP packet on a given interface as an IPv4 packet from
+    /// `src_addr` to `dst_addr`, bypassing routing and source address checks.
+    ///
+    /// This is how the DHCP client sends from `0.0.0.0` to broadcast on an interface
+    /// that has no address yet. A unicast destination that is not on-link is sent
+    /// via the routing table's gateway, if any, else directly.
+    #[cfg(feature = "dhcpv4")]
+    pub(crate) fn transmit_ipv4_on(
+        &mut self,
+        iface: &mut IfaceState,
+        src_addr: Ipv4Address,
+        dst_addr: Ipv4Address,
+        mut buf: PacketBuf,
+    ) {
+        push_ipv4_header(&mut buf, src_addr, dst_addr, IpProtocol::Udp, 64);
+        let dst = IpAddress::Ipv4(dst_addr);
+        let next_hop = if !dst.is_unicast() || iface.in_same_network(&dst) {
+            dst
+        } else {
+            self.routes
+                .lookup(&dst, self.now)
+                .map(|route| route.via_router)
+                .unwrap_or(dst)
+        };
+        self.transmit_ip_frame(iface, dst, next_hop, buf, EthernetProtocol::Ipv4);
+    }
+
     fn transmit_ip_frame(
         &mut self,
         iface: &mut IfaceState,
@@ -2324,8 +2470,16 @@ impl IfaceState {
     /// Panics on a non-Ethernet interface; only the Ethernet paths call it, and
     /// `add_iface` checks the address matches the medium.
     #[cfg(feature = "medium-ethernet")]
-    fn ethernet_addr(&self) -> EthernetAddress {
+    pub(crate) fn ethernet_addr(&self) -> EthernetAddress {
         self.hardware_addr.ethernet_or_panic()
+    }
+
+    /// Note that the interface's configuration changed: bump the generation and
+    /// wake whoever is waiting for it.
+    pub(crate) fn config_changed(&mut self) {
+        self.config_generation = self.config_generation.wrapping_add(1);
+        #[cfg(feature = "async")]
+        self.config_waker.wake();
     }
 
     /// The interface's IP-layer MTU: the device MTU minus the Ethernet header on

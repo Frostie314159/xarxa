@@ -1,0 +1,82 @@
+//! Get an IPv4 address with DHCP on a TAP interface, then reply to pings on it.
+//!
+//! Run with:
+//!
+//! ```sh
+//! cargo run --example dhcp -- tap0
+//! ```
+//!
+//! Then, on the host, bridge `tap0` into a network with a DHCP server, or run one
+//! on it:
+//!
+//! ```sh
+//! sudo ip link set up dev tap0
+//! sudo ip addr add 192.168.69.100/24 dev tap0
+//! sudo dnsmasq --no-daemon --interface=tap0 --bind-interfaces \
+//!     --dhcp-range=192.168.69.50,192.168.69.90,12h
+//! ```
+
+use std::os::unix::io::AsRawFd;
+
+use xarxa::DhcpConfig;
+use xarxa::iface::{Medium, TunTapInterface, wait};
+use xarxa::stack::Stack;
+use xarxa::time::Instant;
+use xarxa::wire::{EthernetAddress, HardwareAddress};
+
+fn main() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
+
+    let name = std::env::args().nth(1).unwrap_or_else(|| "tap0".to_string());
+
+    let device = TunTapInterface::new(&name, Medium::Ethernet).unwrap();
+    let fd = device.as_raw_fd();
+
+    let mut stack = Stack::new(random_seed());
+    let iface = stack.add_iface(
+        Box::new(device),
+        HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])),
+    );
+
+    // That's all it takes: the stack installs the address and default route
+    // itself once a lease comes in, and keeps it renewed.
+    stack.iface(iface).set_dhcpv4(Some(DhcpConfig::default()));
+
+    let mut generation = stack.iface(iface).config_generation();
+    loop {
+        let deadline = stack.poll(Instant::now());
+
+        // Report configuration changes.
+        let iface_view = stack.iface(iface);
+        if iface_view.config_generation() != generation {
+            generation = iface_view.config_generation();
+            match iface_view.dhcpv4_lease() {
+                Some(lease) => {
+                    log::info!("DHCP lease: {}", lease.address);
+                    log::info!("  router: {:?}", lease.router);
+                    log::info!("  DNS servers: {:?}", lease.dns_servers);
+                }
+                None => log::info!("DHCP: no lease"),
+            }
+        }
+
+        let timeout = (deadline != Instant::MAX).then(|| {
+            let now = Instant::now();
+            if deadline <= now {
+                std::time::Duration::ZERO
+            } else {
+                (deadline - now).into()
+            }
+        });
+        wait(fd, timeout).unwrap();
+    }
+}
+
+/// Quick-and-dirty entropy for the example's PRNG seed. Real firmware should
+/// use a hardware RNG or another unpredictable source.
+fn random_seed() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64
+}

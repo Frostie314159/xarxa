@@ -18,6 +18,7 @@ features = [
     "udp",
     "tcp",
     "tcp-listener",
+    "dhcpv4",
     "dns",
     "mdns",
     "tcp-reno",
@@ -39,6 +40,7 @@ default = [
     "udp",
     "tcp",
     "tcp-listener",
+    "dhcpv4",
     "dns",
 ]
 ## Enable functionality that requires the Rust standard library: the
@@ -66,6 +68,8 @@ udp = []
 tcp = []
 ## TCP listeners, for accepting incoming connections.
 tcp-listener = ["tcp"]
+## DHCPv4 client, built into the interface. Needs `ipv4` and `medium-ethernet`.
+dhcpv4 = ["ipv4", "medium-ethernet"]
 ## DNS client.
 dns = ["udp"]
 ## Resolve `.local` names with multicast DNS in the DNS client.
@@ -101,7 +105,7 @@ packetmeta-timestamp = ["packetmeta-id"]
 ## Log with the `log` crate.
 log = ["dep:log"]
 ## Log with the `defmt` crate.
-defmt = ["dep:defmt"]
+defmt = ["dep:defmt", "heapless/defmt"]
 ## Log every packet received and sent, decoded.
 ## Needs `log` or `defmt` to print anything.
 packet-log = []
@@ -134,6 +138,10 @@ required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6
 [[example]]
 name = "dns"
 required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "dns"]
+
+[[example]]
+name = "dhcp"
+required-features = ["std", "log", "medium-ethernet", "ipv4", "dhcpv4"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
