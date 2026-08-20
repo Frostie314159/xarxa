@@ -111,7 +111,7 @@ fn main() {
             socket.close();
         }
 
-        let timeout = deadline.map(|deadline| {
+        let timeout = (deadline != Instant::MAX).then(|| {
             let now = Instant::now();
             if deadline <= now {
                 std::time::Duration::ZERO

@@ -30,6 +30,12 @@ pub struct Instant {
 impl Instant {
     pub const ZERO: Instant = Instant::from_micros_const(0);
 
+    /// The earliest representable instant.
+    pub const MIN: Instant = Instant::from_micros_const(i64::MIN);
+
+    /// The latest representable instant.
+    pub const MAX: Instant = Instant::from_micros_const(i64::MAX);
+
     /// Create a new `Instant` from a number of microseconds.
     pub fn from_micros<T: Into<i64>>(micros: T) -> Instant {
         Instant { micros: micros.into() }

@@ -50,20 +50,6 @@ use self::ring_buffer::RingBuffer;
 /// before sizing or sending anything, so this only stands in while there is no route.
 const DEFAULT_IP_MTU: usize = 1500;
 
-/// Gives an indication on the next time the socket should be polled.
-///
-/// The variant order is meaningful: `Now < Time(_) < Ingress`.
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum PollAt {
-    /// The socket needs to be polled immediately.
-    Now,
-    /// The socket needs to be polled at given [Instant](crate::time::Instant).
-    Time(Instant),
-    /// The socket does not need to be polled unless there are external changes.
-    Ingress,
-}
-
 /// A handle to a TCP socket added to a [`Stack`].
 ///
 /// [`Stack`]: crate::Stack
@@ -388,16 +374,16 @@ impl Timer {
         }
     }
 
-    fn poll_at(&self) -> PollAt {
+    fn poll_at(&self) -> Instant {
         match *self {
             Timer::Idle {
                 keep_alive_at: Some(keep_alive_at),
-            } => PollAt::Time(keep_alive_at),
-            Timer::Idle { keep_alive_at: None } => PollAt::Ingress,
-            Timer::ZeroWindowProbe { expires_at, .. } => PollAt::Time(expires_at),
-            Timer::Retransmit { expires_at, .. } => PollAt::Time(expires_at),
-            Timer::FastRetransmit => PollAt::Now,
-            Timer::Close { expires_at } => PollAt::Time(expires_at),
+            } => keep_alive_at,
+            Timer::Idle { keep_alive_at: None } => Instant::MAX,
+            Timer::ZeroWindowProbe { expires_at, .. } => expires_at,
+            Timer::Retransmit { expires_at, .. } => expires_at,
+            Timer::FastRetransmit => Instant::MIN,
+            Timer::Close { expires_at } => expires_at,
         }
     }
 
@@ -1750,7 +1736,7 @@ impl TcpSocketState {
 
             // Clear the `should_retransmit` state. If we can't retransmit right
             // now for whatever reason (like zero window), this avoids an
-            // infinite polling loop where `poll_at` returns `Now` but `dispatch`
+            // infinite polling loop where `poll_at` says "now" but `dispatch`
             // can't actually do anything.
             self.timer.set_for_idle(cx.now(), self.keep_alive);
 
@@ -2056,47 +2042,48 @@ impl TcpSocketState {
         Ok(())
     }
 
+    /// The next time the socket should be polled.
+    ///
+    /// [`Instant::MIN`] means "poll immediately", [`Instant::MAX`] means "no need to
+    /// poll unless something external happens".
     #[allow(clippy::if_same_then_else)]
-    pub(crate) fn poll_at(&self) -> PollAt {
+    pub(crate) fn poll_at(&self) -> Instant {
         // The logic here mirrors the beginning of dispatch() closely.
         if self.tuple.is_none() {
             // No one to talk to, nothing to transmit.
-            PollAt::Ingress
+            Instant::MAX
         } else if self.remote_last_ts.is_none() {
             // Socket stopped being quiet recently, we need to acquire a timestamp.
-            PollAt::Now
+            Instant::MIN
         } else if self.state == State::Closed {
             // Socket was aborted, we have an RST packet to transmit.
-            PollAt::Now
+            Instant::MIN
         } else if self.seq_to_transmit() {
             // We have a data or flag packet to transmit.
-            PollAt::Now
+            Instant::MIN
         } else if self.window_to_update() {
             // The receive window has been raised significantly.
-            PollAt::Now
+            Instant::MIN
         } else {
             let want_ack = self.ack_to_transmit();
 
             let delayed_ack_poll_at = match (want_ack, self.ack_delay_timer) {
-                (false, _) => PollAt::Ingress,
-                (true, AckDelayTimer::Idle) => PollAt::Now,
-                (true, AckDelayTimer::Waiting(t)) => PollAt::Time(t),
-                (true, AckDelayTimer::Immediate) => PollAt::Now,
+                (false, _) => Instant::MAX,
+                (true, AckDelayTimer::Idle) => Instant::MIN,
+                (true, AckDelayTimer::Waiting(t)) => t,
+                (true, AckDelayTimer::Immediate) => Instant::MIN,
             };
 
             let timeout_poll_at = match (self.remote_last_ts, self.timeout) {
                 // If we're transmitting or retransmitting data, we need to poll at the moment
                 // when the timeout would expire.
-                (Some(remote_last_ts), Some(timeout)) => PollAt::Time(remote_last_ts + timeout),
+                (Some(remote_last_ts), Some(timeout)) => remote_last_ts + timeout,
                 // Otherwise we have no timeout.
-                (_, _) => PollAt::Ingress,
+                (_, _) => Instant::MAX,
             };
 
             // We wait for the earliest of our timers to fire.
-            *[self.timer.poll_at(), timeout_poll_at, delayed_ack_poll_at]
-                .iter()
-                .min()
-                .unwrap_or(&PollAt::Ingress)
+            self.timer.poll_at().min(timeout_poll_at).min(delayed_ack_poll_at)
         }
     }
 }
@@ -8429,7 +8416,7 @@ mod test {
             ..RECV_TEMPL
         }));
         assert_eq!(s.state, State::SynSent);
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(250)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::from_millis(250));
         recv!(s, time 250, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
@@ -8447,23 +8434,23 @@ mod test {
         let mut s = socket_established();
         s.view().set_timeout(Some(Duration::from_millis(2000)));
         recv_nothing!(s, time 250);
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(2250)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::from_millis(2250));
         s.view().send_slice(b"abcdef").unwrap();
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::MIN);
         recv!(s, time 255, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(1255)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::from_millis(1255));
         recv!(s, time 1255, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(2255)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::from_millis(2255));
         recv!(s, time 2255, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1 + 6,
@@ -8485,13 +8472,13 @@ mod test {
             ..RECV_TEMPL
         }));
         recv_nothing!(s, time 100);
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(150)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::from_millis(150));
         send!(s, time 105, TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         });
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(155)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::from_millis(155));
         recv!(s, time 155, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -8499,7 +8486,7 @@ mod test {
             ..RECV_TEMPL
         }));
         recv_nothing!(s, time 155);
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(205)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::from_millis(205));
         recv_nothing!(s, time 200);
         recv!(s, time 205, Ok(TcpRepr {
             control:    TcpControl::Rst,
@@ -8555,14 +8542,14 @@ mod test {
         s.view().set_timeout(Some(Duration::from_millis(200)));
         s.remote_last_ts = Some(Instant::from_millis(100));
         s.view().abort();
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::MIN);
         recv!(s, time 100, Ok(TcpRepr {
             control:    TcpControl::Rst,
             seq_number: LOCAL_SEQ + 1,
             ack_number: Some(REMOTE_SEQ + 1),
             ..RECV_TEMPL
         }));
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Ingress);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::MAX);
     }
 
     // =========================================================================================//
@@ -8593,7 +8580,7 @@ mod test {
         s.view().set_keep_alive(Some(Duration::from_millis(100)));
 
         // drain the forced keep-alive packet
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Now);
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::MIN);
         recv!(s, time 0, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -8601,7 +8588,7 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(100)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::from_millis(100));
         recv_nothing!(s, time 95);
         recv!(s, time 100, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -8610,7 +8597,7 @@ mod test {
             ..RECV_TEMPL
         }));
 
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(200)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::from_millis(200));
         recv_nothing!(s, time 195);
         recv!(s, time 200, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -8624,7 +8611,7 @@ mod test {
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         });
-        assert_eq!(s.sockets.get_mut(0).poll_at(), PollAt::Time(Instant::from_millis(350)));
+        assert_eq!(s.sockets.get_mut(0).poll_at(), Instant::from_millis(350));
         recv_nothing!(s, time 345);
         recv!(s, time 350, Ok(TcpRepr {
             seq_number: LOCAL_SEQ,
@@ -9992,7 +9979,7 @@ mod stack_test {
 
         // The SYN is transmitted by the next poll, which returns the
         // retransmission deadline.
-        let deadline = stack.poll(Instant::from_millis(0)).unwrap();
+        let deadline = stack.poll(Instant::from_millis(0));
         let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.syn() && !tcp.ack());

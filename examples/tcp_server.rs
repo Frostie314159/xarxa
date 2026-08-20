@@ -118,7 +118,7 @@ fn main() {
 
         let deadline = stack.poll(Instant::now());
 
-        let timeout = deadline.map(|deadline| {
+        let timeout = (deadline != Instant::MAX).then(|| {
             let now = Instant::now();
             if deadline <= now {
                 std::time::Duration::ZERO

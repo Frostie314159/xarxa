@@ -361,10 +361,10 @@ impl DnsClient {
     /// Uses the time of the last `Stack::poll`.
     ///
     /// Returns the next time `poll` should be called to retransmit a query, or
-    /// `None` if no query is pending. Call it after every [`Stack::poll`], and
-    /// again when that deadline arrives.
+    /// [`Instant::MAX`] if no query is pending. Call it after every [`Stack::poll`],
+    /// and again when that deadline arrives.
     #[must_use]
-    pub fn poll(&mut self, stack: &mut Stack) -> Option<Instant> {
+    pub fn poll(&mut self, stack: &mut Stack) -> Instant {
         self.process(stack);
         self.dispatch(stack)
     }
@@ -531,9 +531,9 @@ impl DnsClient {
         }
     }
 
-    fn dispatch(&mut self, stack: &mut Stack) -> Option<Instant> {
+    fn dispatch(&mut self, stack: &mut Stack) -> Instant {
         let now = stack.inner.now;
-        let mut next_poll_at: Option<Instant> = None;
+        let mut next_poll_at = Instant::MAX;
 
         for q in self.queries.iter_mut().flatten() {
             if let State::Pending(pq) = &mut q.state {
@@ -585,7 +585,7 @@ impl DnsClient {
 
                 if pq.retransmit_at > now {
                     // query is waiting for retransmit
-                    next_poll_at = Some(next_poll_at.map_or(pq.retransmit_at, |v: Instant| v.min(pq.retransmit_at)));
+                    next_poll_at = next_poll_at.min(pq.retransmit_at);
                     continue;
                 }
 
@@ -630,7 +630,7 @@ impl DnsClient {
 
                 pq.retransmit_at = now + pq.delay;
                 pq.delay = MAX_RETRANSMIT_DELAY.min(pq.delay * 2);
-                next_poll_at = Some(next_poll_at.map_or(pq.retransmit_at, |v: Instant| v.min(pq.retransmit_at)));
+                next_poll_at = next_poll_at.min(pq.retransmit_at);
             }
         }
 

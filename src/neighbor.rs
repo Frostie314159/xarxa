@@ -169,15 +169,15 @@ impl Cache {
         None
     }
 
-    /// The earliest retransmission timer in the cache, if any.
-    pub(crate) fn poll_at(&self) -> Option<Instant> {
+    /// The earliest retransmission timer in the cache, or `Instant::MAX` if there is none.
+    pub(crate) fn poll_at(&self) -> Instant {
         self.storage
             .iter()
             .filter_map(|(_, state)| match state {
                 State::Incomplete { retrans_at, .. } => Some(*retrans_at),
                 State::Reachable { .. } => None,
             })
-            .min()
+            .fold(Instant::MAX, Instant::min)
     }
 
     pub fn reset_expiry_if_existing(&mut self, key: Key, source_hardware_addr: EthernetAddress, timestamp: Instant) {
@@ -343,9 +343,12 @@ impl PendingQueue {
         self.packets.retain(|packet| packet.key.0 != iface);
     }
 
-    /// The earliest expiry timer in the queue, if any.
-    pub fn poll_at(&self) -> Option<Instant> {
-        self.packets.iter().map(|packet| packet.expires_at).min()
+    /// The earliest expiry timer in the queue, or `Instant::MAX` if the queue is empty.
+    pub fn poll_at(&self) -> Instant {
+        self.packets
+            .iter()
+            .map(|packet| packet.expires_at)
+            .fold(Instant::MAX, Instant::min)
     }
 }
 
@@ -480,7 +483,7 @@ mod test {
 
         // First probe was sent at t0; nothing to do before the retransmission timer.
         assert_eq!(cache.poll_retransmit(IF_0, t0, &mut 0), None);
-        assert_eq!(cache.poll_at(), Some(t0 + RETRANS_TIMER));
+        assert_eq!(cache.poll_at(), t0 + RETRANS_TIMER);
 
         // Second and third probes.
         assert_eq!(
@@ -498,7 +501,7 @@ mod test {
             Some(ProbeEvent::Failed(MOCK_IP_ADDR_1.into()))
         );
         assert_eq!(cache.lookup(&key(MOCK_IP_ADDR_1), t0), Answer::NotFound);
-        assert_eq!(cache.poll_at(), None);
+        assert_eq!(cache.poll_at(), Instant::MAX);
     }
 
     #[test]
@@ -514,7 +517,7 @@ mod test {
 
         // The resolved entry has no retransmission timer anymore.
         assert_eq!(cache.poll_retransmit(IF_0, t0 + RETRANS_TIMER, &mut 0), None);
-        assert_eq!(cache.poll_at(), None);
+        assert_eq!(cache.poll_at(), Instant::MAX);
     }
 
     #[test]
@@ -567,10 +570,10 @@ mod test {
         let mut queue = PendingQueue::new();
 
         queue.push(key(MOCK_IP_ADDR_1), PacketBuf::new(), Instant::ZERO);
-        assert_eq!(queue.poll_at(), Some(Instant::ZERO + PENDING_QUEUE_LIFETIME));
+        assert_eq!(queue.poll_at(), Instant::ZERO + PENDING_QUEUE_LIFETIME);
         queue.purge_expired(Instant::ZERO + PENDING_QUEUE_LIFETIME);
         assert!(queue.take_matching(&key(MOCK_IP_ADDR_1)).is_empty());
-        assert_eq!(queue.poll_at(), None);
+        assert_eq!(queue.poll_at(), Instant::MAX);
     }
 
     #[test]

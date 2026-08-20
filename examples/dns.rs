@@ -92,11 +92,8 @@ fn main() {
             Err(GetQueryResultError::Pending) => {}
         }
 
-        let deadline = match (stack_deadline, dns_deadline) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
-        let timeout = deadline.map(|deadline| {
+        let deadline = stack_deadline.min(dns_deadline);
+        let timeout = (deadline != Instant::MAX).then(|| {
             let now = Instant::now();
             if deadline <= now {
                 std::time::Duration::ZERO

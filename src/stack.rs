@@ -17,7 +17,7 @@ use crate::raw::{RawHandle, RawSocket, RawSocketState};
 use crate::route::Routes;
 use crate::slab::Slab;
 #[cfg(feature = "tcp")]
-use crate::tcp::{PollAt, SocketBuffer, TcpHandle, TcpRepr, TcpSocket, TcpSocketState};
+use crate::tcp::{SocketBuffer, TcpHandle, TcpRepr, TcpSocket, TcpSocketState};
 #[cfg(feature = "tcp-listener")]
 use crate::tcp::{TcpListener, TcpListenerHandle, TcpListenerState};
 use crate::time::Instant;
@@ -769,10 +769,11 @@ impl Stack {
     ///
     /// `timestamp` is the current time.
     ///
-    /// Returns the earliest instant at which `poll` should be called again to advance
-    /// the timers, or `None` if no timers are pending. In that case it is enough to
-    /// call `poll` again when a packet is received, or after operating on a socket.
-    pub fn poll(&mut self, timestamp: Instant) -> Option<Instant> {
+    /// Returns a "poll deadline" instant. It is the earliest expiring timer. You should call `poll` at that instant to let it advance timers. Special cases:
+    /// - If it's [`Instant::MIN`] or in the past, `poll` should be called again immediately.
+    /// - If no timer is pending, [`Instant::MAX`] is returned. No need to call `poll` on a timer, only after
+    ///   a packet is received or an operation is done on the Stack, a socket or an interface.
+    pub fn poll(&mut self, timestamp: Instant) -> Instant {
         self.inner.now = timestamp;
 
         // Drop queued packets whose neighbor resolution timed out.
@@ -799,11 +800,14 @@ impl Stack {
             }
         }
 
+        #[allow(unused_mut)]
+        let mut deadline = Instant::MAX;
+
         // Drive TCP egress: this both acknowledges what ingress just delivered and
         // advances the TCP timers (retransmissions, delayed ACKs, keep-alives,
         // zero-window probes, ...).
         #[cfg(feature = "tcp")]
-        let tcp_poll_at = {
+        {
             let mut cx = TxContext {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
@@ -812,24 +816,21 @@ impl Stack {
                 crate::tcp::flush(socket, &mut cx);
             }
 
-            self.sockets
+            deadline = self
+                .sockets
                 .tcp
                 .iter()
-                .filter_map(|(_, socket)| match socket.poll_at() {
-                    PollAt::Now => Some(timestamp),
-                    PollAt::Time(t) => Some(t),
-                    PollAt::Ingress => None,
-                })
-        };
-        #[cfg(not(feature = "tcp"))]
-        let tcp_poll_at = core::iter::empty();
+                .map(|(_, socket)| socket.poll_at())
+                .fold(deadline, Instant::min);
+        }
 
         #[cfg(feature = "medium-ethernet")]
-        let timers = [self.inner.neighbor_cache.poll_at(), self.inner.pending.poll_at()];
-        #[cfg(not(feature = "medium-ethernet"))]
-        let timers: [Option<Instant>; 0] = [];
+        {
+            deadline = deadline.min(self.inner.neighbor_cache.poll_at());
+            deadline = deadline.min(self.inner.pending.poll_at());
+        }
 
-        timers.into_iter().flatten().chain(tcp_poll_at).min()
+        deadline
     }
 }
 
