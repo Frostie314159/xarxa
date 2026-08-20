@@ -190,7 +190,7 @@ impl Controller for Cubic {
             // TODO: Make this optional?
             // RFC recommends (SHOULD) disabling if only a single CUBIC flow is on a network.
             //
-            // RFC 9483.4.7: Fast Convergence
+            // RFC 9438.4.7: Fast Convergence
             // If loss happened at a smaller cwnd than before, it indicates a new flow.
             // Reduce the cubic plateau more than usual to create headroom.
             self.w_max = if self.cwnd < self.w_max {
