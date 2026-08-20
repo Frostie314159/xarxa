@@ -12,6 +12,8 @@ use crate::PacketBuf;
 use crate::wire::UdpPacket;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 use crate::wire::{ArpHardware, ArpPacket, EthernetAddress, Ipv4Address};
+#[cfg(feature = "dns")]
+use crate::wire::{DnsFlags, DnsPacket, DnsQuestion, DnsRecord, DnsRecordData};
 #[cfg(feature = "medium-ethernet")]
 use crate::wire::{EthernetFrame, EthernetProtocol};
 #[cfg(feature = "ipv4")]
@@ -263,15 +265,132 @@ fn log_transport(proto: IpProtocol, version: IpVersion, payload: &mut [u8]) {
 
 #[cfg(feature = "udp")]
 fn log_udp(buf: &mut [u8]) {
-    match UdpPacket::new_checked(buf) {
-        Ok(p) => trace!(
-            "UDP src={} dst={} len={} payload={}",
-            p.src_port(),
-            p.dst_port(),
-            p.len(),
-            p.payload().len()
-        ),
-        Err(_) => trace!("UDP: malformed"),
+    #[allow(unused_mut)]
+    let mut p = match UdpPacket::new_checked(buf) {
+        Ok(p) => p,
+        Err(_) => {
+            trace!("UDP: malformed");
+            return;
+        }
+    };
+    trace!(
+        "UDP src={} dst={} len={} payload={}",
+        p.src_port(),
+        p.dst_port(),
+        p.len(),
+        p.payload().len()
+    );
+    #[cfg(feature = "dns")]
+    if [p.src_port(), p.dst_port()]
+        .iter()
+        .any(|&port| port == 53 || port == 5353)
+    {
+        log_dns(p.payload_mut());
+    }
+}
+
+/// A DNS name in dotted text form, for logging. Labels are copied into a
+/// fixed buffer so the name can be printed as one `str`.
+#[cfg(feature = "dns")]
+struct DnsName {
+    buf: [u8; 255],
+    len: usize,
+}
+
+#[cfg(feature = "dns")]
+impl DnsName {
+    fn parse(packet: &DnsPacket<'_>, name: &[u8]) -> Option<Self> {
+        let mut out = Self { buf: [0; 255], len: 0 };
+        for label in packet.parse_name(name) {
+            let label = label.ok()?;
+            if out.len + label.len() + 1 > out.buf.len() {
+                return None;
+            }
+            out.buf[out.len..out.len + label.len()].copy_from_slice(label);
+            out.len += label.len();
+            out.buf[out.len] = b'.';
+            out.len += 1;
+        }
+        Some(out)
+    }
+
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("<non-utf8>")
+    }
+}
+
+#[cfg(feature = "dns")]
+fn log_dns(buf: &mut [u8]) {
+    let packet = match DnsPacket::new_checked(buf) {
+        Ok(p) => p,
+        Err(_) => {
+            trace!("DNS: malformed");
+            return;
+        }
+    };
+    trace!(
+        "DNS id={:#06x} {} op={} rcode={} flags={:?} qd={} an={} ns={} ar={}",
+        packet.transaction_id(),
+        if packet.flags().contains(DnsFlags::RESPONSE) {
+            "response"
+        } else {
+            "query"
+        },
+        packet.opcode(),
+        packet.rcode(),
+        packet.flags(),
+        packet.question_count(),
+        packet.answer_record_count(),
+        packet.authority_record_count(),
+        packet.additional_record_count(),
+    );
+
+    let mut payload = packet.payload();
+    for _ in 0..packet.question_count() {
+        let (rest, q) = match DnsQuestion::parse(payload) {
+            Ok(x) => x,
+            Err(_) => {
+                trace!("  question: malformed");
+                return;
+            }
+        };
+        payload = rest;
+        match DnsName::parse(&packet, q.name) {
+            Some(name) => trace!("  question {} type={}", name.as_str(), q.type_),
+            None => trace!("  question <malformed name> type={}", q.type_),
+        }
+    }
+
+    for (section, count) in [
+        ("answer", packet.answer_record_count()),
+        ("authority", packet.authority_record_count()),
+        ("additional", packet.additional_record_count()),
+    ] {
+        for _ in 0..count {
+            let (rest, r) = match DnsRecord::parse(payload) {
+                Ok(x) => x,
+                Err(_) => {
+                    trace!("  {}: malformed", section);
+                    return;
+                }
+            };
+            payload = rest;
+            let name = DnsName::parse(&packet, r.name);
+            let name = name.as_ref().map(DnsName::as_str).unwrap_or("<malformed name>");
+            match r.data {
+                #[cfg(feature = "ipv4")]
+                DnsRecordData::A(addr) => trace!("  {} {} ttl={} A {}", section, name, r.ttl, addr),
+                #[cfg(feature = "ipv6")]
+                DnsRecordData::Aaaa(addr) => trace!("  {} {} ttl={} AAAA {}", section, name, r.ttl, addr),
+                DnsRecordData::Cname(cname) => match DnsName::parse(&packet, cname) {
+                    Some(cname) => trace!("  {} {} ttl={} CNAME {}", section, name, r.ttl, cname.as_str()),
+                    None => trace!("  {} {} ttl={} CNAME <malformed name>", section, name, r.ttl),
+                },
+                DnsRecordData::Other(ty, data) => {
+                    trace!("  {} {} ttl={} type={} len={}", section, name, r.ttl, ty, data.len())
+                }
+            }
+        }
     }
 }
 
@@ -478,5 +597,28 @@ fn log_ndisc_options(mut buf: &mut [u8]) {
         }
         // `new_checked` guarantees `len <= buf.len()`.
         buf = &mut buf[len..];
+    }
+}
+
+#[cfg(all(test, feature = "dns", feature = "ipv4"))]
+mod test {
+    use super::*;
+
+    /// Decoding a CNAME + A response must walk every record without panicking.
+    #[test]
+    fn test_log_dns() {
+        let mut bytes = [
+            0x78, 0x6c, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x03, 0x77, 0x77, 0x77, 0x08, 0x66,
+            0x61, 0x63, 0x65, 0x62, 0x6f, 0x6f, 0x6b, 0x03, 0x63, 0x6f, 0x6d, 0x00, 0x00, 0x01, 0x00, 0x01, 0xc0, 0x0c,
+            0x00, 0x05, 0x00, 0x01, 0x00, 0x00, 0x05, 0xf3, 0x00, 0x11, 0x09, 0x73, 0x74, 0x61, 0x72, 0x2d, 0x6d, 0x69,
+            0x6e, 0x69, 0x04, 0x63, 0x31, 0x30, 0x72, 0xc0, 0x10, 0xc0, 0x2e, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x05, 0x00, 0x04, 0x1f, 0x0d, 0x53, 0x24,
+        ];
+        log_dns(&mut bytes);
+        let packet = DnsPacket::new_checked(&mut bytes).unwrap();
+        let name = DnsName::parse(&packet, &[0xc0, 0x2e]).unwrap();
+        assert_eq!(name.as_str(), "star-mini.c10r.facebook.com.");
+        // Truncated: must report malformed, not panic.
+        log_dns(&mut [0x78, 0x6c, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x03, 0x77]);
     }
 }
