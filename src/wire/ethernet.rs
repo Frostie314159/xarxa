@@ -59,15 +59,10 @@ impl Address {
         self.0[0] & 0x02 != 0
     }
 
-    /// Convert the address to an Extended Unique Identifier (EUI-64)
-    pub fn as_eui_64(&self) -> Option<[u8; 8]> {
-        let mut bytes = [0; 8];
-        bytes[0..3].copy_from_slice(&self.0[0..3]);
-        bytes[3] = 0xFF;
-        bytes[4] = 0xFE;
-        bytes[5..8].copy_from_slice(&self.0[3..6]);
-        bytes[0] ^= 1 << 1;
-        Some(bytes)
+    /// Convert the address to a modified EUI-64 interface identifier (RFC 4291).
+    pub const fn as_eui_64(&self) -> [u8; 8] {
+        let m = self.0;
+        [m[0] ^ 0x02, m[1], m[2], 0xFF, 0xFE, m[3], m[4], m[5]]
     }
 }
 

@@ -72,6 +72,9 @@ pub enum AddrOrigin {
     /// Learned from a DHCPv4 lease.
     #[cfg(feature = "dhcpv4")]
     Dhcpv4,
+    /// The IPv6 link-local address the stack derives from the hardware address.
+    #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+    LinkLocal,
 }
 
 /// An IP address assigned to an interface.
@@ -92,6 +95,25 @@ impl IfaceAddr {
             origin: AddrOrigin::Manual,
         }
     }
+}
+
+/// The IPv6 link-local address derived from an Ethernet address (RFC 4291 §2.5.1,
+/// modified EUI-64).
+#[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAddr> {
+    let mac = match hardware_addr {
+        HardwareAddress::Ethernet(mac) => mac,
+        #[allow(unreachable_patterns)]
+        _ => return None,
+    };
+    let mut bytes = [0u8; 16];
+    bytes[0] = 0xfe;
+    bytes[1] = 0x80;
+    bytes[8..].copy_from_slice(&mac.as_eui_64());
+    Some(IfaceAddr {
+        cidr: IpCidr::new(Ipv6Address::from(bytes).into(), 64),
+        origin: AddrOrigin::LinkLocal,
+    })
 }
 
 /// An interface added to the stack, with its configuration.
@@ -173,6 +195,18 @@ impl Iface<'_> {
             "hardware address does not match the interface's medium"
         );
         self.state_mut().hardware_addr = addr;
+        #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+        {
+            let ip_addrs = &mut self.state_mut().ip_addrs;
+            let had = ip_addrs.iter().any(|a| a.origin == AddrOrigin::LinkLocal);
+            ip_addrs.retain(|a| a.origin != AddrOrigin::LinkLocal);
+            if let Some(ll) = link_local_addr(addr) {
+                ip_addrs.push(ll);
+                self.invalidate();
+            } else if had {
+                self.invalidate();
+            }
+        }
     }
 
     /// The IP addresses assigned to the interface, with their origin.
@@ -230,16 +264,24 @@ impl Iface<'_> {
 
     /// Replace the interface's entire set of IP addresses.
     ///
-    /// Equivalent to removing every address and adding the given ones.
+    /// Equivalent to removing every address and adding the given ones. The
+    /// automatic IPv6 link-local address is kept.
     ///
     /// # Panics
     /// Panics if any of the addresses is not unicast.
     pub fn set_ip_addrs(&mut self, addrs: impl IntoIterator<Item = IpCidr>) {
-        let addrs: Vec<IfaceAddr> = addrs.into_iter().map(IfaceAddr::manual).collect();
+        #[allow(unused_mut)]
+        let mut addrs: Vec<IfaceAddr> = addrs.into_iter().map(IfaceAddr::manual).collect();
         assert!(
             addrs.iter().all(|a| a.cidr.address().is_unicast()),
             "only unicast addresses can be assigned to an interface"
         );
+        #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+        for a in self.state().ip_addrs.iter() {
+            if a.origin == AddrOrigin::LinkLocal && !addrs.iter().any(|n| n.cidr.address() == a.cidr.address()) {
+                addrs.push(*a);
+            }
+        }
 
         let ip_addrs = &mut self.state_mut().ip_addrs;
         if *ip_addrs == addrs {
@@ -644,11 +686,15 @@ impl Stack {
             dev.capabilities().medium,
             "hardware address does not match the interface's medium"
         );
+        #[allow(unused_mut)]
+        let mut ip_addrs = Vec::new();
+        #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+        ip_addrs.extend(link_local_addr(hardware_addr));
         let index = self.ifaces.add_with(|index| IfaceState {
             handle: IfaceHandle(index),
             dev,
             hardware_addr,
-            ip_addrs: Vec::new(),
+            ip_addrs,
             config_generation: 0,
             #[cfg(feature = "async")]
             config_waker: crate::waker::WakerRegistration::new(),
@@ -2847,6 +2893,65 @@ mod test {
             .iface(handle)
             .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)]);
         (stack, rx, tx)
+    }
+
+    /// OUR_HW 02:00:00:00:00:01 -> fe80::ff:fe00:1 (modified EUI-64 flips the U/L bit back).
+    #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+    const OUR_LINK_LOCAL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x1);
+
+    #[test]
+    #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+    fn test_auto_link_local() {
+        let ll = IfaceAddr {
+            cidr: IpCidr::new(OUR_LINK_LOCAL.into(), 64),
+            origin: AddrOrigin::LinkLocal,
+        };
+        let (mut stack, _rx, _tx) = test_stack(Medium::Ethernet);
+        let handle = IfaceHandle(0);
+
+        // Present after add_iface, survives set_ip_addrs.
+        assert!(stack.iface(handle).ip_addrs().contains(&ll));
+        assert!(stack.iface(handle).has_ip_addr(OUR_LINK_LOCAL));
+
+        // Follows the hardware address.
+        let generation = stack.iface(handle).config_generation();
+        stack
+            .iface(handle)
+            .set_hardware_addr(HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x02])));
+        assert!(!stack.iface(handle).has_ip_addr(OUR_LINK_LOCAL));
+        assert!(
+            stack
+                .iface(handle)
+                .has_ip_addr(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2))
+        );
+        assert_ne!(stack.iface(handle).config_generation(), generation);
+
+        // Can be removed by hand, and a user-set link-local is kept by set_ip_addrs.
+        stack
+            .iface(handle)
+            .remove_ip_addr(Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2));
+        assert!(
+            !stack
+                .iface(handle)
+                .ip_addrs()
+                .iter()
+                .any(|a| a.origin == AddrOrigin::LinkLocal)
+        );
+        stack.iface(handle).set_ip_addrs([IpCidr::new(OUR_V6.into(), 64)]);
+        assert_eq!(
+            stack.iface(handle).ip_addrs(),
+            &[IfaceAddr::manual(IpCidr::new(OUR_V6.into(), 64))]
+        );
+
+        // No link-local on an IP-medium interface.
+        let (mut stack, _rx, _tx) = test_stack(Medium::Ip);
+        assert!(
+            !stack
+                .iface(handle)
+                .ip_addrs()
+                .iter()
+                .any(|a| a.origin == AddrOrigin::LinkLocal)
+        );
     }
 
     /// Inject a packet into the device and poll the stack to process it.

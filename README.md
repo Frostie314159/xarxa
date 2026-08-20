@@ -86,6 +86,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - IPv4 (feature `ipv4`)
   - DHCP client (feature `dhcpv4`)
 - IPv6 (feature `ipv6`)
+  - Link-local address automatically derived from the MAC address (EUI-64).
 - ICMP
   - Automatically replies to pings. (feature `icmp-ping-reply`)
   - Incoming ICMP errors are routed to the socket that caused them. (feature `icmp-errors`)

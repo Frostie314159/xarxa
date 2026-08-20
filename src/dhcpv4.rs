@@ -964,7 +964,7 @@ mod test {
         assert_eq!(lease.server.address, SERVER_IP);
         assert_eq!(lease.server.identifier, SERVER_IP);
         assert_eq!(
-            stack.iface(IFACE).ip_addrs(),
+            ipv4_addrs(&mut stack),
             &[IfaceAddr {
                 cidr: IpCidr::new(OFFERED_IP.into(), 24),
                 origin: AddrOrigin::Dhcpv4
@@ -977,6 +977,17 @@ mod test {
         assert_ne!(stack.iface(IFACE).config_generation(), generation);
 
         (stack, rx, tx)
+    }
+
+    /// The interface's IPv4 addresses, leaving out the automatic IPv6 link-local.
+    fn ipv4_addrs(stack: &mut Stack) -> Vec<IfaceAddr> {
+        stack
+            .iface(IFACE)
+            .ip_addrs()
+            .iter()
+            .filter(|a| matches!(a.cidr, IpCidr::Ipv4(_)))
+            .copied()
+            .collect()
     }
 
     /// An ARP request from the server for our leased address, which teaches the
@@ -1008,7 +1019,7 @@ mod test {
         let generation = stack.iface(IFACE).config_generation();
         stack.iface(IFACE).set_dhcpv4(None);
         assert!(stack.iface(IFACE).dhcpv4_lease().is_none());
-        assert!(stack.iface(IFACE).ip_addrs().is_empty());
+        assert!(ipv4_addrs(&mut stack).is_empty());
         assert!(stack.routes().get_default_ipv4_route().is_none());
         assert_ne!(stack.iface(IFACE).config_generation(), generation);
     }
@@ -1020,7 +1031,7 @@ mod test {
         stack.iface(IFACE).add_ip_addr(manual);
 
         stack.iface(IFACE).set_dhcpv4(None);
-        assert_eq!(stack.iface(IFACE).ip_addrs(), &[IfaceAddr::manual(manual)]);
+        assert_eq!(ipv4_addrs(&mut stack), &[IfaceAddr::manual(manual)]);
     }
 
     #[test]
@@ -1096,7 +1107,7 @@ mod test {
             t += 1;
         }
         assert!(stack.iface(IFACE).dhcpv4_lease().is_none());
-        assert!(stack.iface(IFACE).ip_addrs().is_empty());
+        assert!(ipv4_addrs(&mut stack).is_empty());
         assert!(stack.routes().get_default_ipv4_route().is_none());
         let mut sent = parse_sent(tx.borrow().last().unwrap());
         assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
@@ -1149,7 +1160,7 @@ mod test {
         let (mut stack, _rx, tx) = bound_stack();
         stack.iface(IFACE).restart_dhcpv4();
         assert!(stack.iface(IFACE).dhcpv4_lease().is_none());
-        assert!(stack.iface(IFACE).ip_addrs().is_empty());
+        assert!(ipv4_addrs(&mut stack).is_empty());
         stack.poll(at(3));
         let mut sent = parse_sent(tx.borrow().last().unwrap());
         assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
