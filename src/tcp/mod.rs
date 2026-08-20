@@ -9661,7 +9661,7 @@ mod test {
 
         // Simulate interface IP change - remove the socket's source IP
         // and add a different one.
-        s.stack.ifaces.get_mut(0).ip_addrs = vec![IpCidr::new(OTHER_ADDR.into(), 24)];
+        s.stack.ifaces.get_mut(0).ip_addrs = vec![crate::IfaceAddr::manual(IpCidr::new(OTHER_ADDR.into(), 24))];
 
         // The socket's source IP is no longer ours: dispatch treats it like a
         // routing failure. The segment is still built, but with no route, so
@@ -9682,7 +9682,7 @@ mod test {
 
         // Restoring the address makes egress work again, and the retransmission
         // carries the dropped data.
-        s.stack.ifaces.get_mut(0).ip_addrs = vec![IpCidr::new(LOCAL_ADDR.into(), 24)];
+        s.stack.ifaces.get_mut(0).ip_addrs = vec![crate::IfaceAddr::manual(IpCidr::new(LOCAL_ADDR.into(), 24))];
         recv!(s, time 2000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 3,
             ack_number: Some(REMOTE_SEQ + 1),

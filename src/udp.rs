@@ -1456,7 +1456,7 @@ mod test {
             .bind((LOCAL_ADDR, LOCAL_PORT), (REMOTE_ADDR, REMOTE_PORT))
             .unwrap();
         assert_eq!(socket.send_slice(b"hi", dst), Ok(()));
-        stack.ifaces.get_mut(0).ip_addrs = vec![IpCidr::new(OTHER_ADDR.into(), 24)];
+        stack.ifaces.get_mut(0).ip_addrs = vec![crate::IfaceAddr::manual(IpCidr::new(OTHER_ADDR.into(), 24))];
         let mut socket = stack.udp_socket(handle);
         assert_eq!(socket.send_slice(b"hi", dst), Err(SendError::Unaddressable));
     }

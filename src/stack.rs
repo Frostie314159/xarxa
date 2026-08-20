@@ -62,12 +62,41 @@ pub(crate) struct Sockets {
     pub(crate) tcp_listeners: Slab<TcpListenerState>,
 }
 
+/// Where an interface address came from.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AddrOrigin {
+    /// Assigned by the application.
+    Manual,
+}
+
+/// An IP address assigned to an interface.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IfaceAddr {
+    /// The address and its prefix.
+    pub cidr: IpCidr,
+    /// Where the address came from.
+    pub origin: AddrOrigin,
+}
+
+impl IfaceAddr {
+    /// An address assigned by the application.
+    pub(crate) const fn manual(cidr: IpCidr) -> Self {
+        Self {
+            cidr,
+            origin: AddrOrigin::Manual,
+        }
+    }
+}
+
 /// An interface added to the stack, with its configuration.
 pub(crate) struct IfaceState {
     handle: IfaceHandle,
     dev: Box<dyn Interface>,
     hardware_addr: HardwareAddress,
-    pub(crate) ip_addrs: Vec<IpCidr>,
+    pub(crate) ip_addrs: Vec<IfaceAddr>,
 }
 
 /// An interface borrowed from a [`Stack`], returned by [`Stack::iface`].
@@ -137,8 +166,8 @@ impl Iface<'_> {
         self.state_mut().hardware_addr = addr;
     }
 
-    /// The IP addresses assigned to the interface.
-    pub fn ip_addrs(&self) -> &[IpCidr] {
+    /// The IP addresses assigned to the interface, with their origin.
+    pub fn ip_addrs(&self) -> &[IfaceAddr] {
         &self.state().ip_addrs
     }
 
@@ -164,15 +193,15 @@ impl Iface<'_> {
         );
 
         let ip_addrs = &mut self.state_mut().ip_addrs;
-        match ip_addrs.iter().position(|old| old.address() == cidr.address()) {
-            Some(index) if ip_addrs[index] == cidr => Some(cidr),
+        match ip_addrs.iter().position(|old| old.cidr.address() == cidr.address()) {
+            Some(index) if ip_addrs[index].cidr == cidr => Some(cidr),
             Some(index) => {
-                let old = core::mem::replace(&mut ip_addrs[index], cidr);
+                let old = core::mem::replace(&mut ip_addrs[index], IfaceAddr::manual(cidr));
                 self.invalidate();
-                Some(old)
+                Some(old.cidr)
             }
             None => {
-                ip_addrs.push(cidr);
+                ip_addrs.push(IfaceAddr::manual(cidr));
                 None
             }
         }
@@ -183,10 +212,10 @@ impl Iface<'_> {
     pub fn remove_ip_addr(&mut self, addr: impl Into<IpAddress>) -> Option<IpCidr> {
         let addr = addr.into();
         let ip_addrs = &mut self.state_mut().ip_addrs;
-        let index = ip_addrs.iter().position(|cidr| cidr.address() == addr)?;
+        let index = ip_addrs.iter().position(|a| a.cidr.address() == addr)?;
         let removed = ip_addrs.remove(index);
         self.invalidate();
-        Some(removed)
+        Some(removed.cidr)
     }
 
     /// Replace the interface's entire set of IP addresses.
@@ -196,9 +225,9 @@ impl Iface<'_> {
     /// # Panics
     /// Panics if any of the addresses is not unicast.
     pub fn set_ip_addrs(&mut self, addrs: impl IntoIterator<Item = IpCidr>) {
-        let addrs: Vec<IpCidr> = addrs.into_iter().collect();
+        let addrs: Vec<IfaceAddr> = addrs.into_iter().map(IfaceAddr::manual).collect();
         assert!(
-            addrs.iter().all(|cidr| cidr.address().is_unicast()),
+            addrs.iter().all(|a| a.cidr.address().is_unicast()),
             "only unicast addresses can be assigned to an interface"
         );
 
@@ -2313,19 +2342,24 @@ impl IfaceState {
         mtu.min(PACKET_BUF_SIZE - LINK_HEADER_LEN)
     }
 
+    /// The assigned addresses, without their origin.
+    fn cidrs(&self) -> impl Iterator<Item = &IpCidr> + '_ {
+        self.ip_addrs.iter().map(|a| &a.cidr)
+    }
+
     fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
         let addr = addr.into();
-        self.ip_addrs.iter().any(|probe| probe.address() == addr)
+        self.cidrs().any(|probe| probe.address() == addr)
     }
 
     fn in_same_network(&self, addr: &IpAddress) -> bool {
-        self.ip_addrs.iter().any(|cidr| cidr.contains_addr(addr))
+        self.cidrs().any(|cidr| cidr.contains_addr(addr))
     }
 
     /// Get the first IPv4 address of the interface.
     #[cfg(all(feature = "ipv4", feature = "icmp-ping-reply"))]
     fn ipv4_addr(&self) -> Option<Ipv4Address> {
-        self.ip_addrs.iter().find_map(|addr| match *addr {
+        self.cidrs().find_map(|addr| match *addr {
             IpCidr::Ipv4(cidr) => Some(cidr.address()),
             #[allow(unreachable_patterns)]
             _ => None,
@@ -2340,7 +2374,7 @@ impl IfaceState {
     #[cfg(all(feature = "ipv4", any(feature = "medium-ethernet", feature = "udp", feature = "tcp")))]
     fn get_source_address_ipv4(&self, dst_addr: &Ipv4Address) -> Option<Ipv4Address> {
         let mut first_ipv4 = None;
-        for cidr in self.ip_addrs.iter() {
+        for cidr in self.cidrs() {
             #[allow(irrefutable_let_patterns)]
             if let IpCidr::Ipv4(cidr) = cidr {
                 // Return immediately if we find an address in the same subnet
@@ -2388,8 +2422,7 @@ impl IfaceState {
             return true;
         }
 
-        self.ip_addrs
-            .iter()
+        self.cidrs()
             .filter_map(|own_cidr| match own_cidr {
                 IpCidr::Ipv4(own_ip) => Some(own_ip.broadcast()?),
                 #[cfg(feature = "ipv6")]
@@ -2411,7 +2444,7 @@ impl IfaceState {
     /// [RFC 4291 § 2.7.1]: https://tools.ietf.org/html/rfc4291#section-2.7.1
     #[cfg(feature = "ipv6")]
     fn has_solicited_node(&self, addr: Ipv6Address) -> bool {
-        self.ip_addrs.iter().any(|cidr| {
+        self.cidrs().any(|cidr| {
             match *cidr {
                 IpCidr::Ipv6(cidr) if cidr.address() != Ipv6Address::LOCALHOST => {
                     // Take the lower order 24 bits of the IPv6 address and
@@ -2487,13 +2520,12 @@ impl IfaceState {
 
         // If the destination address is a loopback address, or when there are no IPv6 addresses in
         // the interface, then the loopback address is the only candidate source address.
-        if dst_addr.is_loopback() || self.ip_addrs.iter().filter(|a| matches!(a, IpCidr::Ipv6(_))).count() == 0 {
+        if dst_addr.is_loopback() || self.cidrs().filter(|a| matches!(a, IpCidr::Ipv6(_))).count() == 0 {
             return Ipv6Address::LOCALHOST;
         }
 
         let mut candidate = self
-            .ip_addrs
-            .iter()
+            .cidrs()
             .find_map(|a| match a {
                 #[cfg(feature = "ipv4")]
                 IpCidr::Ipv4(_) => None,
@@ -2501,7 +2533,7 @@ impl IfaceState {
             })
             .unwrap(); // NOTE: we check above that there is at least one IPv6 address.
 
-        for addr in self.ip_addrs.iter().filter_map(|a| match a {
+        for addr in self.cidrs().filter_map(|a| match a {
             #[cfg(feature = "ipv4")]
             IpCidr::Ipv4(_) => None,
             IpCidr::Ipv6(a) => Some(a),
@@ -3510,7 +3542,10 @@ mod test {
 
         assert_eq!(
             stack.iface(iface).ip_addrs(),
-            [IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)]
+            [
+                IfaceAddr::manual(IpCidr::new(OUR_V4.into(), 24)),
+                IfaceAddr::manual(IpCidr::new(OUR_V6.into(), 64))
+            ]
         );
         assert!(stack.iface(iface).has_ip_addr(OUR_V4));
         assert!(!stack.iface(iface).has_ip_addr(new_addr));
@@ -3537,9 +3572,9 @@ mod test {
         assert_eq!(
             stack.iface(iface).ip_addrs(),
             [
-                IpCidr::new(OUR_V4.into(), 24),
-                IpCidr::new(OUR_V6.into(), 64),
-                IpCidr::new(new_addr.into(), 24),
+                IfaceAddr::manual(IpCidr::new(OUR_V4.into(), 24)),
+                IfaceAddr::manual(IpCidr::new(OUR_V6.into(), 64)),
+                IfaceAddr::manual(IpCidr::new(new_addr.into(), 24)),
             ]
         );
 
@@ -3558,7 +3593,10 @@ mod test {
 
         // Wholesale replacement.
         stack.iface(iface).set_ip_addrs([IpCidr::new(new_addr.into(), 8)]);
-        assert_eq!(stack.iface(iface).ip_addrs(), [IpCidr::new(new_addr.into(), 8)]);
+        assert_eq!(
+            stack.iface(iface).ip_addrs(),
+            [IfaceAddr::manual(IpCidr::new(new_addr.into(), 8))]
+        );
         assert!(!stack.iface(iface).has_ip_addr(OUR_V4));
     }
 

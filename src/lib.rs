@@ -67,7 +67,7 @@ pub use stack::TcpListenerIter;
 pub use stack::TcpSocketIter;
 #[cfg(feature = "udp")]
 pub use stack::UdpSocketIter;
-pub use stack::{Iface, IfaceHandle, IfaceIter, Stack};
+pub use stack::{AddrOrigin, Iface, IfaceAddr, IfaceHandle, IfaceIter, Stack};
 #[cfg(feature = "tcp")]
 pub use tcp::{TcpHandle, TcpSocket};
 #[cfg(feature = "tcp-listener")]
