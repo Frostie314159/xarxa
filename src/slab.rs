@@ -68,6 +68,7 @@ impl<T> Slab<T> {
     }
 
     /// Iterate over all occupied slots, with their indexes.
+    #[allow(unused)]
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
         self.slots
             .iter_mut()

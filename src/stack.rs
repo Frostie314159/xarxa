@@ -46,6 +46,7 @@ pub struct IfaceHandle(pub(crate) usize);
 pub struct Stack {
     pub(crate) inner: StackInner,
     pub(crate) ifaces: Slab<IfaceState>,
+    #[allow(unused)]
     pub(crate) sockets: Sockets,
 }
 
@@ -442,7 +443,7 @@ impl TxContext<'_> {
 /// candidate sockets: `None` if it does not match, else how specific the filter
 /// that matched it is. No address matches anything (0), an unspecified one
 /// matches its own IP version (1), and a concrete one matches only itself (2).
-#[cfg(any(feature = "udp", feature = "tcp"))]
+#[cfg(any(feature = "udp", feature = "tcp-listener"))]
 pub(crate) fn addr_score(filter: &IpListenEndpoint, addr: &IpAddress) -> Option<u8> {
     match filter.addr {
         None => Some(0),
