@@ -37,7 +37,7 @@ for extra in "" "defmt" "log" "std" "std,log" "std,defmt" "async" "std,log,async
              "packetmeta-id" "packetmeta-timestamp" "packetmeta-timestamp,defmt" \
              "tcp-timestamps" "tcp-timestamps,defmt" \
              "tcp-reno" "tcp-cubic" \
-             "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps"; do
+             "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,packet-log"; do
   run cargo check --no-default-features \
     --features "medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp${extra:+,$extra}"
 done

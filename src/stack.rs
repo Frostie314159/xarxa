@@ -787,7 +787,14 @@ impl Stack {
             #[cfg(feature = "medium-ethernet")]
             self.poll_neighbor_timers(handle);
 
-            while let Some(buf) = self.ifaces.get_mut(index).dev.receive() {
+            #[allow(unused_mut)]
+            while let Some(mut buf) = self.ifaces.get_mut(index).dev.receive() {
+                #[cfg(feature = "packet-log")]
+                {
+                    trace!("received on iface {}", index);
+                    let medium = self.ifaces.get(index).dev.capabilities().medium;
+                    crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
+                }
                 self.process(handle, buf);
             }
         }
@@ -2088,10 +2095,27 @@ impl StackInner {
         self.transmit_raw(iface, buf);
     }
 
-    fn transmit_raw(&mut self, iface: &mut IfaceState, buf: PacketBuf) {
+    fn transmit_raw(&mut self, iface: &mut IfaceState, #[allow(unused_mut)] mut buf: PacketBuf) {
+        #[cfg(feature = "packet-log")]
+        {
+            trace!("sent on iface {}", iface.handle.0);
+            let medium = iface.dev.capabilities().medium;
+            crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
+        }
         if iface.dev.transmit(buf).is_err() {
             debug!("iface: cannot transmit, dropping packet");
         }
+    }
+}
+
+/// The outermost header of a frame on an interface of this medium.
+#[cfg(feature = "packet-log")]
+fn packet_log_layer(medium: Medium) -> crate::packet_log::Layer {
+    match medium {
+        #[cfg(feature = "medium-ethernet")]
+        Medium::Ethernet => crate::packet_log::Layer::Ethernet,
+        #[cfg(feature = "medium-ip")]
+        Medium::Ip => crate::packet_log::Layer::Ip,
     }
 }
 

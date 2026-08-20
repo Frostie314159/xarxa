@@ -29,6 +29,8 @@ pub mod iface;
 pub mod meta;
 #[cfg(feature = "medium-ethernet")]
 pub mod neighbor;
+#[cfg(feature = "packet-log")]
+mod packet_log;
 mod rand;
 #[cfg(feature = "raw")]
 pub mod raw;
