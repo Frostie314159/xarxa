@@ -58,7 +58,7 @@ pub use meta::PacketMeta;
 pub use meta::{Timestamp, TxTimestamp};
 #[cfg(feature = "raw")]
 pub use raw::{RawHandle, RawMode, RawSocket};
-pub use route::{Route, Routes};
+pub use route::{Route, RouteOrigin, Routes};
 #[cfg(feature = "raw")]
 pub use stack::RawSocketIter;
 #[cfg(feature = "tcp-listener")]

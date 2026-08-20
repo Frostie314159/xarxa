@@ -29,6 +29,15 @@ const IPV4_DEFAULT: IpCidr = IpCidr::Ipv4(Ipv4Cidr::new(Ipv4Address::new(0, 0, 0
 #[cfg(feature = "ipv6")]
 const IPV6_DEFAULT: IpCidr = IpCidr::Ipv6(Ipv6Cidr::new(Ipv6Address::new(0, 0, 0, 0, 0, 0, 0, 0), 0));
 
+/// Where a route came from.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum RouteOrigin {
+    /// Added by the application.
+    Manual,
+}
+
 /// A prefix of addresses that should be routed via a router, out of an interface.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +46,8 @@ pub struct Route {
     pub via_router: IpAddress,
     /// The interface this route goes out of.
     pub iface: IfaceHandle,
+    /// Where the route came from.
+    pub origin: RouteOrigin,
     /// `None` means "forever".
     pub preferred_until: Option<Instant>,
     /// `None` means "forever".
@@ -51,6 +62,7 @@ impl Route {
             cidr: IPV4_DEFAULT,
             via_router: gateway.into(),
             iface,
+            origin: RouteOrigin::Manual,
             preferred_until: None,
             expires_at: None,
         }
@@ -63,6 +75,7 @@ impl Route {
             cidr: IPV6_DEFAULT,
             via_router: gateway.into(),
             iface,
+            origin: RouteOrigin::Manual,
             preferred_until: None,
             expires_at: None,
         }
@@ -211,6 +224,7 @@ mod test {
             cidr: cidr_1().into(),
             via_router: ADDR_1A.into(),
             iface: IF_0,
+            origin: RouteOrigin::Manual,
             preferred_until: None,
             expires_at: None,
         };
@@ -226,6 +240,7 @@ mod test {
             cidr: cidr_2().into(),
             via_router: ADDR_2A.into(),
             iface: IF_1,
+            origin: RouteOrigin::Manual,
             preferred_until: Some(Instant::from_millis(10)),
             expires_at: Some(Instant::from_millis(10)),
         };
@@ -252,6 +267,7 @@ mod test {
                 cidr: cidr_2().into(),
                 via_router: ADDR_2A.into(),
                 iface: IF_1,
+                origin: RouteOrigin::Manual,
                 preferred_until: None,
                 expires_at: None,
             })
@@ -291,6 +307,7 @@ mod test {
                 cidr: cidr_1().into(),
                 via_router: ADDR_1A.into(),
                 iface: IF_0,
+                origin: RouteOrigin::Manual,
                 preferred_until: None,
                 expires_at: None,
             });
@@ -298,6 +315,7 @@ mod test {
                 cidr: cidr_2().into(),
                 via_router: ADDR_2A.into(),
                 iface: IF_1,
+                origin: RouteOrigin::Manual,
                 preferred_until: None,
                 expires_at: None,
             });
