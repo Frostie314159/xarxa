@@ -16,10 +16,9 @@ use crate::buf::PacketBuf;
 #[cfg(feature = "medium-ethernet")]
 use crate::iface::Medium;
 use crate::meta::PacketMeta;
-use crate::slab::Slab;
 #[cfg(feature = "medium-ethernet")]
-use crate::stack::{IfaceHandle, IfaceState};
-use crate::stack::{StackInner, TxContext};
+use crate::stack::IfaceHandle;
+use crate::stack::{Stack, TxContext};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
 #[cfg(feature = "ipv4")]
@@ -492,7 +491,7 @@ impl RawSocket<'_> {
     }
 }
 
-impl StackInner {
+impl Stack {
     /// Offer an ingress Ethernet frame to the raw sockets. `buf` is the whole
     /// frame, Ethernet header included.
     ///
@@ -504,13 +503,12 @@ impl StackInner {
     #[cfg(feature = "medium-ethernet")]
     pub(crate) fn process_raw_ethernet(
         &mut self,
-        iface: &IfaceState,
-        sockets: &mut Slab<RawSocketState>,
+        iface: IfaceHandle,
         ethertype: EthernetProtocol,
         stack_wants: bool,
         buf: PacketBuf,
     ) -> Option<PacketBuf> {
-        for (_, socket) in sockets.iter_mut() {
+        for (_, socket) in self.sockets.raw.iter_mut() {
             let Some(RawMode::Ethernet {
                 iface: bound_iface,
                 ethertype: bound_ethertype,
@@ -519,7 +517,7 @@ impl StackInner {
                 continue;
             };
             #[allow(unreachable_patterns)]
-            if bound_iface != iface.handle() {
+            if bound_iface != iface {
                 continue;
             }
             if bound_ethertype.is_some_and(|t| t != ethertype) {
@@ -551,13 +549,12 @@ impl StackInner {
     /// packets an application is handling through a raw socket.
     pub(crate) fn process_raw_ip(
         &mut self,
-        sockets: &mut Slab<RawSocketState>,
         version: IpVersion,
         protocol: IpProtocol,
         stack_wants: bool,
         buf: PacketBuf,
     ) -> Option<(PacketBuf, bool)> {
-        for (_, socket) in sockets.iter_mut() {
+        for (_, socket) in self.sockets.raw.iter_mut() {
             let Some(RawMode::Ip {
                 version: bound_version,
                 protocol: bound_protocol,
@@ -858,13 +855,7 @@ mod test {
 
         // Not a stack protocol: the first matching socket takes the buffer.
         let packet = ipv4_packet(IP_PROTO, b"abcd");
-        let res = stack.inner.process_raw_ip(
-            &mut stack.sockets.raw,
-            IpVersion::Ipv4,
-            IP_PROTO,
-            false,
-            buf_from(&packet),
-        );
+        let res = stack.process_raw_ip(IpVersion::Ipv4, IP_PROTO, false, buf_from(&packet));
         assert!(res.is_none());
         assert!(!stack.raw_socket(h_icmp).can_recv());
         assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &packet[..]);
@@ -872,13 +863,7 @@ mod test {
         // A stack-handled protocol: the matching socket gets a copy, the original
         // is handed back for further processing.
         let packet = ipv4_packet(IpProtocol::Icmp, b"ping");
-        let res = stack.inner.process_raw_ip(
-            &mut stack.sockets.raw,
-            IpVersion::Ipv4,
-            IpProtocol::Icmp,
-            true,
-            buf_from(&packet),
-        );
+        let res = stack.process_raw_ip(IpVersion::Ipv4, IpProtocol::Icmp, true, buf_from(&packet));
         let (res_buf, handled) = res.unwrap();
         assert_eq!(&*res_buf, &packet[..]);
         assert!(handled);
@@ -887,13 +872,7 @@ mod test {
 
         // Version filter: an IPv6 packet skips the IPv4-bound socket.
         let packet = ipv6_packet(IpProtocol::Icmp, b"six");
-        let res = stack.inner.process_raw_ip(
-            &mut stack.sockets.raw,
-            IpVersion::Ipv6,
-            IpProtocol::Icmp,
-            false,
-            buf_from(&packet),
-        );
+        let res = stack.process_raw_ip(IpVersion::Ipv6, IpProtocol::Icmp, false, buf_from(&packet));
         assert!(res.is_none());
         assert!(!stack.raw_socket(h_icmp).can_recv());
         assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &packet[..]);
@@ -901,13 +880,7 @@ mod test {
         // No socket matches: the buffer is handed back.
         stack.raw_socket(h_any).close();
         let packet = ipv4_packet(IP_PROTO, b"nobody");
-        let res = stack.inner.process_raw_ip(
-            &mut stack.sockets.raw,
-            IpVersion::Ipv4,
-            IP_PROTO,
-            false,
-            buf_from(&packet),
-        );
+        let res = stack.process_raw_ip(IpVersion::Ipv4, IP_PROTO, false, buf_from(&packet));
         let (res_buf, handled) = res.unwrap();
         assert_eq!(&*res_buf, &packet[..]);
         assert!(!handled);
@@ -954,13 +927,7 @@ mod test {
         // Zero-copy ingress: the socket takes the very buffer the driver filled.
         let mut buf = buf_from(&eth_frame(ETHERTYPE_CUSTOM, b"abcd"));
         buf.meta_mut().id = 0x1111;
-        let res = stack.inner.process_raw_ethernet(
-            stack.ifaces.get(iface.0),
-            &mut stack.sockets.raw,
-            ETHERTYPE_CUSTOM,
-            false,
-            buf,
-        );
+        let res = stack.process_raw_ethernet(iface, ETHERTYPE_CUSTOM, false, buf);
         assert!(res.is_none());
         assert_eq!(stack.raw_socket(handle).recv().unwrap().meta().id, 0x1111);
 
@@ -968,13 +935,7 @@ mod test {
         // packet, so it carries the same metadata.
         let mut buf = buf_from(&eth_frame(EthernetProtocol::Arp, b"abcd"));
         buf.meta_mut().id = 0x2222;
-        let res = stack.inner.process_raw_ethernet(
-            stack.ifaces.get(iface.0),
-            &mut stack.sockets.raw,
-            EthernetProtocol::Arp,
-            true,
-            buf,
-        );
+        let res = stack.process_raw_ethernet(iface, EthernetProtocol::Arp, true, buf);
         assert_eq!(res.unwrap().meta().id, 0x2222);
         assert_eq!(stack.raw_socket(handle).recv().unwrap().meta().id, 0x2222);
 
@@ -1013,21 +974,13 @@ mod test {
 
         // Frame on another interface: no socket matches.
         let frame = eth_frame(ETHERTYPE_CUSTOM, b"hello");
-        let iface = stack.ifaces.get(iface_b.0);
-        let res =
-            stack
-                .inner
-                .process_raw_ethernet(iface, &mut stack.sockets.raw, ETHERTYPE_CUSTOM, false, buf_from(&frame));
+        let res = stack.process_raw_ethernet(iface_b, ETHERTYPE_CUSTOM, false, buf_from(&frame));
         assert_eq!(&*res.unwrap(), &frame[..]);
         assert!(!stack.raw_socket(h_custom).can_recv());
         assert!(!stack.raw_socket(h_any).can_recv());
 
         // Frame on the bound interface: the first matching socket takes it.
-        let iface = stack.ifaces.get(iface_a.0);
-        let res =
-            stack
-                .inner
-                .process_raw_ethernet(iface, &mut stack.sockets.raw, ETHERTYPE_CUSTOM, false, buf_from(&frame));
+        let res = stack.process_raw_ethernet(iface_a, ETHERTYPE_CUSTOM, false, buf_from(&frame));
         assert!(res.is_none());
         assert_eq!(&*stack.raw_socket(h_custom).recv().unwrap(), &frame[..]);
         assert!(!stack.raw_socket(h_any).can_recv());
@@ -1035,14 +988,7 @@ mod test {
         // A stack-handled ethertype skips the filtered socket, and the wildcard
         // socket gets a copy while the original is handed back.
         let frame = eth_frame(EthernetProtocol::Arp, b"arp?");
-        let iface = stack.ifaces.get(iface_a.0);
-        let res = stack.inner.process_raw_ethernet(
-            iface,
-            &mut stack.sockets.raw,
-            EthernetProtocol::Arp,
-            true,
-            buf_from(&frame),
-        );
+        let res = stack.process_raw_ethernet(iface_a, EthernetProtocol::Arp, true, buf_from(&frame));
         assert_eq!(&*res.unwrap(), &frame[..]);
         assert!(!stack.raw_socket(h_custom).can_recv());
         assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &frame[..]);

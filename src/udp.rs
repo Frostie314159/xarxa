@@ -28,7 +28,7 @@ use crate::buf::PacketBuf;
 use crate::icmp_error::IcmpError;
 use crate::meta::PacketMeta;
 use crate::slab::Slab;
-use crate::stack::{IfaceState, StackInner, TxContext, addr_score, alloc_ephemeral_port};
+use crate::stack::{IfaceHandle, Stack, TxContext, addr_score, alloc_ephemeral_port};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
 #[cfg(feature = "ipv4")]
@@ -800,7 +800,7 @@ impl UdpSocket<'_> {
     }
 }
 
-impl StackInner {
+impl Stack {
     /// Process an ingress UDP packet: validate it and queue it on the first matching
     /// socket.
     ///
@@ -809,8 +809,7 @@ impl StackInner {
     /// `recv` can parse the addresses back out of it.
     pub(crate) fn process_udp(
         &mut self,
-        iface: &mut IfaceState,
-        sockets: &mut Slab<UdpSocketState>,
+        iface: IfaceHandle,
         src_addr: IpAddress,
         dst_addr: IpAddress,
         ip_header_len: usize,
@@ -841,7 +840,7 @@ impl StackInner {
 
         // Sockets bound to a specific address also accept broadcast/multicast traffic
         // on their port.
-        let dst_is_bcast = iface.is_broadcast(&dst_addr) || dst_addr.is_multicast();
+        let dst_is_bcast = self.ifaces.get(iface.0).is_broadcast(&dst_addr) || dst_addr.is_multicast();
 
         // Linear scan, most specific match wins: every candidate whose
         // specified tuple parts all match is scored by how specific those parts
@@ -849,7 +848,7 @@ impl StackInner {
         // per-version wildcards beat wildcards. Ties (only possible between
         // sockets specific in *different* parts) go to the earliest socket.
         let mut best: Option<(usize, u8)> = None;
-        for (index, socket) in sockets.iter() {
+        for (index, socket) in self.sockets.udp.iter() {
             if let Some(score) = socket.match_score(&src_addr, src_port, &dst_addr, dst_port, dst_is_bcast)
                 && best.is_none_or(|(_, best_score)| score > best_score)
             {
@@ -858,7 +857,7 @@ impl StackInner {
         }
 
         if let Some((index, _)) = best {
-            let socket = sockets.get_mut(index);
+            let socket = self.sockets.udp.get_mut(index);
             trace!(
                 "udp:{}: receiving {} octets from {}:{}",
                 socket.local, payload_len, src_addr, src_port
@@ -1015,9 +1014,8 @@ mod test {
     fn deliver_to(stack: &mut Stack, src_addr: Ipv4Address, src_port: u16, dst_addr: Ipv4Address, payload: &[u8]) {
         let mut buf = queued_packet_from(src_addr, src_port, dst_addr, payload);
         buf.pull_front(IPV4_HEADER_LEN);
-        stack.inner.process_udp(
-            stack.ifaces.get_mut(0),
-            &mut stack.sockets.udp,
+        stack.process_udp(
+            IfaceHandle(0),
             src_addr.into(),
             dst_addr.into(),
             IPV4_HEADER_LEN,
