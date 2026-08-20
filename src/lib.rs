@@ -23,6 +23,8 @@ mod fmt;
 mod macros;
 
 pub mod buf;
+#[cfg(feature = "dns")]
+pub mod dns;
 #[cfg(feature = "icmp-errors")]
 mod icmp_error;
 pub mod iface;
@@ -47,6 +49,8 @@ mod waker;
 pub mod wire;
 
 pub use buf::{PACKET_BUF_SIZE, PacketBuf};
+#[cfg(feature = "dns")]
+pub use dns::{DnsClient, DnsQueryHandle};
 #[cfg(feature = "icmp-errors")]
 pub use icmp_error::IcmpError;
 pub use meta::PacketMeta;

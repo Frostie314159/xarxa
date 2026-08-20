@@ -32,6 +32,8 @@ mod field {
 
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 mod arp;
+#[cfg(feature = "dns")]
+pub mod dns;
 mod ethernet;
 #[cfg(feature = "ipv4")]
 mod icmpv4;
@@ -138,6 +140,12 @@ pub use self::tcp::{
 
 #[cfg(feature = "udp")]
 pub use self::udp::{HEADER_LEN as UDP_HEADER_LEN, Packet as UdpPacket};
+
+#[cfg(feature = "dns")]
+pub use self::dns::{
+    Flags as DnsFlags, HEADER_LEN as DNS_HEADER_LEN, Opcode as DnsOpcode, Packet as DnsPacket, Question as DnsQuestion,
+    Rcode as DnsRcode, Record as DnsRecord, RecordData as DnsRecordData, Type as DnsType,
+};
 
 /// Parsing a packet failed.
 ///

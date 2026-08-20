@@ -292,6 +292,11 @@ impl RecvPacket {
     pub fn payload(&self) -> &[u8] {
         &self.buf[self.payload.clone()]
     }
+
+    /// The UDP payload, mutable.
+    pub fn payload_mut(&mut self) -> &mut [u8] {
+        &mut self.buf[self.payload.clone()]
+    }
 }
 
 impl Deref for RecvPacket {

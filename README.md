@@ -107,6 +107,9 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Delayed ACK (defaults to enabled, can be turned off)
   - Zero-window probes
   - TCP Timestamps (feature `tcp-timestamps`)
+- DNS client (feature `dns`)
+  - Multiple servers, retransmission with backoff.
+  - Multicast DNS for `.local` names (feature `mdns`)
 - Packet metadata
   - Support for hardware timestamping on both RX and TX. Allows implementing protocols like PTP, NTP. (feature `packetmeta-timestamp`)
   - Opaque ID for correlating packets through the stack. (feature `packetmeta-id`)
@@ -115,7 +118,6 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 
 All of the below is planned. Please open an issue or reach out on [the Matrix chat](https://matrix.to/#/#xarxa:matrix.org) if you want to work on one of these so we don't duplicate work.
 
-- DNS/mDNS
 - DHCP client
 - DHCP server
 - IPv6 SLAAC

@@ -18,6 +18,8 @@ features = [
     "udp",
     "tcp",
     "tcp-listener",
+    "dns",
+    "mdns",
     "tcp-reno",
     "tcp-timestamps",
     "packetmeta-timestamp",
@@ -37,6 +39,7 @@ default = [
     "udp",
     "tcp",
     "tcp-listener",
+    "dns",
 ]
 ## Enable functionality that requires the Rust standard library: the
 ## `TunTapInterface` device, `iface::wait`, and `Instant::now()`.
@@ -63,6 +66,10 @@ udp = []
 tcp = []
 ## TCP listeners, for accepting incoming connections.
 tcp-listener = ["tcp"]
+## DNS client.
+dns = ["udp"]
+## Resolve `.local` names with multicast DNS in the DNS client.
+mdns = ["dns"]
 ## Send and receive the TCP timestamp option (RFC 7323).
 tcp-timestamps = ["tcp"]
 ## Automatically reply to pings (ICMP echo requests).
@@ -103,6 +110,7 @@ packet-log = []
 document-features = "0.2.11"
 bitflags = { version = "2", default-features = false }
 byteorder = { version = "1", default-features = false }
+heapless = { version = "0.9", default-features = false }
 libc = { version = "0.2", optional = true }
 defmt = { version = "1", optional = true, features = ["ip_in_core"] }
 log = { version = "0.4", optional = true }
@@ -122,6 +130,10 @@ required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6
 [[example]]
 name = "tcp_client"
 required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "tcp"]
+
+[[example]]
+name = "dns"
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "dns"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
