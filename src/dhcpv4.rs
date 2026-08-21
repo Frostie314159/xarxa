@@ -422,7 +422,7 @@ impl Client {
     }
 }
 
-impl IfaceState {
+impl IfaceState<'_> {
     /// Process a DHCP packet received on this interface from `src_ip`. `payload` is
     /// the UDP payload, the ports have already been checked by the caller.
     pub(crate) fn dhcpv4_process(&mut self, inner: &mut StackInner, src_ip: Ipv4Address, payload: &mut [u8]) {
@@ -767,16 +767,16 @@ mod test {
     const IFACE: IfaceHandle = IfaceHandle(0);
 
     /// A stack with one Ethernet interface, no addresses, DHCP on.
-    fn test_stack() -> (Stack, Queue, Sent) {
+    fn test_stack() -> (Stack<'static>, Queue, Sent) {
         let rx = Rc::new(RefCell::new(VecDeque::new()));
         let tx = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(1);
         let handle = stack
-            .add_iface(
-                Box::new(TestDevice {
+            .add_iface_borrowed(
+                Box::leak(Box::new(TestDevice {
                     rx: rx.clone(),
                     tx: tx.clone(),
-                }),
+                })),
                 HardwareAddress::Ethernet(OUR_HW),
             )
             .unwrap();
@@ -918,11 +918,11 @@ mod test {
 
     /// Drive the client to BOUND: DISCOVER, OFFER, REQUEST, ACK. Returns the stack
     /// with the lease applied at `at(2)`.
-    fn bound_stack() -> (Stack, Queue, Sent) {
+    fn bound_stack() -> (Stack<'static>, Queue, Sent) {
         bound_stack_with(DhcpConfig::default())
     }
 
-    fn bound_stack_with(config: DhcpConfig) -> (Stack, Queue, Sent) {
+    fn bound_stack_with(config: DhcpConfig) -> (Stack<'static>, Queue, Sent) {
         let (mut stack, rx, tx) = test_stack();
         stack.iface(IFACE).set_dhcpv4(Some(config));
 

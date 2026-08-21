@@ -364,7 +364,7 @@ fn from_link_prefix(link_prefix: &Ipv6Cidr, ethernet_addr: crate::wire::Ethernet
     Some(Ipv6Cidr::new(Ipv6Address::from_octets(bytes), 64))
 }
 
-impl IfaceState {
+impl IfaceState<'_> {
     /// Process a router advertisement that passed the NDISC validity checks.
     pub(crate) fn slaac_process_advertisement(
         &mut self,

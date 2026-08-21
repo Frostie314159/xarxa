@@ -357,13 +357,13 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
 ///
 /// [`Stack`]: crate::Stack
 /// [`Stack::udp_socket`]: crate::Stack::udp_socket
-pub struct UdpSocket<'a> {
+pub struct UdpSocket<'a, 'd> {
     pub(crate) sockets: &'a mut Slab<UdpSocketState, UDP_SOCKET_COUNT>,
     pub(crate) index: usize,
-    pub(crate) tx: TxContext<'a>,
+    pub(crate) tx: TxContext<'a, 'd>,
 }
 
-impl UdpSocket<'_> {
+impl UdpSocket<'_, '_> {
     /// This socket's state in the slab.
     #[inline]
     fn inner(&self) -> &UdpSocketState {
@@ -809,7 +809,7 @@ impl UdpSocket<'_> {
     }
 }
 
-impl Stack {
+impl Stack<'_> {
     /// Process an ingress UDP packet: validate it and queue it on the first matching
     /// socket.
     ///
@@ -941,7 +941,7 @@ mod test {
     use crate::stack::Stack;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
-    fn stack_with_socket() -> (Stack, UdpHandle) {
+    fn stack_with_socket() -> (Stack<'static>, UdpHandle) {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack.add_udp_socket().unwrap();
         (stack, handle)
@@ -978,9 +978,11 @@ mod test {
 
     /// A stack with one interface owning `LOCAL_ADDR`, so that binds with a
     /// specified remote can resolve their local address.
-    fn stack_with_iface() -> Stack {
+    fn stack_with_iface() -> Stack<'static> {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_iface(Box::new(TestingDevice), HardwareAddress::Ip).unwrap();
+        let handle = stack
+            .add_iface_borrowed(Box::leak(Box::new(TestingDevice)), HardwareAddress::Ip)
+            .unwrap();
         stack
             .iface(handle)
             .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
@@ -1397,7 +1399,7 @@ mod test {
         let sent = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let iface = stack
-            .add_iface(Box::new(MetaDevice(sent.clone())), HardwareAddress::Ip)
+            .add_iface_borrowed(Box::leak(Box::new(MetaDevice(sent.clone()))), HardwareAddress::Ip)
             .unwrap();
         stack
             .iface(iface)

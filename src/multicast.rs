@@ -154,7 +154,7 @@ impl core::fmt::Display for MulticastError {
 
 impl core::error::Error for MulticastError {}
 
-impl Iface<'_> {
+impl Iface<'_, '_> {
     /// Join a multicast group.
     ///
     /// The stack accepts packets sent to the group right away, and reports the
@@ -189,7 +189,7 @@ impl Iface<'_> {
     }
 }
 
-impl IfaceState {
+impl IfaceState<'_> {
     /// Add an address to a list of subscribed multicast IP addresses.
     pub(crate) fn join_multicast_group<T: Into<IpAddress>>(&mut self, addr: T) -> Result<(), MulticastError> {
         let addr = addr.into();
@@ -725,17 +725,17 @@ mod test {
     /// A stack with one interface of the given medium, owning [`OUR_V4`]/24 and
     /// [`OUR_LL`]/64 (plus, on Ethernet, the automatic link-local address, whose
     /// solicited-node group is the same as [`OUR_LL`]'s).
-    fn test_stack(medium: Medium) -> (Stack, Queue, Sent) {
+    fn test_stack(medium: Medium) -> (Stack<'static>, Queue, Sent) {
         let rx = Rc::new(RefCell::new(VecDeque::new()));
         let tx = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack
-            .add_iface(
-                Box::new(TestDevice {
+            .add_iface_borrowed(
+                Box::leak(Box::new(TestDevice {
                     medium,
                     rx: rx.clone(),
                     tx: tx.clone(),
-                }),
+                })),
                 match medium {
                     Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
                     Medium::Ip => HardwareAddress::Ip,

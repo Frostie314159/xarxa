@@ -211,12 +211,12 @@ fn parse_ip_headers(buf: &mut [u8]) -> Option<(IpAddress, IpProtocol)> {
 ///
 /// [`Stack`]: crate::Stack
 /// [`Stack::raw_socket`]: crate::Stack::raw_socket
-pub struct RawSocket<'a> {
+pub struct RawSocket<'a, 'd> {
     pub(crate) state: &'a mut RawSocketState,
-    pub(crate) tx: TxContext<'a>,
+    pub(crate) tx: TxContext<'a, 'd>,
 }
 
-impl RawSocket<'_> {
+impl RawSocket<'_, '_> {
     /// Return the mode the socket is bound to, or `None` if it is unbound.
     #[inline]
     pub fn mode(&self) -> Option<RawMode> {
@@ -495,7 +495,7 @@ impl RawSocket<'_> {
     }
 }
 
-impl Stack {
+impl Stack<'_> {
     /// Offer an ingress Ethernet frame to the raw sockets. `buf` is the whole
     /// frame, Ethernet header included.
     ///
@@ -634,8 +634,8 @@ mod test {
     ) -> (IfaceHandle, Rc<RefCell<Vec<Vec<u8>>>>) {
         let tx = Rc::new(RefCell::new(Vec::new()));
         let handle = stack
-            .add_iface(
-                Box::new(TestDevice { medium, tx: tx.clone() }),
+            .add_iface_borrowed(
+                Box::leak(Box::new(TestDevice { medium, tx: tx.clone() })),
                 match medium {
                     Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
                     Medium::Ip => HardwareAddress::Ip,
@@ -920,8 +920,8 @@ mod test {
         let sent = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let iface = stack
-            .add_iface(
-                Box::new(MetaDevice(sent.clone())),
+            .add_iface_borrowed(
+                Box::leak(Box::new(MetaDevice(sent.clone()))),
                 HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
             )
             .unwrap();

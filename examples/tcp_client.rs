@@ -49,13 +49,18 @@ fn main() {
         .unwrap()
         .into();
 
-    let device = TunTapInterface::new(name, medium).unwrap();
+    // The device and the socket buffers are lent to the stack by reference
+    // rather than boxed, as a no-alloc program would. They must be declared
+    // before the stack, which holds them until it is dropped.
+    let mut device = TunTapInterface::new(name, medium).unwrap();
     let fd = device.as_raw_fd();
+    let mut rx_buffer = [0u8; 4096];
+    let mut tx_buffer = [0u8; 4096];
 
     let mut stack = Stack::new(random_seed());
     let iface = stack
-        .add_iface(
-            Box::new(device),
+        .add_iface_borrowed(
+            &mut device,
             match medium {
                 Medium::Ip => HardwareAddress::Ip,
                 Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])),
@@ -77,7 +82,7 @@ fn main() {
         .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100), iface)
         .unwrap();
 
-    let tcp_handle = stack.add_tcp_socket(4096, 4096).unwrap();
+    let tcp_handle = stack.add_tcp_socket_with_bufs(&mut rx_buffer, &mut tx_buffer).unwrap();
 
     // Local port 0: the stack allocates an ephemeral port.
     let mut socket = stack.tcp_socket(tcp_handle);

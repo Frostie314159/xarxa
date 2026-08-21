@@ -1,4 +1,5 @@
-//! The stack's storage: growable containers with a compile-time bound.
+//! The stack's storage: growable containers with a compile-time bound, and the
+//! lent-or-boxed wrapper for what the user gives the stack.
 //!
 //! This is where the `alloc` feature is decided. With it, [`Vec`] and [`Slab`]
 //! grow on the heap and their bound `N` is ignored; without it they hold at most
@@ -18,6 +19,7 @@ use core::fmt;
 
 mod bounded_deque;
 mod bounded_vec;
+mod maybe_box;
 mod slab;
 mod vec;
 
@@ -26,6 +28,8 @@ mod vec;
 pub(crate) use bounded_deque::BoundedDeque;
 #[allow(unused_imports)]
 pub(crate) use bounded_vec::BoundedVec;
+#[allow(unused_imports)]
+pub(crate) use maybe_box::MaybeBox;
 #[allow(unused_imports)]
 pub(crate) use slab::Slab;
 #[allow(unused_imports)]

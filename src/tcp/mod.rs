@@ -150,7 +150,7 @@ impl Display for RecvError {
 impl core::error::Error for RecvError {}
 
 /// A TCP socket ring buffer.
-pub(crate) type SocketBuffer = RingBuffer<u8>;
+pub(crate) type SocketBuffer<'d> = RingBuffer<'d, u8>;
 
 /// The state of a TCP socket, according to [RFC 793].
 ///
@@ -485,14 +485,14 @@ impl Display for Tuple {
 /// The state of a TCP socket, stored in the stack's socket slab. The public API
 /// lives on [`TcpSocket`], the view of one of these borrowed from the stack.
 #[derive(Debug)]
-pub(crate) struct TcpSocketState {
+pub(crate) struct TcpSocketState<'d> {
     state: State,
     timer: Timer,
     rtte: RttEstimator,
     assembler: Assembler,
-    rx_buffer: SocketBuffer,
+    rx_buffer: SocketBuffer<'d>,
     rx_fin_received: bool,
-    tx_buffer: SocketBuffer,
+    tx_buffer: SocketBuffer<'d>,
     /// Interval after which, if no inbound packets are received, the connection is aborted.
     timeout: Option<Duration>,
     /// Interval at which keep-alive packets will be sent.
@@ -597,10 +597,10 @@ const DEFAULT_MSS: usize = 536;
 /// timestamps) so that every segment carries some payload.
 const MIN_REMOTE_MSS: usize = 48;
 
-impl TcpSocketState {
+impl<'d> TcpSocketState<'d> {
     #[allow(unused_comparisons)] // small usize platforms always pass rx_capacity check
     /// Create a socket using the given buffers.
-    pub(crate) fn new(rx_buffer: SocketBuffer, tx_buffer: SocketBuffer) -> TcpSocketState {
+    pub(crate) fn new(rx_buffer: SocketBuffer<'d>, tx_buffer: SocketBuffer<'d>) -> TcpSocketState<'d> {
         let rx_capacity = rx_buffer.capacity();
 
         // From RFC 1323:
@@ -1681,9 +1681,9 @@ impl TcpSocketState {
         }
     }
 
-    pub(crate) fn dispatch<F, E>(&mut self, cx: &mut TxContext<'_>, emit: F) -> Result<(), E>
+    pub(crate) fn dispatch<F, E>(&mut self, cx: &mut TxContext<'_, '_>, emit: F) -> Result<(), E>
     where
-        F: FnOnce(&mut TxContext<'_>, (Option<EgressRoute>, IpAddress, IpAddress, u8, TcpRepr)) -> Result<(), E>,
+        F: FnOnce(&mut TxContext<'_, '_>, (Option<EgressRoute>, IpAddress, IpAddress, u8, TcpRepr)) -> Result<(), E>,
     {
         if self.tuple.is_none() {
             return Ok(());
@@ -2140,7 +2140,7 @@ pub(crate) fn process_icmp_error(
 /// Each emitted segment goes down the stack's egress path
 /// ([`TxContext::transmit_ip`]): routing, IP header construction, and neighbor
 /// resolution.
-pub(crate) fn flush(state: &mut TcpSocketState, cx: &mut TxContext<'_>) {
+pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) {
     loop {
         let mut emitted = false;
         let result: Result<(), core::convert::Infallible> =
@@ -2179,22 +2179,22 @@ pub(crate) fn flush(state: &mut TcpSocketState, cx: &mut TxContext<'_>) {
 ///
 /// [`Stack`]: crate::Stack
 /// [`Stack::tcp_socket`]: crate::Stack::tcp_socket
-pub struct TcpSocket<'a> {
-    pub(crate) sockets: &'a mut Slab<TcpSocketState, TCP_SOCKET_COUNT>,
+pub struct TcpSocket<'a, 'd> {
+    pub(crate) sockets: &'a mut Slab<TcpSocketState<'d>, TCP_SOCKET_COUNT>,
     pub(crate) index: usize,
-    pub(crate) tx: TxContext<'a>,
+    pub(crate) tx: TxContext<'a, 'd>,
 }
 
-impl TcpSocket<'_> {
+impl<'d> TcpSocket<'_, 'd> {
     /// This socket's state in the slab.
     #[inline]
-    fn inner(&self) -> &TcpSocketState {
+    fn inner(&self) -> &TcpSocketState<'d> {
         self.sockets.get(self.index)
     }
 
     /// Mutable variant of [`inner`](Self::inner).
     #[inline]
-    fn inner_mut(&mut self) -> &mut TcpSocketState {
+    fn inner_mut(&mut self) -> &mut TcpSocketState<'d> {
         self.sockets.get_mut(self.index)
     }
 
@@ -2608,7 +2608,7 @@ impl TcpSocket<'_> {
 
     fn send_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, SendError>
     where
-        F: FnOnce(&'b mut SocketBuffer) -> (usize, R),
+        F: FnOnce(&'b mut SocketBuffer<'d>) -> (usize, R),
     {
         if !self.may_send() {
             return Err(SendError::InvalidState);
@@ -2682,7 +2682,7 @@ impl TcpSocket<'_> {
 
     fn recv_impl<'b, F, R>(&'b mut self, f: F) -> Result<R, RecvError>
     where
-        F: FnOnce(&'b mut SocketBuffer) -> (usize, R),
+        F: FnOnce(&'b mut SocketBuffer<'d>) -> (usize, R),
     {
         self.recv_error_check()?;
 
@@ -2772,7 +2772,7 @@ impl TcpSocket<'_> {
     }
 }
 
-impl fmt::Write for TcpSocket<'_> {
+impl fmt::Write for TcpSocket<'_, '_> {
     fn write_str(&mut self, slice: &str) -> fmt::Result {
         let slice = slice.as_bytes();
         if self.send_slice(slice) == Ok(slice.len()) {
@@ -2880,12 +2880,12 @@ mod test {
     }
 
     struct TestSocket {
-        sockets: Slab<TcpSocketState, TCP_SOCKET_COUNT>,
-        stack: Stack,
+        sockets: Slab<TcpSocketState<'static>, TCP_SOCKET_COUNT>,
+        stack: Stack<'static>,
     }
 
     impl TestSocket {
-        fn view(&mut self) -> TcpSocket<'_> {
+        fn view(&mut self) -> TcpSocket<'_, 'static> {
             TcpSocket {
                 sockets: &mut self.sockets,
                 index: 0,
@@ -2895,7 +2895,7 @@ mod test {
     }
 
     impl Deref for TestSocket {
-        type Target = TcpSocketState;
+        type Target = TcpSocketState<'static>;
         fn deref(&self) -> &Self::Target {
             self.sockets.get(0)
         }
@@ -3035,9 +3035,11 @@ mod test {
     }
 
     /// A stack with one interface owning `LOCAL_ADDR`.
-    fn test_stack() -> Stack {
+    fn test_stack() -> Stack<'static> {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_iface(Box::new(TestingDevice), HardwareAddress::Ip).unwrap();
+        let handle = stack
+            .add_iface_borrowed(Box::leak(Box::new(TestingDevice)), HardwareAddress::Ip)
+            .unwrap();
         stack
             .iface(handle)
             .set_ip_addrs([
@@ -3051,8 +3053,8 @@ mod test {
     fn socket_with_buffer_sizes(tx_len: usize, rx_len: usize) -> TestSocket {
         let stack = test_stack();
 
-        let rx_buffer = SocketBuffer::new(vec![0; rx_len]);
-        let tx_buffer = SocketBuffer::new(vec![0; tx_len]);
+        let rx_buffer = SocketBuffer::new(vec![0; rx_len].leak());
+        let tx_buffer = SocketBuffer::new(vec![0; tx_len].leak());
         let mut socket = TcpSocketState::new(rx_buffer, tx_buffer);
         socket.ack_delay = None;
         let mut sockets = Slab::new();
@@ -3209,7 +3211,7 @@ mod test {
 
     /// A stack with a listener on `LOCAL_PORT` (any address).
     #[cfg(feature = "tcp-listener")]
-    fn listener_stack() -> (Stack, TcpListenerHandle) {
+    fn listener_stack() -> (Stack<'static>, TcpListenerHandle) {
         let mut stack = test_stack();
         let h = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(h).listen(LOCAL_PORT).unwrap();
@@ -3283,9 +3285,17 @@ mod test {
         assert!(stack.tcp_listener(h).can_accept());
 
         // Accept allocates the actual socket, in SYN-RECEIVED.
-        let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
+        let sh = stack
+            .tcp_listener(h)
+            .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
         assert!(!stack.tcp_listener(h).can_accept());
-        assert!(stack.tcp_listener(h).accept(64, 64).is_none());
+        assert!(
+            stack
+                .tcp_listener(h)
+                .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+                .is_none()
+        );
         assert_eq!(stack.tcp_socket(sh).state(), State::SynReceived);
         assert_eq!(stack.tcp_socket(sh).local_endpoint(), Some(LOCAL_END));
         assert_eq!(stack.tcp_socket(sh).remote_endpoint(), Some(REMOTE_END));
@@ -3340,9 +3350,19 @@ mod test {
             ));
         }
         for _ in 0..TCP_LISTENER_BACKLOG {
-            assert!(stack.tcp_listener(h).accept(64, 64).is_some());
+            assert!(
+                stack
+                    .tcp_listener(h)
+                    .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+                    .is_some()
+            );
         }
-        assert!(stack.tcp_listener(h).accept(64, 64).is_none());
+        assert!(
+            stack
+                .tcp_listener(h)
+                .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+                .is_none()
+        );
     }
 
     #[cfg(feature = "tcp-listener")]
@@ -3364,8 +3384,16 @@ mod test {
             }
         ));
 
-        let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
-        assert!(stack.tcp_listener(h).accept(64, 64).is_none());
+        let sh = stack
+            .tcp_listener(h)
+            .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        assert!(
+            stack
+                .tcp_listener(h)
+                .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+                .is_none()
+        );
         assert_eq!(stack.sockets.tcp.get(sh.0).remote_seq_no, REMOTE_SEQ + 101);
     }
 
@@ -3457,7 +3485,10 @@ mod test {
                     ..syn_repr()
                 }
             ));
-            let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
+            let sh = stack
+                .tcp_listener(h)
+                .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+                .unwrap();
             assert_eq!(stack.sockets.tcp.get(sh.0).remote_mss, effective);
         }
     }
@@ -3477,7 +3508,10 @@ mod test {
                     ..syn_repr()
                 }
             ));
-            let sh = stack.tcp_listener(h).accept(buffer_size, 64).unwrap();
+            let sh = stack
+                .tcp_listener(h)
+                .accept_with_bufs(vec![0; buffer_size].leak(), vec![0; 64].leak())
+                .unwrap();
             assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_scale, Some(7));
             assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_shift, shift);
 
@@ -3506,7 +3540,10 @@ mod test {
         // Without an offer from the remote, scaling is off entirely.
         let (mut stack, h) = listener_stack();
         assert!(listener_deliver(&mut stack, &syn_repr()));
-        let sh = stack.tcp_listener(h).accept(65536, 64).unwrap();
+        let sh = stack
+            .tcp_listener(h)
+            .accept_with_bufs(vec![0; 65536].leak(), vec![0; 64].leak())
+            .unwrap();
         assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_scale, None);
         assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_shift, 0);
         let mut s = TestSocket {
@@ -3865,8 +3902,12 @@ mod test {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let h1 = stack.add_tcp_socket(64, 64).unwrap();
-        let h2 = stack.add_tcp_socket(64, 64).unwrap();
+        let h1 = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        let h2 = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
 
         // Local port 0 allocates an ephemeral port. (The explicit local address
         // avoids needing an interface for source address selection.)
@@ -3890,10 +3931,18 @@ mod test {
         };
 
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let h1 = stack.add_tcp_socket(64, 64).unwrap();
-        let h2 = stack.add_tcp_socket(64, 64).unwrap();
-        let h3 = stack.add_tcp_socket(64, 64).unwrap();
-        let h4 = stack.add_tcp_socket(64, 64).unwrap();
+        let h1 = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        let h2 = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        let h3 = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        let h4 = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
 
         stack
             .tcp_socket(h1)
@@ -4641,7 +4690,7 @@ mod test {
         let mut s = socket_established();
         // Update our scaling parameters for a TCP with a scaled buffer.
         assert_eq!(s.rx_buffer.len(), 0);
-        s.rx_buffer = SocketBuffer::new(vec![0; 262143]);
+        s.rx_buffer = SocketBuffer::new(vec![0; 262143].leak());
         s.assembler = Assembler::new();
         s.remote_win_scale = Some(0);
         s.remote_last_win = 65535;
@@ -5228,7 +5277,7 @@ mod test {
         s.stack = Stack::new(0x1234_5678_dead_beef);
         let handle = s
             .stack
-            .add_iface(Box::new(SmallMtuDevice), HardwareAddress::Ip)
+            .add_iface_borrowed(Box::leak(Box::new(SmallMtuDevice)), HardwareAddress::Ip)
             .unwrap();
         s.stack
             .iface(handle)
@@ -7709,7 +7758,7 @@ mod test {
     #[test]
     fn test_zero_window_ack() {
         let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
         s.assembler = Assembler::new();
         send!(
             s,
@@ -7749,7 +7798,7 @@ mod test {
     #[test]
     fn test_zero_window_ack_not_rate_limited() {
         let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
         s.assembler = Assembler::new();
         send!(
             s,
@@ -7809,7 +7858,7 @@ mod test {
     #[test]
     fn test_zero_window_fin() {
         let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
         s.assembler = Assembler::new();
         s.ack_delay = None;
 
@@ -7860,7 +7909,7 @@ mod test {
     #[test]
     fn test_zero_window_ack_on_window_growth() {
         let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
         s.assembler = Assembler::new();
         send!(
             s,
@@ -8001,7 +8050,7 @@ mod test {
     #[test]
     fn test_announce_window_after_read() {
         let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
         s.assembler = Assembler::new();
         send!(
             s,
@@ -8742,7 +8791,7 @@ mod test {
     #[test]
     fn test_buffer_wraparound_rx() {
         let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
         s.assembler = Assembler::new();
         send!(
             s,
@@ -8778,7 +8827,7 @@ mod test {
         let mut s = socket_established();
         s.view().set_nagle_enabled(false);
 
-        s.tx_buffer = SocketBuffer::new(vec![b'.'; 9]);
+        s.tx_buffer = SocketBuffer::new(vec![b'.'; 9].leak());
         assert_eq!(s.view().send_slice(b"xxxyyy"), Ok(6));
         assert_eq!(s.tx_buffer.dequeue_many(3), &b"xxx"[..]);
         assert_eq!(s.tx_buffer.len(), 3);
@@ -9340,7 +9389,7 @@ mod test {
     #[test]
     fn test_doesnt_accept_wrong_port() {
         let mut s = socket_established();
-        s.rx_buffer = SocketBuffer::new(vec![0; 6]);
+        s.rx_buffer = SocketBuffer::new(vec![0; 6].leak());
         s.assembler = Assembler::new();
 
         let tcp_repr = TcpRepr {
@@ -9522,7 +9571,10 @@ mod test {
     fn accepted_socket(syn: &TcpRepr) -> TestSocket {
         let (mut stack, h) = listener_stack();
         assert!(listener_deliver(&mut stack, syn));
-        let sh = stack.tcp_listener(h).accept(64, 64).unwrap();
+        let sh = stack
+            .tcp_listener(h)
+            .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
         TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
@@ -9807,11 +9859,11 @@ mod stack_test {
         }
     }
 
-    fn stack() -> (Stack, Rc<RefCell<Queues>>) {
+    fn stack() -> (Stack<'static>, Rc<RefCell<Queues>>) {
         let queues = Rc::new(RefCell::new(Queues::default()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack
-            .add_iface(Box::new(QueueDevice(queues.clone())), HardwareAddress::Ip)
+            .add_iface_borrowed(Box::leak(Box::new(QueueDevice(queues.clone()))), HardwareAddress::Ip)
             .unwrap();
         stack
             .iface(handle)
@@ -9877,7 +9929,10 @@ mod stack_test {
 
         // Accept allocates the actual socket, and the next poll sends the
         // SYN|ACK, advertising the socket's actual receive window.
-        let h = stack.tcp_listener(lh).accept(64, 64).unwrap();
+        let h = stack
+            .tcp_listener(lh)
+            .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
         stack.tcp_socket(h).set_ack_delay(None);
         assert_eq!(stack.tcp_socket(h).state(), State::SynReceived);
         stack.poll(Instant::from_millis(0));
@@ -9986,7 +10041,10 @@ mod stack_test {
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(0));
-        let h = stack.tcp_listener(lh).accept(64, 64).unwrap();
+        let h = stack
+            .tcp_listener(lh)
+            .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
         stack.poll(Instant::from_millis(0));
         queues.borrow_mut().tx.pop_front().unwrap(); // the SYN|ACK
         queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
@@ -10023,7 +10081,9 @@ mod stack_test {
     #[test]
     fn test_stack_retransmission_timer() {
         let (mut stack, queues) = stack();
-        let h = stack.add_tcp_socket(64, 64).unwrap();
+        let h = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
         stack.tcp_socket(h).set_ack_delay(None);
         stack
             .tcp_socket(h)

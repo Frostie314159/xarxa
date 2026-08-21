@@ -75,7 +75,9 @@ done
 
 run cargo test
 # Once more without `alloc`: the bounded containers and their full-table paths.
-run cargo test --no-default-features \
+# Unit tests only: the examples and doc tests are written against the owned
+# `Box`/`Vec` storage that only exists with `alloc`.
+run cargo test --lib --no-default-features \
   --features "medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp,tcp-listener,std,log,async,icmp-errors,icmp-ping-reply,multicast,slaac,dhcpv4,dns,mdns,packetmeta-timestamp,tcp-timestamps"
 # Once more with packet metadata: the default feature set leaves `PacketMeta`
 # zero-sized, so the tests that exercise it are gated on the feature.
@@ -83,9 +85,10 @@ run cargo test --features packetmeta-timestamp
 # Once more with TCP timestamps: without the feature no segment carries the
 # option, so the tests that expect one are gated on it.
 run cargo test --features tcp-timestamps
-# Once more with each congestion control algorithm: without either feature TCP
-# does no congestion control, so the tests that exercise a congestion window are
-# gated on `tcp-reno`.
-run cargo test --features tcp-reno
-run cargo test --features tcp-cubic
+# Once more with Reno congestion control: the default set has CUBIC, and the
+# two are mutually exclusive, so this is the default set with one swapped for
+# the other. (Without either feature TCP does no congestion control at all, and
+# the tests that exercise a congestion window are gated on `tcp-reno`.)
+run cargo test --no-default-features \
+  --features "alloc,std,log,async,icmp-ping-reply,icmp-errors,medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp,tcp-listener,dhcpv4,slaac,dns,mdns,multicast,tcp-reno,tcp-timestamps,packetmeta-timestamp"
 run cargo build --examples

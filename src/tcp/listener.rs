@@ -1,7 +1,5 @@
 //! TCP listeners.
 
-use alloc::vec;
-
 #[cfg(feature = "tcp-timestamps")]
 use super::TcpTimestampRepr;
 use super::{
@@ -203,14 +201,14 @@ pub(crate) fn process_listeners(
 /// and constructs a full [`TcpSocket`](crate::tcp::TcpSocket) for it.
 ///
 /// Connection attempts (SYN packets) are not answered (with a SYN|ACK packet) until you accept them.
-pub struct TcpListener<'a> {
+pub struct TcpListener<'a, 'd> {
     pub(crate) listeners: &'a mut Slab<TcpListenerState, TCP_LISTENER_COUNT>,
     pub(crate) index: usize,
-    pub(crate) tcp: &'a mut Slab<TcpSocketState, TCP_SOCKET_COUNT>,
+    pub(crate) tcp: &'a mut Slab<TcpSocketState<'d>, TCP_SOCKET_COUNT>,
     pub(crate) rand: &'a mut Rand,
 }
 
-impl TcpListener<'_> {
+impl<'d> TcpListener<'_, 'd> {
     /// This listener's state in the slab.
     #[inline]
     fn inner(&self) -> &TcpListenerState {
@@ -300,15 +298,48 @@ impl TcpListener<'_> {
         !self.inner().queue.is_empty()
     }
 
-    /// Accept a queued connection attempt, allocating the actual socket for it,
-    /// with receive and transmit buffers of the given capacities.
+    /// Accept a queued connection attempt, allocating the socket for it with
+    /// receive and transmit buffers of the given capacities.
+    ///
+    /// The buffers are allocated on the heap, so this needs the `alloc` feature.
+    /// Without it, or to use your own buffers, see
+    /// [`accept_with_bufs`](Self::accept_with_bufs).
     ///
     /// The new socket starts in the SYN-RECEIVED state and is added to the stack.
     ///
     /// Returns `None` if no connection attempt is queued, or if the stack has no
     /// room for another TCP socket. In the second case the attempt stays queued
     /// and `accept` can be retried after removing a socket.
+    #[cfg(feature = "alloc")]
     pub fn accept(&mut self, rx_capacity: usize, tx_capacity: usize) -> Option<TcpHandle> {
+        if self.tcp.is_full() || !self.can_accept() {
+            return None;
+        }
+        self.accept_inner(
+            SocketBuffer::new(alloc::vec![0; rx_capacity]),
+            SocketBuffer::new(alloc::vec![0; tx_capacity]),
+        )
+    }
+
+    /// Accept a queued connection attempt, creating the socket for it with the
+    /// given receive and transmit buffers.
+    ///
+    /// The buffers are lent to the stack. It holds them until it is dropped or
+    /// the socket is removed, so they must be declared before the stack, or be
+    /// `'static`.
+    ///
+    /// The new socket starts in the SYN-RECEIVED state and is added to the stack.
+    ///
+    /// Returns `None` if no connection attempt is queued, or if the stack has no
+    /// room for another TCP socket. In the second case the attempt stays queued
+    /// and `accept_with_bufs` can be retried after removing a socket. The buffers
+    /// are not handed back in either case, so check
+    /// [`can_accept`](Self::can_accept) first.
+    pub fn accept_with_bufs(&mut self, rx_buffer: &'d mut [u8], tx_buffer: &'d mut [u8]) -> Option<TcpHandle> {
+        self.accept_inner(SocketBuffer::new(rx_buffer), SocketBuffer::new(tx_buffer))
+    }
+
+    fn accept_inner(&mut self, rx_buffer: SocketBuffer<'d>, tx_buffer: SocketBuffer<'d>) -> Option<TcpHandle> {
         if self.tcp.is_full() {
             // No room for the socket: leave the SYN queued, the caller can retry
             // after freeing one.
@@ -321,10 +352,7 @@ impl TcpListener<'_> {
         // The SYN-RECEIVED socket continuing the recorded SYN. This mirrors
         // what the SYN would have set up in a LISTEN-state socket: the SYN|ACK
         // itself is built by the socket's dispatch from this state.
-        let mut s = TcpSocketState::new(
-            SocketBuffer::new(vec![0; rx_capacity]),
-            SocketBuffer::new(vec![0; tx_capacity]),
-        );
+        let mut s = TcpSocketState::new(rx_buffer, tx_buffer);
         s.state = State::SynReceived;
         s.tuple = Some(syn.tuple);
         s.local_seq_no = TcpSocketState::random_seq_no(self.rand);

@@ -1,9 +1,5 @@
 //! The network stack.
 
-use alloc::boxed::Box;
-#[cfg(feature = "tcp")]
-use alloc::vec;
-
 use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
 #[cfg(feature = "raw")]
 use crate::config::RAW_SOCKET_COUNT;
@@ -23,7 +19,7 @@ use crate::rand::Rand;
 #[cfg(feature = "raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketState};
 use crate::route::Routes;
-use crate::storage::{Full, Slab, Vec};
+use crate::storage::{Full, MaybeBox, Slab, Vec};
 #[cfg(feature = "tcp")]
 use crate::tcp::{SocketBuffer, TcpHandle, TcpRepr, TcpSocket, TcpSocketState};
 #[cfg(feature = "tcp-listener")]
@@ -39,23 +35,26 @@ use crate::wire::*;
 pub struct IfaceHandle(pub(crate) usize);
 
 /// A network stack.
-pub struct Stack {
+pub struct Stack<'d> {
     pub(crate) inner: StackInner,
-    pub(crate) ifaces: Slab<IfaceState, IFACE_COUNT>,
+    pub(crate) ifaces: Slab<IfaceState<'d>, IFACE_COUNT>,
     #[allow(unused)]
-    pub(crate) sockets: Sockets,
+    pub(crate) sockets: Sockets<'d>,
 }
 
 /// The stack's socket storage, one slab per socket type.
-pub(crate) struct Sockets {
+pub(crate) struct Sockets<'d> {
     #[cfg(feature = "udp")]
     pub(crate) udp: Slab<UdpSocketState, UDP_SOCKET_COUNT>,
     #[cfg(feature = "raw")]
     pub(crate) raw: Slab<RawSocketState, RAW_SOCKET_COUNT>,
     #[cfg(feature = "tcp")]
-    pub(crate) tcp: Slab<TcpSocketState, TCP_SOCKET_COUNT>,
+    pub(crate) tcp: Slab<TcpSocketState<'d>, TCP_SOCKET_COUNT>,
     #[cfg(feature = "tcp-listener")]
     pub(crate) tcp_listeners: Slab<TcpListenerState, TCP_LISTENER_COUNT>,
+    /// Only TCP sockets hold lent storage; without them `'d` is unused.
+    #[cfg(not(feature = "tcp"))]
+    _lent: core::marker::PhantomData<&'d mut ()>,
 }
 
 /// Where an interface address came from.
@@ -116,9 +115,9 @@ fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAddr> {
 }
 
 /// An interface added to the stack, with its configuration.
-pub(crate) struct IfaceState {
+pub(crate) struct IfaceState<'d> {
     pub(crate) handle: IfaceHandle,
-    dev: Box<dyn Interface>,
+    dev: MaybeBox<'d, dyn Interface + 'd>,
     pub(crate) hardware_addr: HardwareAddress,
     pub(crate) ip_addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT>,
     /// Bumped whenever the interface's addresses or routes change.
@@ -134,21 +133,21 @@ pub(crate) struct IfaceState {
 }
 
 /// An interface borrowed from a [`Stack`], returned by [`Stack::iface`].
-pub struct Iface<'a> {
+pub struct Iface<'a, 'd> {
     #[cfg_attr(not(feature = "medium-ethernet"), allow(dead_code))]
     inner: &'a mut StackInner,
-    ifaces: &'a mut Slab<IfaceState, IFACE_COUNT>,
+    ifaces: &'a mut Slab<IfaceState<'d>, IFACE_COUNT>,
     index: usize,
 }
 
-impl Iface<'_> {
+impl<'d> Iface<'_, 'd> {
     #[inline]
-    pub(crate) fn state(&self) -> &IfaceState {
+    pub(crate) fn state(&self) -> &IfaceState<'d> {
         self.ifaces.get(self.index)
     }
 
     #[inline]
-    pub(crate) fn state_mut(&mut self) -> &mut IfaceState {
+    pub(crate) fn state_mut(&mut self) -> &mut IfaceState<'d> {
         self.ifaces.get_mut(self.index)
     }
 
@@ -435,9 +434,9 @@ impl StackInner {
 /// Sockets hand fully-built L4 packets to [`TxContext::transmit_ip`]. Picking the
 /// egress interface, building the IP header and resolving the neighbor all happen
 /// in here, so socket code doesn't have to care about any of it.
-pub(crate) struct TxContext<'a> {
+pub(crate) struct TxContext<'a, 'd> {
     pub(crate) inner: &'a mut StackInner,
-    pub(crate) ifaces: &'a mut Slab<IfaceState, IFACE_COUNT>,
+    pub(crate) ifaces: &'a mut Slab<IfaceState<'d>, IFACE_COUNT>,
 }
 
 /// A complete egress routing decision for one destination, produced by
@@ -460,7 +459,7 @@ pub(crate) struct EgressRoute {
     pub(crate) ip_mtu: usize,
 }
 
-impl TxContext<'_> {
+impl TxContext<'_, '_> {
     /// The current time, as last set by [`Stack::poll`].
     #[cfg(feature = "tcp")]
     pub(crate) fn now(&self) -> Instant {
@@ -674,7 +673,7 @@ enum NeighborLookup {
     Pending { next_hop: IpAddress },
 }
 
-impl Stack {
+impl<'d> Stack<'d> {
     /// Create a network stack.
     ///
     /// `random_seed` seeds the stack's PRNG, which picks TCP initial sequence
@@ -701,11 +700,16 @@ impl Stack {
                 tcp: Slab::new(),
                 #[cfg(feature = "tcp-listener")]
                 tcp_listeners: Slab::new(),
+                #[cfg(not(feature = "tcp"))]
+                _lent: core::marker::PhantomData,
             },
         }
     }
 
     /// Add an interface to the stack, returning a handle to it.
+    ///
+    /// The stack owns the boxed device, so this needs the `alloc` feature.
+    /// Without alloc, use [`add_iface_borrowed`](Self::add_iface_borrowed).
     ///
     /// Configure the interface after adding it. At minimum, you will want to
     /// add an IP address to it.
@@ -730,9 +734,39 @@ impl Stack {
     /// Errors:
     /// - `Full` if the stack has no room for another interface. Only possible
     ///   without the `alloc` feature, where the `iface-count-N` feature sets the limit.
+    #[cfg(feature = "alloc")]
     pub fn add_iface(
         &mut self,
-        dev: Box<dyn Interface>,
+        dev: alloc::boxed::Box<dyn Interface + 'd>,
+        hardware_addr: HardwareAddress,
+    ) -> core::result::Result<IfaceHandle, Full> {
+        self.add_iface_inner(dev.into(), hardware_addr)
+    }
+
+    /// Add an interface to the stack, lending it the device, and returning a
+    /// handle to it.
+    ///
+    /// The stack holds the device until it is dropped or the interface is
+    /// removed, so the device must be declared before the stack, or be `'static`.
+    /// Otherwise this is [`add_iface`](Self::add_iface).
+    ///
+    /// # Panics
+    /// Panics if the hardware address is not of the kind the device's medium uses.
+    ///
+    /// Errors:
+    /// - `Full` if the stack has no room for another interface. Only possible
+    ///   without the `alloc` feature, where the `iface-count-N` feature sets the limit.
+    pub fn add_iface_borrowed(
+        &mut self,
+        dev: &'d mut dyn Interface,
+        hardware_addr: HardwareAddress,
+    ) -> core::result::Result<IfaceHandle, Full> {
+        self.add_iface_inner(dev.into(), hardware_addr)
+    }
+
+    fn add_iface_inner(
+        &mut self,
+        dev: MaybeBox<'d, dyn Interface + 'd>,
         hardware_addr: HardwareAddress,
     ) -> core::result::Result<IfaceHandle, Full> {
         assert_eq!(
@@ -775,7 +809,7 @@ impl Stack {
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
-    pub fn iface(&mut self, handle: IfaceHandle) -> Iface<'_> {
+    pub fn iface(&mut self, handle: IfaceHandle) -> Iface<'_, 'd> {
         self.ifaces.get(handle.0); // Stale handles panic here, not on first use.
         Iface {
             inner: &mut self.inner,
@@ -784,19 +818,18 @@ impl Stack {
         }
     }
 
-    /// Remove an interface from the stack, returning the device.
+    /// Remove an interface from the stack.
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was already removed).
-    pub fn remove_iface(&mut self, handle: IfaceHandle) -> Box<dyn Interface> {
-        let iface = self.ifaces.remove(handle.0);
+    pub fn remove_iface(&mut self, handle: IfaceHandle) {
+        self.ifaces.remove(handle.0);
         #[cfg(feature = "medium-ethernet")]
         {
             self.inner.neighbor_cache.purge_iface(handle);
             self.inner.pending.purge_iface(handle);
         }
         self.inner.routes.purge_iface(handle);
-        iface.dev
     }
 
     /// Access the routing table.
@@ -833,7 +866,7 @@ impl Stack {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "udp")]
-    pub fn udp_socket(&mut self, handle: UdpHandle) -> UdpSocket<'_> {
+    pub fn udp_socket(&mut self, handle: UdpHandle) -> UdpSocket<'_, 'd> {
         self.sockets.udp.get(handle.0); // Stale handles panic here, not on first use.
         UdpSocket {
             sockets: &mut self.sockets.udp,
@@ -869,7 +902,7 @@ impl Stack {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "raw")]
-    pub fn raw_socket(&mut self, handle: RawHandle) -> RawSocket<'_> {
+    pub fn raw_socket(&mut self, handle: RawHandle) -> RawSocket<'_, 'd> {
         RawSocket {
             state: self.sockets.raw.get_mut(handle.0),
             tx: TxContext {
@@ -879,20 +912,67 @@ impl Stack {
         }
     }
 
-    /// Add a TCP socket to the stack, with the given receive and transmit buffer
-    /// capacities, returning a handle to it.
+    /// Add a TCP socket to the stack, with receive and transmit buffers of the
+    /// given capacities, returning a handle to it.
+    ///
+    /// The buffers are allocated on the heap, so this needs the `alloc` feature.
+    /// Without it, or to use your own buffers, see
+    /// [`add_tcp_socket_with_bufs`](Self::add_tcp_socket_with_bufs).
+    ///
+    /// # Panics
+    /// Panics if the receive buffer is larger than 1 GiB.
+    ///
+    /// Errors:
+    /// - `Full` if the stack has no room for another TCP socket. Only possible
+    ///   without the `alloc` feature, where the `tcp-socket-count-N` feature sets the limit.
+    #[cfg(all(feature = "tcp", feature = "alloc"))]
+    pub fn add_tcp_socket(&mut self, rx_capacity: usize, tx_capacity: usize) -> core::result::Result<TcpHandle, Full> {
+        self.add_tcp_socket_inner(
+            SocketBuffer::new(alloc::vec![0; rx_capacity]),
+            SocketBuffer::new(alloc::vec![0; tx_capacity]),
+        )
+    }
+
+    /// Add a TCP socket to the stack, with borrowed receive and transmit
+    /// buffers, and returning a handle to it.
+    ///
+    /// The stack holds the buffers until it is dropped or the socket is removed,
+    /// so they must be declared before the stack, or be `'static`. Otherwise
+    /// this is [`add_tcp_socket`](Self::add_tcp_socket).
+    ///
+    /// ```no_run
+    /// # use xarxa::Stack;
+    /// # fn add<'d>(stack: &mut Stack<'d>, rx: &'d mut [u8; 4096], tx: &'d mut [u8; 4096]) {
+    /// let handle = stack.add_tcp_socket_with_bufs(rx, tx).unwrap();
+    /// # }
+    /// ```
+    ///
+    /// # Panics
+    /// Panics if the receive buffer is larger than 1 GiB.
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another TCP socket. Only possible
     ///   without the `alloc` feature, where the `tcp-socket-count-N` feature sets the limit.
     #[cfg(feature = "tcp")]
-    pub fn add_tcp_socket(&mut self, rx_capacity: usize, tx_capacity: usize) -> core::result::Result<TcpHandle, Full> {
-        Ok(TcpHandle(self.sockets.tcp.add_with(|_| {
-            TcpSocketState::new(
-                SocketBuffer::new(vec![0; rx_capacity]),
-                SocketBuffer::new(vec![0; tx_capacity]),
-            )
-        })?))
+    pub fn add_tcp_socket_with_bufs(
+        &mut self,
+        rx_buffer: &'d mut [u8],
+        tx_buffer: &'d mut [u8],
+    ) -> core::result::Result<TcpHandle, Full> {
+        self.add_tcp_socket_inner(SocketBuffer::new(rx_buffer), SocketBuffer::new(tx_buffer))
+    }
+
+    #[cfg(feature = "tcp")]
+    fn add_tcp_socket_inner(
+        &mut self,
+        rx_buffer: SocketBuffer<'d>,
+        tx_buffer: SocketBuffer<'d>,
+    ) -> core::result::Result<TcpHandle, Full> {
+        Ok(TcpHandle(
+            self.sockets
+                .tcp
+                .add_with(|_| TcpSocketState::new(rx_buffer, tx_buffer))?,
+        ))
     }
 
     /// Remove a TCP socket from the stack.
@@ -912,7 +992,7 @@ impl Stack {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "tcp")]
-    pub fn tcp_socket(&mut self, handle: TcpHandle) -> TcpSocket<'_> {
+    pub fn tcp_socket(&mut self, handle: TcpHandle) -> TcpSocket<'_, 'd> {
         self.sockets.tcp.get(handle.0); // Stale handles panic here, not on first use.
         TcpSocket {
             sockets: &mut self.sockets.tcp,
@@ -950,7 +1030,7 @@ impl Stack {
     /// # Panics
     /// Panics if the handle is stale (the listener was already removed).
     #[cfg(feature = "tcp-listener")]
-    pub fn tcp_listener(&mut self, handle: TcpListenerHandle) -> TcpListener<'_> {
+    pub fn tcp_listener(&mut self, handle: TcpListenerHandle) -> TcpListener<'_, 'd> {
         self.sockets.tcp_listeners.get(handle.0); // Stale handles panic here, not on first use.
         TcpListener {
             listeners: &mut self.sockets.tcp_listeners,
@@ -961,7 +1041,7 @@ impl Stack {
     }
 
     /// Borrow the stack context for egress.
-    pub(crate) fn tx_context(&mut self) -> TxContext<'_> {
+    pub(crate) fn tx_context(&mut self) -> TxContext<'_, 'd> {
         TxContext {
             inner: &mut self.inner,
             ifaces: &mut self.ifaces,
@@ -971,7 +1051,7 @@ impl Stack {
     /// Iterate over the interfaces added to the stack.
     ///
     /// See [`IfaceIter`] for how to use it.
-    pub fn ifaces(&mut self) -> IfaceIter<'_> {
+    pub fn ifaces(&mut self) -> IfaceIter<'_, 'd> {
         IfaceIter { stack: self, next: 0 }
     }
 
@@ -979,7 +1059,7 @@ impl Stack {
     ///
     /// See [`UdpSocketIter`] for how to use it.
     #[cfg(feature = "udp")]
-    pub fn udp_sockets(&mut self) -> UdpSocketIter<'_> {
+    pub fn udp_sockets(&mut self) -> UdpSocketIter<'_, 'd> {
         UdpSocketIter { stack: self, next: 0 }
     }
 
@@ -987,7 +1067,7 @@ impl Stack {
     ///
     /// See [`RawSocketIter`] for how to use it.
     #[cfg(feature = "raw")]
-    pub fn raw_sockets(&mut self) -> RawSocketIter<'_> {
+    pub fn raw_sockets(&mut self) -> RawSocketIter<'_, 'd> {
         RawSocketIter { stack: self, next: 0 }
     }
 
@@ -995,7 +1075,7 @@ impl Stack {
     ///
     /// See [`TcpSocketIter`] for how to use it.
     #[cfg(feature = "tcp")]
-    pub fn tcp_sockets(&mut self) -> TcpSocketIter<'_> {
+    pub fn tcp_sockets(&mut self) -> TcpSocketIter<'_, 'd> {
         TcpSocketIter { stack: self, next: 0 }
     }
 
@@ -1003,7 +1083,7 @@ impl Stack {
     ///
     /// See [`TcpListenerIter`] for how to use it.
     #[cfg(feature = "tcp-listener")]
-    pub fn tcp_listeners(&mut self) -> TcpListenerIter<'_> {
+    pub fn tcp_listeners(&mut self) -> TcpListenerIter<'_, 'd> {
         TcpListenerIter { stack: self, next: 0 }
     }
 
@@ -1133,17 +1213,17 @@ impl Stack {
 /// }
 /// # }
 /// ```
-pub struct IfaceIter<'a> {
-    stack: &'a mut Stack,
+pub struct IfaceIter<'a, 'd> {
+    stack: &'a mut Stack<'d>,
     next: usize,
 }
 
-impl IfaceIter<'_> {
+impl<'d> IfaceIter<'_, 'd> {
     /// Get the next interface, with its handle.
     ///
     /// Returns `None` when there are no more.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<(IfaceHandle, Iface<'_>)> {
+    pub fn next(&mut self) -> Option<(IfaceHandle, Iface<'_, 'd>)> {
         let index = self.stack.ifaces.next_occupied(self.next)?;
         self.next = index + 1;
         let handle = IfaceHandle(index);
@@ -1166,18 +1246,18 @@ impl IfaceIter<'_> {
 /// # }
 /// ```
 #[cfg(feature = "udp")]
-pub struct UdpSocketIter<'a> {
-    stack: &'a mut Stack,
+pub struct UdpSocketIter<'a, 'd> {
+    stack: &'a mut Stack<'d>,
     next: usize,
 }
 
 #[cfg(feature = "udp")]
-impl UdpSocketIter<'_> {
+impl<'d> UdpSocketIter<'_, 'd> {
     /// Get the next UDP socket, with its handle.
     ///
     /// Returns `None` when there are no more.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<(UdpHandle, UdpSocket<'_>)> {
+    pub fn next(&mut self) -> Option<(UdpHandle, UdpSocket<'_, 'd>)> {
         let index = self.stack.sockets.udp.next_occupied(self.next)?;
         self.next = index + 1;
         let handle = UdpHandle(index);
@@ -1200,18 +1280,18 @@ impl UdpSocketIter<'_> {
 /// # }
 /// ```
 #[cfg(feature = "raw")]
-pub struct RawSocketIter<'a> {
-    stack: &'a mut Stack,
+pub struct RawSocketIter<'a, 'd> {
+    stack: &'a mut Stack<'d>,
     next: usize,
 }
 
 #[cfg(feature = "raw")]
-impl RawSocketIter<'_> {
+impl<'d> RawSocketIter<'_, 'd> {
     /// Get the next raw socket, with its handle.
     ///
     /// Returns `None` when there are no more.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<(RawHandle, RawSocket<'_>)> {
+    pub fn next(&mut self) -> Option<(RawHandle, RawSocket<'_, 'd>)> {
         let index = self.stack.sockets.raw.next_occupied(self.next)?;
         self.next = index + 1;
         let handle = RawHandle(index);
@@ -1234,18 +1314,18 @@ impl RawSocketIter<'_> {
 /// # }
 /// ```
 #[cfg(feature = "tcp")]
-pub struct TcpSocketIter<'a> {
-    stack: &'a mut Stack,
+pub struct TcpSocketIter<'a, 'd> {
+    stack: &'a mut Stack<'d>,
     next: usize,
 }
 
 #[cfg(feature = "tcp")]
-impl TcpSocketIter<'_> {
+impl<'d> TcpSocketIter<'_, 'd> {
     /// Get the next TCP socket, with its handle.
     ///
     /// Returns `None` when there are no more.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<(TcpHandle, TcpSocket<'_>)> {
+    pub fn next(&mut self) -> Option<(TcpHandle, TcpSocket<'_, 'd>)> {
         let index = self.stack.sockets.tcp.next_occupied(self.next)?;
         self.next = index + 1;
         let handle = TcpHandle(index);
@@ -1268,18 +1348,18 @@ impl TcpSocketIter<'_> {
 /// # }
 /// ```
 #[cfg(feature = "tcp-listener")]
-pub struct TcpListenerIter<'a> {
-    stack: &'a mut Stack,
+pub struct TcpListenerIter<'a, 'd> {
+    stack: &'a mut Stack<'d>,
     next: usize,
 }
 
 #[cfg(feature = "tcp-listener")]
-impl TcpListenerIter<'_> {
+impl<'d> TcpListenerIter<'_, 'd> {
     /// Get the next TCP listener, with its handle.
     ///
     /// Returns `None` when there are no more.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<(TcpListenerHandle, TcpListener<'_>)> {
+    pub fn next(&mut self) -> Option<(TcpListenerHandle, TcpListener<'_, 'd>)> {
         let index = self.stack.sockets.tcp_listeners.next_occupied(self.next)?;
         self.next = index + 1;
         let handle = TcpListenerHandle(index);
@@ -1287,7 +1367,7 @@ impl TcpListenerIter<'_> {
     }
 }
 
-impl Stack {
+impl<'d> Stack<'d> {
     fn process(&mut self, iface: IfaceHandle, buf: PacketBuf) {
         match self.ifaces.get(iface.0).dev.capabilities().medium {
             #[cfg(feature = "medium-ethernet")]
@@ -2094,7 +2174,7 @@ impl Stack {
 // because they serve both ingress (above) and socket egress (`TxContext`).
 impl StackInner {
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
-    fn process_arp(&mut self, iface: &mut IfaceState, mut buf: PacketBuf) {
+    fn process_arp(&mut self, iface: &mut IfaceState<'_>, mut buf: PacketBuf) {
         let arp_packet = check!(ArpPacket::new_checked(&mut buf));
 
         if arp_packet.hardware_type() != ArpHardware::Ethernet
@@ -2161,7 +2241,7 @@ impl StackInner {
     #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
     fn process_ndisc_solicit(
         &mut self,
-        iface: &mut IfaceState,
+        iface: &mut IfaceState<'_>,
         src_addr: Ipv6Address,
         dst_addr: Ipv6Address,
         icmp_packet: &mut Icmpv6Packet<'_>,
@@ -2209,7 +2289,7 @@ impl StackInner {
     #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
     fn process_ndisc_advert(
         &mut self,
-        iface: &mut IfaceState,
+        iface: &mut IfaceState<'_>,
         src_addr: Ipv6Address,
         icmp_packet: &mut Icmpv6Packet<'_>,
     ) {
@@ -2237,7 +2317,7 @@ impl StackInner {
 
     /// Send a solicitation (ARP request / NDISC neighbor solicit) for the given address.
     #[cfg(feature = "medium-ethernet")]
-    fn solicit_neighbor(&mut self, iface: &mut IfaceState, addr: IpAddress) {
+    fn solicit_neighbor(&mut self, iface: &mut IfaceState<'_>, addr: IpAddress) {
         match addr {
             #[cfg(feature = "ipv4")]
             IpAddress::Ipv4(addr) => self.transmit_arp_request(iface, addr),
@@ -2249,7 +2329,12 @@ impl StackInner {
     /// Fill the neighbor cache, and flush any packets that were queued waiting for
     /// this neighbor to resolve.
     #[cfg(feature = "medium-ethernet")]
-    pub(crate) fn fill_neighbor(&mut self, iface: &mut IfaceState, addr: IpAddress, hardware_addr: EthernetAddress) {
+    pub(crate) fn fill_neighbor(
+        &mut self,
+        iface: &mut IfaceState<'_>,
+        addr: IpAddress,
+        hardware_addr: EthernetAddress,
+    ) {
         let key = (iface.handle, addr);
         self.neighbor_cache.fill(key, hardware_addr, self.now);
 
@@ -2273,7 +2358,7 @@ impl StackInner {
     #[cfg(feature = "medium-ethernet")]
     fn lookup_hardware_addr(
         &mut self,
-        iface: &mut IfaceState,
+        iface: &mut IfaceState<'_>,
         dst_addr: &IpAddress,
         next_hop: IpAddress,
     ) -> NeighborLookup {
@@ -2315,7 +2400,7 @@ impl StackInner {
     }
 
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
-    fn transmit_arp_request(&mut self, iface: &mut IfaceState, target_addr: Ipv4Address) {
+    fn transmit_arp_request(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv4Address) {
         let Some(source_protocol_addr) = iface.get_source_address_ipv4(&target_addr) else {
             debug!("arp: no source address for request");
             return;
@@ -2340,7 +2425,7 @@ impl StackInner {
     }
 
     #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
-    fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState, target_addr: Ipv6Address) {
+    fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv6Address) {
         let src_addr = iface.get_source_address_ipv6(&target_addr);
         let dst_addr = target_addr.solicited_node();
 
@@ -2375,7 +2460,7 @@ impl StackInner {
     #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
     pub(crate) fn transmit_ndisc(
         &mut self,
-        iface: &mut IfaceState,
+        iface: &mut IfaceState<'_>,
         mut buf: PacketBuf,
         src_addr: Ipv6Address,
         dst_addr: Ipv6Address,
@@ -2407,7 +2492,7 @@ impl StackInner {
     #[cfg(feature = "dhcpv4")]
     pub(crate) fn transmit_ipv4_on(
         &mut self,
-        iface: &mut IfaceState,
+        iface: &mut IfaceState<'_>,
         src_addr: Ipv4Address,
         dst_addr: Ipv4Address,
         mut buf: PacketBuf,
@@ -2427,7 +2512,7 @@ impl StackInner {
 
     pub(crate) fn transmit_ip_frame(
         &mut self,
-        iface: &mut IfaceState,
+        iface: &mut IfaceState<'_>,
         dst_addr: IpAddress,
         next_hop: IpAddress,
         buf: PacketBuf,
@@ -2453,7 +2538,7 @@ impl StackInner {
     #[cfg(feature = "medium-ethernet")]
     fn transmit_ethernet(
         &mut self,
-        iface: &mut IfaceState,
+        iface: &mut IfaceState<'_>,
         dst_hw: EthernetAddress,
         mut buf: PacketBuf,
         ethertype: EthernetProtocol,
@@ -2466,7 +2551,7 @@ impl StackInner {
         self.transmit_raw(iface, buf);
     }
 
-    fn transmit_raw(&mut self, iface: &mut IfaceState, #[allow(unused_mut)] mut buf: PacketBuf) {
+    fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
         #[cfg(feature = "packet-log")]
         {
             trace!("sent on iface {}", iface.handle.0);
@@ -2648,7 +2733,7 @@ fn process_hop_by_hop(payload: &[u8]) -> crate::wire::Result<HopByHopAction> {
     })
 }
 
-impl IfaceState {
+impl IfaceState<'_> {
     /// The interface's medium.
     #[cfg(all(
         feature = "medium-ethernet",
@@ -3051,17 +3136,17 @@ mod test {
 
     /// A stack with one interface of the given medium, owning [`OUR_V4`]/24 and
     /// [`OUR_V6`]/64.
-    fn test_stack(medium: Medium) -> (Stack, Queue, Sent) {
+    fn test_stack(medium: Medium) -> (Stack<'static>, Queue, Sent) {
         let rx = Rc::new(RefCell::new(VecDeque::new()));
         let tx = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack
-            .add_iface(
-                Box::new(TestDevice {
+            .add_iface_borrowed(
+                Box::leak(Box::new(TestDevice {
                     medium,
                     rx: rx.clone(),
                     tx: tx.clone(),
-                }),
+                })),
                 match medium {
                     Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
                     Medium::Ip => HardwareAddress::Ip,
@@ -3486,7 +3571,7 @@ mod test {
 
     /// A stack with two IP-medium interfaces: the first owns [`OUR_V4`]/24,
     /// the second 10.0.0.1/24, and both own fe80::1/64.
-    fn test_stack_two_ifaces() -> (Stack, [Queue; 2], [Sent; 2]) {
+    fn test_stack_two_ifaces() -> (Stack<'static>, [Queue; 2], [Sent; 2]) {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let mut rxs = Vec::new();
         let mut txs = Vec::new();
@@ -3494,12 +3579,12 @@ mod test {
             let rx = Rc::new(RefCell::new(VecDeque::new()));
             let tx = Rc::new(RefCell::new(Vec::new()));
             let handle = stack
-                .add_iface(
-                    Box::new(TestDevice {
+                .add_iface_borrowed(
+                    Box::leak(Box::new(TestDevice {
                         medium: Medium::Ip,
                         rx: rx.clone(),
                         tx: tx.clone(),
-                    }),
+                    })),
                     HardwareAddress::Ip,
                 )
                 .unwrap();
@@ -3924,12 +4009,12 @@ mod test {
         let sent = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let iface = stack
-            .add_iface(
-                Box::new(PtpDevice {
+            .add_iface_borrowed(
+                Box::leak(Box::new(PtpDevice {
                     rx: rx.clone(),
                     sent: sent.clone(),
                     tx_stamps: Rc::new(RefCell::new(VecDeque::new())),
-                }),
+                })),
                 HardwareAddress::Ip,
             )
             .unwrap();
@@ -4080,7 +4165,9 @@ mod test {
     #[test]
     fn test_tcp_connect_aborted_by_icmp_error() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
-        let handle = stack.add_tcp_socket(4096, 4096).unwrap();
+        let handle = stack
+            .add_tcp_socket_with_bufs(vec![0; 4096].leak(), vec![0; 4096].leak())
+            .unwrap();
         stack.tcp_socket(handle).connect((REMOTE_V4, 80), 0).unwrap();
         stack.poll(Instant::ZERO);
         assert_eq!(stack.tcp_socket(handle).state(), TcpState::SynSent);
@@ -4106,7 +4193,9 @@ mod test {
     #[test]
     fn test_tcp_established_icmp_error_is_soft() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
-        let handle = stack.add_tcp_socket(4096, 4096).unwrap();
+        let handle = stack
+            .add_tcp_socket_with_bufs(vec![0; 4096].leak(), vec![0; 4096].leak())
+            .unwrap();
         stack.tcp_socket(handle).connect((REMOTE_V4, 80), 0).unwrap();
         stack.poll(Instant::ZERO);
         let syn = tx.borrow().last().unwrap().clone();
@@ -4178,7 +4267,9 @@ mod test {
     fn test_neighbor_failure_aborts_tcp_connect() {
         let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
         let dead = Ipv4Address::new(192, 168, 1, 99);
-        let handle = stack.add_tcp_socket(4096, 4096).unwrap();
+        let handle = stack
+            .add_tcp_socket_with_bufs(vec![0; 4096].leak(), vec![0; 4096].leak())
+            .unwrap();
         stack.tcp_socket(handle).connect((dead, 80), 0).unwrap();
 
         // The SYN is queued on the unresolvable neighbor. When resolution fails, the
