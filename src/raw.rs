@@ -9,7 +9,8 @@
 //! - **IP mode** ([`RawMode::Ip`]): whole IP packets on all interfaces. The socket may be
 //!   bound to an IP version and/or an IP protocol, both optional.
 
-use alloc::collections::VecDeque;
+use crate::config::RAW_RX_QUEUE_COUNT;
+use crate::storage::BoundedDeque;
 use core::fmt;
 
 use crate::buf::PacketBuf;
@@ -142,7 +143,7 @@ impl core::error::Error for RecvError {}
 #[derive(Debug)]
 pub(crate) struct RawSocketState {
     mode: Option<RawMode>,
-    rx_queue: VecDeque<PacketBuf>,
+    rx_queue: BoundedDeque<PacketBuf, RAW_RX_QUEUE_COUNT>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -154,7 +155,7 @@ impl RawSocketState {
     pub(crate) fn new() -> RawSocketState {
         RawSocketState {
             mode: None,
-            rx_queue: VecDeque::new(),
+            rx_queue: BoundedDeque::new(),
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -165,7 +166,10 @@ impl RawSocketState {
     /// Queue an ingress packet. `buf` must be a whole Ethernet frame or IP packet,
     /// headers included, matching the socket's mode.
     pub(crate) fn rx_enqueue(&mut self, buf: PacketBuf) {
-        self.rx_queue.push_back(buf);
+        if self.rx_queue.push_back(buf).is_err() {
+            trace!("raw: rx queue full, dropping packet");
+            return;
+        }
         #[cfg(feature = "async")]
         self.rx_waker.wake();
     }
@@ -629,14 +633,16 @@ mod test {
         ip_addrs: Vec<IpCidr>,
     ) -> (IfaceHandle, Rc<RefCell<Vec<Vec<u8>>>>) {
         let tx = Rc::new(RefCell::new(Vec::new()));
-        let handle = stack.add_iface(
-            Box::new(TestDevice { medium, tx: tx.clone() }),
-            match medium {
-                Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
-                Medium::Ip => HardwareAddress::Ip,
-            },
-        );
-        stack.iface(handle).set_ip_addrs(ip_addrs);
+        let handle = stack
+            .add_iface(
+                Box::new(TestDevice { medium, tx: tx.clone() }),
+                match medium {
+                    Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
+                    Medium::Ip => HardwareAddress::Ip,
+                },
+            )
+            .unwrap();
+        stack.iface(handle).set_ip_addrs(ip_addrs).unwrap();
         (handle, tx)
     }
 
@@ -698,7 +704,7 @@ mod test {
     #[test]
     fn test_bind_ip() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_raw_socket();
+        let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         assert!(!socket.is_open());
         assert_eq!(socket.mode(), None);
@@ -735,7 +741,7 @@ mod test {
         let (eth_iface, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (ip_iface, _) = add_test_iface(&mut stack, Medium::Ip, vec![]);
 
-        let handle = stack.add_raw_socket();
+        let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         assert_eq!(
             socket.bind(RawMode::Ethernet {
@@ -758,7 +764,7 @@ mod test {
     #[test]
     fn test_recv() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_raw_socket();
+        let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
 
         // Not bound yet.
@@ -789,7 +795,7 @@ mod test {
     #[test]
     fn test_peek_and_recv_slice() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_raw_socket();
+        let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         socket
             .bind(RawMode::Ip {
@@ -814,7 +820,7 @@ mod test {
     #[test]
     fn test_recv_slice_truncated() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_raw_socket();
+        let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         socket
             .bind(RawMode::Ip {
@@ -836,8 +842,8 @@ mod test {
     #[test]
     fn test_demux_ip() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let h_icmp = stack.add_raw_socket();
-        let h_any = stack.add_raw_socket();
+        let h_icmp = stack.add_raw_socket().unwrap();
+        let h_any = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(h_icmp)
             .bind(RawMode::Ip {
@@ -913,12 +919,14 @@ mod test {
 
         let sent = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = stack.add_iface(
-            Box::new(MetaDevice(sent.clone())),
-            HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
-        );
+        let iface = stack
+            .add_iface(
+                Box::new(MetaDevice(sent.clone())),
+                HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
+            )
+            .unwrap();
 
-        let handle = stack.add_raw_socket();
+        let handle = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(handle)
             .bind(RawMode::Ethernet { iface, ethertype: None })
@@ -955,8 +963,8 @@ mod test {
         let (iface_a, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (iface_b, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
 
-        let h_custom = stack.add_raw_socket();
-        let h_any = stack.add_raw_socket();
+        let h_custom = stack.add_raw_socket().unwrap();
+        let h_any = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(h_custom)
             .bind(RawMode::Ethernet {
@@ -998,7 +1006,7 @@ mod test {
     fn test_send_ethernet() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let (iface, tx) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
-        let handle = stack.add_raw_socket();
+        let handle = stack.add_raw_socket().unwrap();
 
         // Not bound yet.
         let frame = eth_frame(ETHERTYPE_CUSTOM, b"hello");
@@ -1029,7 +1037,7 @@ mod test {
     #[test]
     fn test_send_ip() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_raw_socket();
+        let handle = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(handle)
             .bind(RawMode::Ip {
@@ -1084,7 +1092,7 @@ mod test {
             Medium::Ip,
             vec![IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24)],
         );
-        let handle = stack.add_raw_socket();
+        let handle = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(handle)
             .bind(RawMode::Ip {

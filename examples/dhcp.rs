@@ -33,10 +33,12 @@ fn main() {
     let fd = device.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());
-    let iface = stack.add_iface(
-        Box::new(device),
-        HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])),
-    );
+    let iface = stack
+        .add_iface(
+            Box::new(device),
+            HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])),
+        )
+        .unwrap();
 
     // That's all it takes: the stack installs the address and default route
     // itself once a lease comes in, and keeps it renewed.

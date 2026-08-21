@@ -43,25 +43,31 @@ fn main() {
     let fd = device.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());
-    let iface = stack.add_iface(
-        Box::new(device),
-        match medium {
-            Medium::Ip => HardwareAddress::Ip,
-            Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])),
-        },
-    );
-    stack.iface(iface).set_ip_addrs([
-        IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24),
-        IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
-        IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
-    ]);
+    let iface = stack
+        .add_iface(
+            Box::new(device),
+            match medium {
+                Medium::Ip => HardwareAddress::Ip,
+                Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])),
+            },
+        )
+        .unwrap();
+    stack
+        .iface(iface)
+        .set_ip_addrs([
+            IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24),
+            IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
+            IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
+        ])
+        .unwrap();
 
     // Off-link traffic routes to the host's address on this interface.
     stack
         .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100), iface);
+        .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100), iface)
+        .unwrap();
 
-    let udp_handle = stack.add_udp_socket();
+    let udp_handle = stack.add_udp_socket().unwrap();
     stack
         .udp_socket(udp_handle)
         .bind(6969, IpListenEndpoint::UNSPECIFIED)

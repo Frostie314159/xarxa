@@ -1,7 +1,7 @@
 // Heads up! Before working on this file you should read, at least,
 // the parts of RFC 1122 that discuss ARP, and RFC 4861 § 7.2 and § 7.3.
 
-use alloc::vec::Vec;
+use crate::storage::{BoundedVec, Full};
 
 use crate::buf::PacketBuf;
 use crate::stack::IfaceHandle;
@@ -12,13 +12,10 @@ use crate::wire::{EthernetAddress, IpAddress};
 /// protocol address.
 pub(crate) type Key = (IfaceHandle, IpAddress);
 
-/// Maximum number of entries in the neighbor cache.
-pub(crate) const NEIGHBOR_CACHE_COUNT: usize = 8;
-
-/// Maximum number of packets waiting for neighbor resolution, per interface.
-///
-/// When the queue is full, the oldest packet is dropped to make room.
-pub(crate) const PENDING_QUEUE_COUNT: usize = 16;
+// Maximum number of entries in the neighbor cache, and maximum number of packets
+// waiting for neighbor resolution (when full, the oldest packet is dropped to
+// make room). Both are compile-time knobs.
+pub(crate) use crate::config::{NEIGHBOR_CACHE_COUNT, PENDING_QUEUE_COUNT};
 
 /// How long a packet may sit in the pending queue before it is dropped.
 pub(crate) const PENDING_QUEUE_LIFETIME: Duration = Duration::from_millis(5_000);
@@ -88,7 +85,7 @@ pub(crate) enum ProbeEvent {
 /// A neighbor cache backed by a map.
 #[derive(Debug)]
 pub struct Cache {
-    storage: Vec<(Key, State)>,
+    storage: BoundedVec<(Key, State), NEIGHBOR_CACHE_COUNT>,
 }
 
 impl Cache {
@@ -97,7 +94,9 @@ impl Cache {
 
     /// Create a cache.
     pub fn new() -> Self {
-        Self { storage: Vec::new() }
+        Self {
+            storage: BoundedVec::new(),
+        }
     }
 
     pub(crate) fn lookup(&self, key: &Key, timestamp: Instant) -> Answer {
@@ -242,9 +241,7 @@ impl Cache {
     fn insert(&mut self, key: Key, state: State) {
         if let Some(entry) = self.get_mut(&key) {
             *entry = state;
-        } else if self.storage.len() < NEIGHBOR_CACHE_COUNT {
-            self.storage.push((key, state));
-        } else {
+        } else if let Err((key, state)) = self.storage.push((key, state)) {
             // The cache is full, and we need to evict an entry. Prefer evicting
             // resolved entries: evicting an in-progress resolution would strand the
             // packets queued on it.
@@ -297,30 +294,34 @@ pub(crate) struct PendingPacket {
 /// flushed to the device; if resolution fails, they are dropped.
 #[derive(Debug, Default)]
 pub(crate) struct PendingQueue {
-    packets: Vec<PendingPacket>,
+    packets: BoundedVec<PendingPacket, PENDING_QUEUE_COUNT>,
 }
 
 impl PendingQueue {
     pub fn new() -> Self {
-        Self { packets: Vec::new() }
+        Self {
+            packets: BoundedVec::new(),
+        }
     }
 
     /// Queue a packet waiting for `key` to resolve.
     pub fn push(&mut self, key: Key, buf: PacketBuf, timestamp: Instant) {
-        if self.packets.len() >= PENDING_QUEUE_COUNT {
-            trace!("neighbor: pending queue full, dropping oldest packet");
-            self.packets.remove(0);
-        }
-        self.packets.push(PendingPacket {
+        let packet = PendingPacket {
             key,
             buf,
             expires_at: timestamp + PENDING_QUEUE_LIFETIME,
-        });
+        };
+        if let Err(packet) = self.packets.push(packet) {
+            trace!("neighbor: pending queue full, dropping oldest packet");
+            self.packets.remove(0);
+            unwrap!(self.packets.push(packet).map_err(|_| Full));
+        }
     }
 
     /// Remove and return all packets waiting for `key`, in FIFO order.
-    pub fn take_matching(&mut self, key: &Key) -> Vec<PendingPacket> {
-        self.packets.extract_if(.., |packet| packet.key == *key).collect()
+    pub fn pop_matching(&mut self, key: &Key) -> Option<PendingPacket> {
+        let index = self.packets.iter().position(|packet| packet.key == *key)?;
+        Some(self.packets.remove(index))
     }
 
     /// Drop packets that have waited too long.
@@ -358,9 +359,19 @@ mod test {
     use crate::stack::IfaceHandle;
     use crate::wire::Ipv6Address;
     use crate::wire::ipv6::test::{MOCK_IP_ADDR_1, MOCK_IP_ADDR_2, MOCK_IP_ADDR_3, MOCK_IP_ADDR_4};
+    #[allow(unused_imports)]
+    use std::vec::Vec;
 
     const IF_0: IfaceHandle = IfaceHandle(0);
     const IF_1: IfaceHandle = IfaceHandle(1);
+
+    fn take_matching(queue: &mut PendingQueue, key: &Key) -> std::vec::Vec<PendingPacket> {
+        let mut taken = std::vec::Vec::new();
+        while let Some(packet) = queue.pop_matching(key) {
+            taken.push(packet);
+        }
+        taken
+    }
 
     const HADDR_A: EthernetAddress = EthernetAddress([0, 0, 0, 0, 0, 1]);
     const HADDR_B: EthernetAddress = EthernetAddress([0, 0, 0, 0, 0, 2]);
@@ -544,11 +555,11 @@ mod test {
         // Same address, different interface: distinct key.
         queue.push((IF_1, MOCK_IP_ADDR_1.into()), PacketBuf::new(), Instant::ZERO);
 
-        let taken = queue.take_matching(&key(MOCK_IP_ADDR_1));
+        let taken = take_matching(&mut queue, &key(MOCK_IP_ADDR_1));
         assert_eq!(taken.len(), 2);
-        assert!(queue.take_matching(&key(MOCK_IP_ADDR_1)).is_empty());
-        assert_eq!(queue.take_matching(&key(MOCK_IP_ADDR_2)).len(), 1);
-        assert_eq!(queue.take_matching(&(IF_1, MOCK_IP_ADDR_1.into())).len(), 1);
+        assert!(take_matching(&mut queue, &key(MOCK_IP_ADDR_1)).is_empty());
+        assert_eq!(take_matching(&mut queue, &key(MOCK_IP_ADDR_2)).len(), 1);
+        assert_eq!(take_matching(&mut queue, &(IF_1, MOCK_IP_ADDR_1.into())).len(), 1);
     }
 
     #[test]
@@ -561,8 +572,11 @@ mod test {
         // This push drops the oldest packet to make room.
         queue.push(key(MOCK_IP_ADDR_2), PacketBuf::new(), Instant::ZERO);
 
-        assert_eq!(queue.take_matching(&key(MOCK_IP_ADDR_1)).len(), PENDING_QUEUE_COUNT - 1);
-        assert_eq!(queue.take_matching(&key(MOCK_IP_ADDR_2)).len(), 1);
+        assert_eq!(
+            take_matching(&mut queue, &key(MOCK_IP_ADDR_1)).len(),
+            PENDING_QUEUE_COUNT - 1
+        );
+        assert_eq!(take_matching(&mut queue, &key(MOCK_IP_ADDR_2)).len(), 1);
     }
 
     #[test]
@@ -572,7 +586,7 @@ mod test {
         queue.push(key(MOCK_IP_ADDR_1), PacketBuf::new(), Instant::ZERO);
         assert_eq!(queue.poll_at(), Instant::ZERO + PENDING_QUEUE_LIFETIME);
         queue.purge_expired(Instant::ZERO + PENDING_QUEUE_LIFETIME);
-        assert!(queue.take_matching(&key(MOCK_IP_ADDR_1)).is_empty());
+        assert!(take_matching(&mut queue, &key(MOCK_IP_ADDR_1)).is_empty());
         assert_eq!(queue.poll_at(), Instant::MAX);
     }
 
@@ -584,8 +598,8 @@ mod test {
         queue.push((IF_1, MOCK_IP_ADDR_1.into()), PacketBuf::new(), Instant::ZERO);
 
         queue.purge_iface(IF_0);
-        assert!(queue.take_matching(&(IF_0, MOCK_IP_ADDR_1.into())).is_empty());
-        assert_eq!(queue.take_matching(&(IF_1, MOCK_IP_ADDR_1.into())).len(), 1);
+        assert!(take_matching(&mut queue, &(IF_0, MOCK_IP_ADDR_1.into())).is_empty());
+        assert_eq!(take_matching(&mut queue, &(IF_1, MOCK_IP_ADDR_1.into())).len(), 1);
     }
 }
 

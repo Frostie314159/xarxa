@@ -21,9 +21,9 @@ use crate::route::{Route, RouteOrigin};
 use crate::stack::{AddrOrigin, IfaceAddr, IfaceState, StackInner};
 use crate::time::{Duration, Instant};
 use crate::wire::{
-    DHCP_CLIENT_PORT, DHCP_HEADER_LEN, DHCP_MAGIC_NUMBER, DHCP_MAX_DNS_SERVER_COUNT, DHCP_SERVER_PORT, DhcpFlags,
-    DhcpMessageType, DhcpOption, DhcpPacket, EthernetAddress, IPV4_HEADER_LEN, IpAddress, IpCidr, Ipv4Address,
-    Ipv4AddressExt, Ipv4Cidr, LINK_HEADER_LEN, UDP_HEADER_LEN, UdpPacket, dhcpv4_field as field,
+    DHCP_CLIENT_PORT, DHCP_HEADER_LEN, DHCP_MAGIC_NUMBER, DHCP_SERVER_PORT, DhcpFlags, DhcpMessageType, DhcpOption,
+    DhcpPacket, EthernetAddress, IPV4_HEADER_LEN, IpAddress, IpCidr, Ipv4Address, Ipv4AddressExt, Ipv4Cidr,
+    LINK_HEADER_LEN, UDP_HEADER_LEN, UdpPacket, dhcpv4_field as field,
 };
 
 const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(120);
@@ -39,6 +39,9 @@ const MIN_RENEW_TIMEOUT: Duration = Duration::from_secs(60);
 
 const DEFAULT_PARAMETER_REQUEST_LIST: &[u8] =
     &[field::OPT_SUBNET_MASK, field::OPT_ROUTER, field::OPT_DOMAIN_NAME_SERVER];
+
+/// The most DNS servers a client keeps from a lease. Set by the `dhcp-max-dns-server-count-N` feature.
+pub use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
 
 /// A lease obtained from a DHCP server.
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -670,10 +673,13 @@ impl IfaceState {
         if old_addr != new_addr {
             self.ip_addrs.retain(|a| a.origin != AddrOrigin::Dhcpv4);
             if let Some(cidr) = new_addr {
-                self.ip_addrs.push(IfaceAddr {
+                let addr = IfaceAddr {
                     cidr,
                     origin: AddrOrigin::Dhcpv4,
-                });
+                };
+                if self.ip_addrs.push(addr).is_err() {
+                    warn!("dhcp: address table full, {} not assigned", cidr);
+                }
             }
             inner.purge_iface_link_state(self.handle);
         }
@@ -682,15 +688,18 @@ impl IfaceState {
         let new_router = new.and_then(|l| l.router);
         if old_router != new_router {
             let handle = self.handle;
-            inner.routes.update(|routes| {
-                routes.retain(|route| !(route.origin == RouteOrigin::Dhcpv4 && route.iface == handle));
-                if let Some(new_router) = new_router {
-                    routes.push(Route {
-                        origin: RouteOrigin::Dhcpv4,
-                        ..Route::new_ipv4_gateway(new_router, handle)
-                    });
+            inner
+                .routes
+                .retain(|route| !(route.origin == RouteOrigin::Dhcpv4 && route.iface == handle));
+            if let Some(new_router) = new_router {
+                let route = Route {
+                    origin: RouteOrigin::Dhcpv4,
+                    ..Route::new_ipv4_gateway(new_router, handle)
+                };
+                if inner.routes.add(route).is_err() {
+                    warn!("dhcp: route table full, default route not installed");
                 }
-            });
+            }
         }
 
         self.config_changed();
@@ -762,13 +771,15 @@ mod test {
         let rx = Rc::new(RefCell::new(VecDeque::new()));
         let tx = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(1);
-        let handle = stack.add_iface(
-            Box::new(TestDevice {
-                rx: rx.clone(),
-                tx: tx.clone(),
-            }),
-            HardwareAddress::Ethernet(OUR_HW),
-        );
+        let handle = stack
+            .add_iface(
+                Box::new(TestDevice {
+                    rx: rx.clone(),
+                    tx: tx.clone(),
+                }),
+                HardwareAddress::Ethernet(OUR_HW),
+            )
+            .unwrap();
         assert_eq!(handle, IFACE);
         // Drain the solicited-node multicast report the link-local address triggers,
         // so the tests only see the frames DHCP provokes.
@@ -1032,7 +1043,7 @@ mod test {
     fn test_manual_config_left_alone() {
         let (mut stack, _rx, _tx) = bound_stack();
         let manual = IpCidr::new(Ipv4Address::new(10, 0, 0, 1).into(), 8);
-        stack.iface(IFACE).add_ip_addr(manual);
+        stack.iface(IFACE).add_ip_addr(manual).unwrap();
 
         stack.iface(IFACE).set_dhcpv4(None);
         assert_eq!(ipv4_addrs(&mut stack), &[IfaceAddr::manual(manual)]);

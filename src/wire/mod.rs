@@ -96,9 +96,8 @@ pub(crate) use self::dhcpv4::field as dhcpv4_field;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 pub use self::dhcpv4::{
     CLIENT_PORT as DHCP_CLIENT_PORT, DhcpOption, Flags as DhcpFlags, HEADER_LEN as DHCP_HEADER_LEN,
-    MAGIC_NUMBER as DHCP_MAGIC_NUMBER, MAX_DNS_SERVER_COUNT as DHCP_MAX_DNS_SERVER_COUNT,
-    MessageType as DhcpMessageType, OpCode as DhcpOpCode, OptionWriter as DhcpOptionWriter, Packet as DhcpPacket,
-    SERVER_PORT as DHCP_SERVER_PORT,
+    MAGIC_NUMBER as DHCP_MAGIC_NUMBER, MessageType as DhcpMessageType, OpCode as DhcpOpCode,
+    OptionWriter as DhcpOptionWriter, Packet as DhcpPacket, SERVER_PORT as DHCP_SERVER_PORT,
 };
 
 pub use self::ip::checksum;

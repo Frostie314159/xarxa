@@ -49,20 +49,23 @@ fn main() {
     // Create interface
     let ethernet_addr = EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
     let mut stack = Stack::new(random_seed());
-    let iface = stack.add_iface(
-        Box::new(device),
-        match medium {
-            Medium::Ip => HardwareAddress::Ip,
-            Medium::Ethernet => HardwareAddress::Ethernet(ethernet_addr),
-        },
-    );
+    let iface = stack
+        .add_iface(
+            Box::new(device),
+            match medium {
+                Medium::Ip => HardwareAddress::Ip,
+                Medium::Ethernet => HardwareAddress::Ethernet(ethernet_addr),
+            },
+        )
+        .unwrap();
     stack
         .iface(iface)
-        .set_ip_addrs([IpCidr::new(IpAddress::from(LOCAL_ADDR), 64)]);
-    stack.routes_mut().add_default_ipv6_route(ROUTER_ADDR, iface);
+        .set_ip_addrs([IpCidr::new(IpAddress::from(LOCAL_ADDR), 64)])
+        .unwrap();
+    stack.routes_mut().add_default_ipv6_route(ROUTER_ADDR, iface).unwrap();
 
     // Create sockets
-    let udp_handle = stack.add_udp_socket();
+    let udp_handle = stack.add_udp_socket().unwrap();
     stack
         .udp_socket(udp_handle)
         .bind(PORT, IpListenEndpoint::UNSPECIFIED)

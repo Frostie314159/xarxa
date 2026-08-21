@@ -14,7 +14,8 @@ use core::cmp::min;
 #[cfg(feature = "async")]
 use core::task::Waker;
 
-use alloc::vec::Vec as AllocVec;
+use crate::config::DNS_MAX_QUERY_COUNT;
+use crate::storage::{Full, Slab};
 use heapless::Vec;
 
 use crate::stack::Stack;
@@ -26,12 +27,12 @@ use crate::wire::{self, IpAddress, IpEndpoint, IpListenEndpoint};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
 
-/// Maximum length of a name, in wire format.
-pub const DNS_MAX_NAME_SIZE: usize = 255;
-/// Maximum number of addresses returned by one query.
-pub const DNS_MAX_RESULT_COUNT: usize = 4;
-/// Maximum number of DNS servers.
-pub const DNS_MAX_SERVER_COUNT: usize = 4;
+/// Maximum length of a name, in wire format. Set by the `dns-max-name-size-N` feature.
+pub use crate::config::DNS_MAX_NAME_SIZE;
+/// Maximum number of addresses returned by one query. Set by the `dns-max-result-count-N` feature.
+pub use crate::config::DNS_MAX_RESULT_COUNT;
+/// Maximum number of DNS servers. Set by the `dns-max-server-count-N` feature.
+pub use crate::config::DNS_MAX_SERVER_COUNT;
 
 const DNS_PORT: u16 = 53;
 const MDNS_DNS_PORT: u16 = 5353;
@@ -53,6 +54,9 @@ pub enum StartQueryError {
     InvalidName,
     /// The name is longer than [`DNS_MAX_NAME_SIZE`] in wire format.
     NameTooLong,
+    /// Too many queries are in flight. The limit is set by the
+    /// `dns-max-query-count-N` feature.
+    NoFreeSlot,
 }
 
 impl core::fmt::Display for StartQueryError {
@@ -60,6 +64,7 @@ impl core::fmt::Display for StartQueryError {
         match self {
             StartQueryError::InvalidName => write!(f, "Invalid name"),
             StartQueryError::NameTooLong => write!(f, "Name too long"),
+            StartQueryError::NoFreeSlot => write!(f, "No free query slot"),
         }
     }
 }
@@ -156,7 +161,7 @@ pub struct DnsQueryHandle(usize);
 pub struct DnsClient {
     socket: UdpHandle,
     servers: Vec<IpAddress, DNS_MAX_SERVER_COUNT>,
-    queries: AllocVec<Option<DnsQuery>>,
+    queries: Slab<DnsQuery, DNS_MAX_QUERY_COUNT>,
 }
 
 impl DnsClient {
@@ -164,19 +169,22 @@ impl DnsClient {
     ///
     /// Creates and binds a UDP socket in `stack`.
     /// Truncates the server list if `servers.len() > DNS_MAX_SERVER_COUNT`.
-    pub fn new(stack: &mut Stack, servers: &[IpAddress]) -> DnsClient {
+    ///
+    /// Errors:
+    /// - `Full` if the stack has no room for another UDP socket.
+    pub fn new(stack: &mut Stack, servers: &[IpAddress]) -> core::result::Result<DnsClient, Full> {
         let truncated_servers = &servers[..min(servers.len(), DNS_MAX_SERVER_COUNT)];
 
-        let socket = stack.add_udp_socket();
+        let socket = stack.add_udp_socket()?;
         // A fresh socket on an ephemeral port: can only fail if the whole
         // ephemeral range is taken.
         unwrap!(stack.udp_socket(socket).bind(0, IpListenEndpoint::UNSPECIFIED));
 
-        DnsClient {
+        Ok(DnsClient {
             socket,
             servers: Vec::from_slice(truncated_servers).unwrap(),
-            queries: AllocVec::new(),
-        }
+            queries: Slab::new(),
+        })
     }
 
     /// Destroy the client, removing its UDP socket from `stack`.
@@ -203,17 +211,6 @@ impl DnsClient {
         } else {
             self.servers = Vec::from_slice(servers).unwrap();
         }
-    }
-
-    fn find_free_query(&mut self) -> DnsQueryHandle {
-        for (i, q) in self.queries.iter().enumerate() {
-            if q.is_none() {
-                return DnsQueryHandle(i);
-            }
-        }
-
-        self.queries.push(None);
-        DnsQueryHandle(self.queries.len() - 1)
     }
 
     /// Start a query.
@@ -286,13 +283,13 @@ impl DnsClient {
         mdns: MulticastDns,
     ) -> Result<DnsQueryHandle, StartQueryError> {
         let name = Vec::from_slice(raw_name).map_err(|_| StartQueryError::NameTooLong)?;
-        let handle = self.find_free_query();
+        let txid = stack.inner.rand.rand_u16();
 
-        self.queries[handle.0] = Some(DnsQuery {
+        let index = self.queries.add_with(|_| DnsQuery {
             state: State::Pending(PendingQuery {
                 name,
                 type_: query_type,
-                txid: stack.inner.rand.rand_u32() as u16,
+                txid,
                 delay: RETRANSMIT_DELAY,
                 timeout_at: None,
                 retransmit_at: Instant::ZERO,
@@ -302,7 +299,8 @@ impl DnsClient {
             #[cfg(feature = "async")]
             waker: WakerRegistration::new(),
         });
-        Ok(handle)
+        let index = index.map_err(|_| StartQueryError::NoFreeSlot)?;
+        Ok(DnsQueryHandle(index))
     }
 
     /// Get the result of a query.
@@ -315,19 +313,18 @@ impl DnsClient {
         &mut self,
         handle: DnsQueryHandle,
     ) -> Result<Vec<IpAddress, DNS_MAX_RESULT_COUNT>, GetQueryResultError> {
-        let slot = &mut self.queries[handle.0];
-        let q = slot.as_mut().unwrap();
+        let q = self.queries.get_mut(handle.0);
         match &mut q.state {
             // Query is not done yet.
             State::Pending(_) => Err(GetQueryResultError::Pending),
             // Query is done
             State::Completed(q) => {
                 let res = q.addresses.clone();
-                *slot = None; // Free up the slot for recycling.
+                self.queries.remove(handle.0); // Free up the slot for recycling.
                 Ok(res)
             }
             State::Failure => {
-                *slot = None; // Free up the slot for recycling.
+                self.queries.remove(handle.0); // Free up the slot for recycling.
                 Err(GetQueryResultError::Failed)
             }
         }
@@ -338,11 +335,8 @@ impl DnsClient {
     /// # Panics
     /// Panics if the handle corresponds to an already free slot.
     pub fn cancel_query(&mut self, handle: DnsQueryHandle) {
-        let slot = &mut self.queries[handle.0];
-        if slot.is_none() {
-            panic!("Canceling query in a free slot.")
-        }
-        *slot = None; // Free up the slot for recycling.
+        // Panics if the slot is free.
+        self.queries.remove(handle.0);
     }
 
     /// Assign a waker to a query slot.
@@ -353,7 +347,7 @@ impl DnsClient {
     /// Panics if the handle corresponds to an already free slot.
     #[cfg(feature = "async")]
     pub fn register_query_waker(&mut self, handle: DnsQueryHandle, waker: &Waker) {
-        self.queries[handle.0].as_mut().unwrap().waker.register(waker);
+        self.queries.get_mut(handle.0).waker.register(waker);
     }
 
     /// Advance the client: process received responses and send due queries.
@@ -414,7 +408,7 @@ impl DnsClient {
 
             // Find pending query
             let mut matched = false;
-            'queries: for q in self.queries.iter_mut().flatten() {
+            'queries: for (_, q) in self.queries.iter_mut() {
                 if let State::Pending(pq) = &mut q.state {
                     if p.transaction_id() != pq.txid {
                         continue;
@@ -535,7 +529,7 @@ impl DnsClient {
         let now = stack.inner.now;
         let mut next_poll_at = Instant::MAX;
 
-        for q in self.queries.iter_mut().flatten() {
+        for (_, q) in self.queries.iter_mut() {
             if let State::Pending(pq) = &mut q.state {
                 // As per RFC 6762 any DNS query ending in .local. MUST be sent as mdns
                 // so we internally overwrite the servers for any of those queries

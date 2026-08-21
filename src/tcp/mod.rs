@@ -8,11 +8,14 @@ use core::fmt::Display;
 use core::{fmt, mem};
 
 use crate::buf::PacketBuf;
+#[cfg(all(test, feature = "tcp-listener"))]
+use crate::config::TCP_LISTENER_BACKLOG;
+use crate::config::TCP_SOCKET_COUNT;
 #[cfg(feature = "icmp-errors")]
 use crate::icmp_error::IcmpError;
 use crate::rand::Rand;
-use crate::slab::Slab;
 use crate::stack::{EgressRoute, TxContext, alloc_ephemeral_port};
+use crate::storage::Slab;
 use crate::time::{Duration, Instant};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -2111,7 +2114,7 @@ pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_add
 /// stack sent.
 #[cfg(feature = "icmp-errors")]
 pub(crate) fn process_icmp_error(
-    sockets: &mut Slab<TcpSocketState>,
+    sockets: &mut Slab<TcpSocketState, TCP_SOCKET_COUNT>,
     error: IcmpError,
     local: IpEndpoint,
     remote: IpEndpoint,
@@ -2177,7 +2180,7 @@ pub(crate) fn flush(state: &mut TcpSocketState, cx: &mut TxContext<'_>) {
 /// [`Stack`]: crate::Stack
 /// [`Stack::tcp_socket`]: crate::Stack::tcp_socket
 pub struct TcpSocket<'a> {
-    pub(crate) sockets: &'a mut Slab<TcpSocketState>,
+    pub(crate) sockets: &'a mut Slab<TcpSocketState, TCP_SOCKET_COUNT>,
     pub(crate) index: usize,
     pub(crate) tx: TxContext<'a>,
 }
@@ -2877,7 +2880,7 @@ mod test {
     }
 
     struct TestSocket {
-        sockets: Slab<TcpSocketState>,
+        sockets: Slab<TcpSocketState, TCP_SOCKET_COUNT>,
         stack: Stack,
     }
 
@@ -3034,11 +3037,14 @@ mod test {
     /// A stack with one interface owning `LOCAL_ADDR`.
     fn test_stack() -> Stack {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_iface(Box::new(TestingDevice), HardwareAddress::Ip);
-        stack.iface(handle).set_ip_addrs([
-            IpCidr::new(LOCAL_ADDR.into(), 24),
-            IpCidr::new(Ipv4Address::new(127, 0, 0, 1).into(), 8),
-        ]);
+        let handle = stack.add_iface(Box::new(TestingDevice), HardwareAddress::Ip).unwrap();
+        stack
+            .iface(handle)
+            .set_ip_addrs([
+                IpCidr::new(LOCAL_ADDR.into(), 24),
+                IpCidr::new(Ipv4Address::new(127, 0, 0, 1).into(), 8),
+            ])
+            .unwrap();
         stack
     }
 
@@ -3050,7 +3056,7 @@ mod test {
         let mut socket = TcpSocketState::new(rx_buffer, tx_buffer);
         socket.ack_delay = None;
         let mut sockets = Slab::new();
-        sockets.add_with(|_| socket);
+        sockets.add_with(|_| socket).unwrap();
         TestSocket { sockets, stack }
     }
 
@@ -3205,7 +3211,7 @@ mod test {
     #[cfg(feature = "tcp-listener")]
     fn listener_stack() -> (Stack, TcpListenerHandle) {
         let mut stack = test_stack();
-        let h = stack.add_tcp_listener();
+        let h = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(h).listen(LOCAL_PORT).unwrap();
         (stack, h)
     }
@@ -3242,8 +3248,8 @@ mod test {
     #[test]
     fn test_listener_listen_validation() {
         let mut stack = test_stack();
-        let h1 = stack.add_tcp_listener();
-        let h2 = stack.add_tcp_listener();
+        let h1 = stack.add_tcp_listener().unwrap();
+        let h2 = stack.add_tcp_listener().unwrap();
 
         assert_eq!(stack.tcp_listener(h1).listen(0), Err(ListenError::Unaddressable));
         assert_eq!(stack.tcp_listener(h1).listen(80), Ok(()));
@@ -3259,7 +3265,9 @@ mod test {
         assert_eq!(stack.tcp_listener(h2).listen(80), Err(ListenError::InUse));
         assert_eq!(stack.tcp_listener(h2).listen((LOCAL_ADDR, 80)), Ok(()));
 
-        let h3 = stack.add_tcp_listener();
+        // Free a slot first: without `alloc` the listener slab is small.
+        stack.remove_tcp_listener(h1);
+        let h3 = stack.add_tcp_listener().unwrap();
         assert_eq!(stack.tcp_listener(h3).listen((LOCAL_ADDR, 80)), Err(ListenError::InUse));
         assert_eq!(stack.tcp_listener(h3).listen(81), Ok(()));
     }
@@ -3288,7 +3296,7 @@ mod test {
         let mut s = TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
-                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
+                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0)).unwrap();
                 sockets
             },
             stack,
@@ -3313,6 +3321,28 @@ mod test {
             }
         );
         sanity!(s, socket_established());
+    }
+
+    #[cfg(feature = "tcp-listener")]
+    #[test]
+    fn test_listener_backlog_full_drops_syn() {
+        let (mut stack, h) = listener_stack();
+
+        // One more connection attempt than the backlog holds: the last SYN is
+        // dropped, the others can all be accepted.
+        for i in 0..TCP_LISTENER_BACKLOG + 1 {
+            assert!(listener_deliver(
+                &mut stack,
+                &TcpRepr {
+                    src_port: REMOTE_PORT + i as u16,
+                    ..syn_repr()
+                }
+            ));
+        }
+        for _ in 0..TCP_LISTENER_BACKLOG {
+            assert!(stack.tcp_listener(h).accept(64, 64).is_some());
+        }
+        assert!(stack.tcp_listener(h).accept(64, 64).is_none());
     }
 
     #[cfg(feature = "tcp-listener")]
@@ -3377,7 +3407,7 @@ mod test {
         // A listener bound to a specific address ignores SYNs to other
         // addresses.
         let mut stack = test_stack();
-        let h = stack.add_tcp_listener();
+        let h = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(h).listen((OTHER_ADDR, LOCAL_PORT)).unwrap();
         assert!(!listener_deliver(&mut stack, &syn_repr()));
 
@@ -3394,8 +3424,8 @@ mod test {
         // Among listeners on the same port, an exact local-address match beats
         // a wildcard one, regardless of creation order.
         let mut stack = test_stack();
-        let h_any = stack.add_tcp_listener();
-        let h_addr = stack.add_tcp_listener();
+        let h_any = stack.add_tcp_listener().unwrap();
+        let h_addr = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(h_any).listen(LOCAL_PORT).unwrap();
         stack.tcp_listener(h_addr).listen((LOCAL_ADDR, LOCAL_PORT)).unwrap();
 
@@ -3454,7 +3484,7 @@ mod test {
             let mut s = TestSocket {
                 sockets: {
                     let mut sockets = Slab::new();
-                    sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
+                    sockets.add_with(|_| stack.sockets.tcp.remove(sh.0)).unwrap();
                     sockets
                 },
                 stack,
@@ -3482,7 +3512,7 @@ mod test {
         let mut s = TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
-                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
+                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0)).unwrap();
                 sockets
             },
             stack,
@@ -3835,8 +3865,8 @@ mod test {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let h1 = stack.add_tcp_socket(64, 64);
-        let h2 = stack.add_tcp_socket(64, 64);
+        let h1 = stack.add_tcp_socket(64, 64).unwrap();
+        let h2 = stack.add_tcp_socket(64, 64).unwrap();
 
         // Local port 0 allocates an ephemeral port. (The explicit local address
         // avoids needing an interface for source address selection.)
@@ -3860,10 +3890,10 @@ mod test {
         };
 
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let h1 = stack.add_tcp_socket(64, 64);
-        let h2 = stack.add_tcp_socket(64, 64);
-        let h3 = stack.add_tcp_socket(64, 64);
-        let h4 = stack.add_tcp_socket(64, 64);
+        let h1 = stack.add_tcp_socket(64, 64).unwrap();
+        let h2 = stack.add_tcp_socket(64, 64).unwrap();
+        let h3 = stack.add_tcp_socket(64, 64).unwrap();
+        let h4 = stack.add_tcp_socket(64, 64).unwrap();
 
         stack
             .tcp_socket(h1)
@@ -5196,8 +5226,14 @@ mod test {
 
         let mut s = socket_with_buffer_sizes(2048, 64);
         s.stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = s.stack.add_iface(Box::new(SmallMtuDevice), HardwareAddress::Ip);
-        s.stack.iface(handle).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
+        let handle = s
+            .stack
+            .add_iface(Box::new(SmallMtuDevice), HardwareAddress::Ip)
+            .unwrap();
+        s.stack
+            .iface(handle)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
         s.state = State::SynSent;
         s.tuple = Some(TUPLE);
         s.local_seq_no = LOCAL_SEQ;
@@ -9490,7 +9526,7 @@ mod test {
         TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
-                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0));
+                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0)).unwrap();
                 sockets
             },
             stack,
@@ -9661,7 +9697,13 @@ mod test {
 
         // Simulate interface IP change - remove the socket's source IP
         // and add a different one.
-        s.stack.ifaces.get_mut(0).ip_addrs = vec![crate::IfaceAddr::manual(IpCidr::new(OTHER_ADDR.into(), 24))];
+        s.stack.ifaces.get_mut(0).ip_addrs.clear();
+        s.stack
+            .ifaces
+            .get_mut(0)
+            .ip_addrs
+            .push(crate::IfaceAddr::manual(IpCidr::new(OTHER_ADDR.into(), 24)))
+            .unwrap();
 
         // The socket's source IP is no longer ours: dispatch treats it like a
         // routing failure. The segment is still built, but with no route, so
@@ -9682,7 +9724,13 @@ mod test {
 
         // Restoring the address makes egress work again, and the retransmission
         // carries the dropped data.
-        s.stack.ifaces.get_mut(0).ip_addrs = vec![crate::IfaceAddr::manual(IpCidr::new(LOCAL_ADDR.into(), 24))];
+        s.stack.ifaces.get_mut(0).ip_addrs.clear();
+        s.stack
+            .ifaces
+            .get_mut(0)
+            .ip_addrs
+            .push(crate::IfaceAddr::manual(IpCidr::new(LOCAL_ADDR.into(), 24)))
+            .unwrap();
         recv!(s, time 2000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 3,
             ack_number: Some(REMOTE_SEQ + 1),
@@ -9762,8 +9810,13 @@ mod stack_test {
     fn stack() -> (Stack, Rc<RefCell<Queues>>) {
         let queues = Rc::new(RefCell::new(Queues::default()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_iface(Box::new(QueueDevice(queues.clone())), HardwareAddress::Ip);
-        stack.iface(handle).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
+        let handle = stack
+            .add_iface(Box::new(QueueDevice(queues.clone())), HardwareAddress::Ip)
+            .unwrap();
+        stack
+            .iface(handle)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
         (stack, queues)
     }
 
@@ -9808,7 +9861,7 @@ mod stack_test {
     #[cfg(feature = "tcp-listener")]
     fn test_stack_handshake_data_and_close() {
         let (mut stack, queues) = stack();
-        let lh = stack.add_tcp_listener();
+        let lh = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(lh).listen(LOCAL_PORT).unwrap();
 
         // A SYN is recorded in the accept queue, nothing is transmitted until
@@ -9925,7 +9978,7 @@ mod stack_test {
     fn test_stack_established_socket_beats_listener() {
         // Set up an established connection through the listener.
         let (mut stack, queues) = stack();
-        let lh = stack.add_tcp_listener();
+        let lh = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(lh).listen(LOCAL_PORT).unwrap();
         queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
@@ -9970,7 +10023,7 @@ mod stack_test {
     #[test]
     fn test_stack_retransmission_timer() {
         let (mut stack, queues) = stack();
-        let h = stack.add_tcp_socket(64, 64);
+        let h = stack.add_tcp_socket(64, 64).unwrap();
         stack.tcp_socket(h).set_ack_delay(None);
         stack
             .tcp_socket(h)

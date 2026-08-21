@@ -19,7 +19,8 @@
 //! receive it is what the driver attached to the packet, on send it is attached to the
 //! packet handed to the driver.
 
-use alloc::collections::VecDeque;
+use crate::config::{UDP_RX_QUEUE_COUNT, UDP_SOCKET_COUNT};
+use crate::storage::BoundedDeque;
 use core::fmt;
 use core::ops::{Deref, Range};
 
@@ -27,8 +28,8 @@ use crate::buf::PacketBuf;
 #[cfg(feature = "icmp-errors")]
 use crate::icmp_error::IcmpError;
 use crate::meta::PacketMeta;
-use crate::slab::Slab;
 use crate::stack::{IfaceHandle, Stack, TxContext, addr_score, alloc_ephemeral_port};
+use crate::storage::Slab;
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
 #[cfg(feature = "ipv4")]
@@ -187,7 +188,7 @@ pub(crate) struct UdpSocketState {
     /// (only matching datagrams are delivered) and are the default destination
     /// for sends. Unspecified parts match any remote.
     remote: IpListenEndpoint,
-    rx_queue: VecDeque<PacketBuf>,
+    rx_queue: BoundedDeque<PacketBuf, UDP_RX_QUEUE_COUNT>,
     hop_limit: Option<u8>,
     /// The last ICMP error reported against this socket, with the remote endpoint
     /// it is about. A single slot: a newer error overwrites an unread older one.
@@ -205,7 +206,7 @@ impl UdpSocketState {
         UdpSocketState {
             local: IpListenEndpoint::UNSPECIFIED,
             remote: IpListenEndpoint::UNSPECIFIED,
-            rx_queue: VecDeque::new(),
+            rx_queue: BoundedDeque::new(),
             hop_limit: None,
             #[cfg(feature = "icmp-errors")]
             pending_error: None,
@@ -219,7 +220,10 @@ impl UdpSocketState {
     /// Queue an ingress datagram. `buf` must be a full IP packet (IP header
     /// included), truncated to the UDP length.
     pub(crate) fn rx_enqueue(&mut self, buf: PacketBuf) {
-        self.rx_queue.push_back(buf);
+        if self.rx_queue.push_back(buf).is_err() {
+            trace!("udp: rx queue full, dropping packet");
+            return;
+        }
         #[cfg(feature = "async")]
         self.rx_waker.wake();
     }
@@ -354,7 +358,7 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
 /// [`Stack`]: crate::Stack
 /// [`Stack::udp_socket`]: crate::Stack::udp_socket
 pub struct UdpSocket<'a> {
-    pub(crate) sockets: &'a mut Slab<UdpSocketState>,
+    pub(crate) sockets: &'a mut Slab<UdpSocketState, UDP_SOCKET_COUNT>,
     pub(crate) index: usize,
     pub(crate) tx: TxContext<'a>,
 }
@@ -907,7 +911,7 @@ impl Stack {
 /// specific match gets the error.
 #[cfg(feature = "icmp-errors")]
 pub(crate) fn process_icmp_error(
-    sockets: &mut Slab<UdpSocketState>,
+    sockets: &mut Slab<UdpSocketState, UDP_SOCKET_COUNT>,
     error: IcmpError,
     local: IpEndpoint,
     remote: IpEndpoint,
@@ -939,7 +943,7 @@ mod test {
 
     fn stack_with_socket() -> (Stack, UdpHandle) {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         (stack, handle)
     }
 
@@ -976,8 +980,11 @@ mod test {
     /// specified remote can resolve their local address.
     fn stack_with_iface() -> Stack {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_iface(Box::new(TestingDevice), HardwareAddress::Ip);
-        stack.iface(handle).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
+        let handle = stack.add_iface(Box::new(TestingDevice), HardwareAddress::Ip).unwrap();
+        stack
+            .iface(handle)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
         stack
     }
 
@@ -1056,8 +1063,8 @@ mod test {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let h1 = stack.add_udp_socket();
-        let h2 = stack.add_udp_socket();
+        let h1 = stack.add_udp_socket().unwrap();
+        let h2 = stack.add_udp_socket().unwrap();
 
         stack.udp_socket(h1).bind(0, ANY).unwrap();
         let p1 = stack.udp_socket(h1).local_endpoint().port;
@@ -1073,8 +1080,8 @@ mod test {
     #[test]
     fn test_bind_conflicts() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let h1 = stack.add_udp_socket();
-        let h2 = stack.add_udp_socket();
+        let h1 = stack.add_udp_socket().unwrap();
+        let h2 = stack.add_udp_socket().unwrap();
 
         // Identical 4-tuples conflict.
         stack.udp_socket(h1).bind(LOCAL_PORT, ANY).unwrap();
@@ -1083,10 +1090,12 @@ mod test {
         // fine: the tuples differ, and demux picks the most specific match.
         stack.udp_socket(h2).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
 
-        // Two different specific addresses may share a port.
-        let h3 = stack.add_udp_socket();
-        let h4 = stack.add_udp_socket();
-        let h5 = stack.add_udp_socket();
+        // Two different specific addresses may share a port. (Free a slot first:
+        // without `alloc` the socket slab is small.)
+        stack.remove_udp_socket(h1);
+        let h3 = stack.add_udp_socket().unwrap();
+        let h4 = stack.add_udp_socket().unwrap();
+        let h5 = stack.add_udp_socket().unwrap();
         stack.udp_socket(h3).bind((LOCAL_ADDR, LOCAL_PORT + 2), ANY).unwrap();
         stack.udp_socket(h4).bind((OTHER_ADDR, LOCAL_PORT + 2), ANY).unwrap();
         // ...but the same specific address may not.
@@ -1099,10 +1108,10 @@ mod test {
     #[test]
     fn test_bind_conflicts_connected() {
         let mut stack = stack_with_iface();
-        let h1 = stack.add_udp_socket();
-        let h2 = stack.add_udp_socket();
-        let h3 = stack.add_udp_socket();
-        let h4 = stack.add_udp_socket();
+        let h1 = stack.add_udp_socket().unwrap();
+        let h2 = stack.add_udp_socket().unwrap();
+        let h3 = stack.add_udp_socket().unwrap();
+        let h4 = stack.add_udp_socket().unwrap();
 
         // A connected socket and a wildcard-remote socket share a local port:
         // the 4-tuples differ.
@@ -1131,9 +1140,9 @@ mod test {
     #[test]
     fn test_bind_conflicts_per_version() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let h1 = stack.add_udp_socket();
-        let h2 = stack.add_udp_socket();
-        let h3 = stack.add_udp_socket();
+        let h1 = stack.add_udp_socket().unwrap();
+        let h2 = stack.add_udp_socket().unwrap();
+        let h3 = stack.add_udp_socket().unwrap();
 
         // The two halves of a dual stack are different tuples, so they may
         // share a port, as may the address-less bind that covers both.
@@ -1173,7 +1182,7 @@ mod test {
         // A bind to any IPv6 address takes no IPv4 traffic, not even on the port
         // it holds.
         let mut stack = stack_with_iface();
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack
             .udp_socket(handle)
             .bind((Ipv6Address::UNSPECIFIED, LOCAL_PORT), ANY)
@@ -1183,7 +1192,7 @@ mod test {
         assert!(!stack.udp_socket(handle).can_recv());
 
         // The IPv4 half of the same port does take it.
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack
             .udp_socket(handle)
             .bind((Ipv4Address::UNSPECIFIED, LOCAL_PORT), ANY)
@@ -1198,7 +1207,7 @@ mod test {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
         let mut stack = stack_with_iface();
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         let mut socket = stack.udp_socket(handle);
 
         // Local fully wildcard + exact remote: the ordinary connected client.
@@ -1228,7 +1237,7 @@ mod test {
 
         // Mismatched local/remote address families.
         let mut stack = stack_with_iface();
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         assert_eq!(
             stack.udp_socket(handle).bind(
                 (LOCAL_ADDR, LOCAL_PORT),
@@ -1241,7 +1250,7 @@ mod test {
     #[test]
     fn test_connected_demux_filter() {
         let mut stack = stack_with_iface();
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack
             .udp_socket(handle)
             .bind(LOCAL_PORT, (REMOTE_ADDR, REMOTE_PORT))
@@ -1261,7 +1270,7 @@ mod test {
     fn test_remote_addr_only_filter() {
         // A partially specified remote: any port of one peer.
         let mut stack = stack_with_iface();
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack.udp_socket(handle).bind(LOCAL_PORT, (REMOTE_ADDR, 0)).unwrap();
 
         deliver(&mut stack, REMOTE_ADDR, REMOTE_PORT, b"a");
@@ -1278,9 +1287,9 @@ mod test {
         // regardless of creation order: connected beats bound-to-address beats
         // wildcard.
         let mut stack = stack_with_iface();
-        let h_any = stack.add_udp_socket();
-        let h_addr = stack.add_udp_socket();
-        let h_conn = stack.add_udp_socket();
+        let h_any = stack.add_udp_socket().unwrap();
+        let h_addr = stack.add_udp_socket().unwrap();
+        let h_conn = stack.add_udp_socket().unwrap();
         stack.udp_socket(h_any).bind(LOCAL_PORT, ANY).unwrap();
         stack.udp_socket(h_addr).bind((LOCAL_ADDR, LOCAL_PORT), ANY).unwrap();
         stack
@@ -1309,9 +1318,9 @@ mod test {
         // exact address: it takes its version's traffic away from the
         // dual-stack socket, and gives it up to the exact address in turn.
         let mut stack = stack_with_iface();
-        let h_any = stack.add_udp_socket();
-        let h_v4 = stack.add_udp_socket();
-        let h_addr = stack.add_udp_socket();
+        let h_any = stack.add_udp_socket().unwrap();
+        let h_v4 = stack.add_udp_socket().unwrap();
+        let h_addr = stack.add_udp_socket().unwrap();
         stack.udp_socket(h_any).bind(LOCAL_PORT, ANY).unwrap();
         stack
             .udp_socket(h_v4)
@@ -1333,7 +1342,7 @@ mod test {
     #[test]
     fn test_send_defaults_to_remote() {
         let mut stack = stack_with_iface();
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         let mut socket = stack.udp_socket(handle);
 
         // Not bound yet.
@@ -1387,10 +1396,15 @@ mod test {
 
         let sent = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = stack.add_iface(Box::new(MetaDevice(sent.clone())), HardwareAddress::Ip);
-        stack.iface(iface).add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24));
+        let iface = stack
+            .add_iface(Box::new(MetaDevice(sent.clone())), HardwareAddress::Ip)
+            .unwrap();
+        stack
+            .iface(iface)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
 
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
@@ -1417,7 +1431,7 @@ mod test {
     #[test]
     fn test_send_requires_own_src_addr() {
         let mut stack = stack_with_iface();
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         let mut socket = stack.udp_socket(handle);
         socket.bind(LOCAL_PORT, ANY).unwrap();
 
@@ -1456,9 +1470,45 @@ mod test {
             .bind((LOCAL_ADDR, LOCAL_PORT), (REMOTE_ADDR, REMOTE_PORT))
             .unwrap();
         assert_eq!(socket.send_slice(b"hi", dst), Ok(()));
-        stack.ifaces.get_mut(0).ip_addrs = vec![crate::IfaceAddr::manual(IpCidr::new(OTHER_ADDR.into(), 24))];
+        stack.ifaces.get_mut(0).ip_addrs.clear();
+        stack
+            .ifaces
+            .get_mut(0)
+            .ip_addrs
+            .push(crate::IfaceAddr::manual(IpCidr::new(OTHER_ADDR.into(), 24)))
+            .unwrap();
         let mut socket = stack.udp_socket(handle);
         assert_eq!(socket.send_slice(b"hi", dst), Err(SendError::Unaddressable));
+    }
+
+    #[cfg(not(feature = "alloc"))]
+    #[test]
+    fn test_socket_slab_full() {
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut handles = std::vec::Vec::new();
+        for _ in 0..UDP_SOCKET_COUNT {
+            handles.push(stack.add_udp_socket().unwrap());
+        }
+        assert_eq!(stack.add_udp_socket(), Err(crate::Full));
+        // Removing one makes room again, and its slot is reused.
+        stack.remove_udp_socket(handles[1]);
+        assert_eq!(stack.add_udp_socket(), Ok(handles[1]));
+    }
+
+    #[test]
+    fn test_rx_queue_full_drops() {
+        let (mut stack, handle) = stack_with_socket();
+        let mut socket = stack.udp_socket(handle);
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+
+        // One more datagram than the queue holds: the extra one is dropped.
+        for _ in 0..UDP_RX_QUEUE_COUNT + 1 {
+            socket.inner_mut().rx_enqueue(queued_packet(b"abcdef"));
+        }
+        for _ in 0..UDP_RX_QUEUE_COUNT {
+            assert!(socket.recv().is_ok());
+        }
+        assert_eq!(socket.recv().err(), Some(RecvError::Exhausted));
     }
 
     #[test]

@@ -8,7 +8,8 @@
 //!
 //! Needs the `multicast` feature.
 
-use alloc::vec::Vec;
+use crate::config::MULTICAST_GROUP_COUNT;
+use crate::storage::{Full, Vec};
 use core::result::Result;
 
 use crate::buf::PacketBuf;
@@ -22,6 +23,9 @@ use crate::wire::*;
 pub enum MulticastError {
     /// Cannot join/leave the given multicast group.
     Unaddressable,
+    /// The group table is full. Only possible without the `alloc` feature, where
+    /// the size is set by the `multicast-group-count-N` feature.
+    TooManyGroups,
 }
 
 #[cfg(feature = "ipv4")]
@@ -58,7 +62,7 @@ enum GroupState {
 }
 
 pub(crate) struct State {
-    groups: Vec<(IpAddress, GroupState)>,
+    groups: Vec<(IpAddress, GroupState), MULTICAST_GROUP_COUNT>,
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "ipv4")]
     igmp_report_state: IgmpReportState,
@@ -117,10 +121,13 @@ impl State {
         self.groups.iter_mut().find(|(a, _)| a == addr).map(|(_, state)| state)
     }
 
-    fn insert(&mut self, addr: IpAddress, state: GroupState) {
+    fn insert(&mut self, addr: IpAddress, state: GroupState) -> Result<(), Full> {
         match self.get_mut(&addr) {
-            Some(old) => *old = state,
-            None => self.groups.push((addr, state)),
+            Some(old) => {
+                *old = state;
+                Ok(())
+            }
+            None => self.groups.push((addr, state)).map_err(|_| Full),
         }
     }
 
@@ -131,7 +138,7 @@ impl State {
     }
 
     /// The joined addresses.
-    fn keys(&self) -> impl Iterator<Item = &IpAddress> + '_ {
+    fn keys(&self) -> impl Iterator<Item = &IpAddress> + Clone + '_ {
         self.groups.iter().map(|(addr, _)| addr)
     }
 }
@@ -140,6 +147,7 @@ impl core::fmt::Display for MulticastError {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
             MulticastError::Unaddressable => write!(f, "Unaddressable"),
+            MulticastError::TooManyGroups => write!(f, "Too many groups"),
         }
     }
 }
@@ -196,7 +204,9 @@ impl IfaceState {
                 GroupState::Leaving => GroupState::Joined,
             };
         } else {
-            self.multicast.insert(addr, GroupState::Joining);
+            self.multicast
+                .insert(addr, GroupState::Joining)
+                .map_err(|_| MulticastError::TooManyGroups)?;
         }
         Ok(())
     }
@@ -225,22 +235,28 @@ impl IfaceState {
     #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
     pub(crate) fn update_solicited_node_groups(&mut self) {
         // Remove old solicited-node multicast addresses
-        let removals: Vec<_> = self
-            .multicast
-            .keys()
-            .cloned()
-            .filter(
-                |a| matches!(a, IpAddress::Ipv6(a) if a.is_solicited_node_multicast() && !self.has_solicited_node(*a)),
-            )
-            .collect();
-        for removal in removals {
-            let _ = self.leave_multicast_group(removal);
+        // Walk the group table by index: leaving a group may remove the entry
+        // at the current index (and move the last one into its place), in
+        // which case the index is not advanced.
+        let mut i = 0;
+        while i < self.multicast.groups.len() {
+            let (addr, _) = self.multicast.groups[i];
+            let stale =
+                matches!(addr, IpAddress::Ipv6(a) if a.is_solicited_node_multicast() && !self.has_solicited_node(a));
+            let len = self.multicast.groups.len();
+            if stale {
+                let _ = self.leave_multicast_group(addr);
+            }
+            if self.multicast.groups.len() == len {
+                i += 1;
+            }
         }
 
-        let cidrs: Vec<IpCidr> = self.cidrs().cloned().collect();
-        for cidr in cidrs {
+        // Joining only touches the group table, so the address table can be
+        // walked by index.
+        for i in 0..self.ip_addrs.len() {
             #[allow(irrefutable_let_patterns)]
-            if let IpCidr::Ipv6(cidr) = cidr {
+            if let IpCidr::Ipv6(cidr) = self.ip_addrs[i].cidr {
                 let _ = self.join_multicast_group(cidr.address().solicited_node());
             }
         }
@@ -268,14 +284,16 @@ impl IfaceState {
                 }
                 #[cfg(feature = "ipv6")]
                 IpAddress::Ipv6(addr) => {
-                    if let Some(pkt) = self.mldv2_report_packet(&[(MldRecordType::ChangeToInclude, addr)]) {
+                    if let Some(pkt) =
+                        self.mldv2_report_packet(core::iter::once((MldRecordType::ChangeToInclude, addr)))
+                    {
                         self.dispatch_ip(inner, pkt);
                     }
                 }
             }
 
-            // NOTE: this is always replacing an existing entry.
-            self.multicast.insert(addr, GroupState::Joined);
+            // NOTE: this is always replacing an existing entry, so it can't fail.
+            let _ = self.multicast.insert(addr, GroupState::Joined);
         }
 
         // Process multicast leaves.
@@ -294,7 +312,9 @@ impl IfaceState {
                 }
                 #[cfg(feature = "ipv6")]
                 IpAddress::Ipv6(addr) => {
-                    if let Some(pkt) = self.mldv2_report_packet(&[(MldRecordType::ChangeToExclude, addr)]) {
+                    if let Some(pkt) =
+                        self.mldv2_report_packet(core::iter::once((MldRecordType::ChangeToExclude, addr)))
+                    {
                         self.dispatch_ip(inner, pkt);
                     }
                 }
@@ -360,23 +380,19 @@ impl IfaceState {
         #[cfg(feature = "ipv6")]
         match self.multicast.mld_report_state {
             MldReportState::ToGeneralQuery { timeout } if inner.now >= timeout => {
-                let records = self
-                    .multicast
-                    .keys()
-                    .filter_map(|addr| match addr {
-                        IpAddress::Ipv6(addr) => Some((MldRecordType::ModeIsExclude, *addr)),
-                        #[allow(unreachable_patterns)]
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                if let Some(pkt) = self.mldv2_report_packet(&records) {
+                let records = self.multicast.keys().filter_map(|addr| match addr {
+                    IpAddress::Ipv6(addr) => Some((MldRecordType::ModeIsExclude, *addr)),
+                    #[allow(unreachable_patterns)]
+                    _ => None,
+                });
+                if let Some(pkt) = self.mldv2_report_packet(records) {
                     self.dispatch_ip(inner, pkt);
                 }
                 self.multicast.mld_report_state = MldReportState::Inactive;
             }
             MldReportState::ToSpecificQuery { group, timeout } if inner.now >= timeout => {
                 let record = (MldRecordType::ModeIsExclude, group);
-                if let Some(pkt) = self.mldv2_report_packet(&[record]) {
+                if let Some(pkt) = self.mldv2_report_packet(core::iter::once(record)) {
                     self.dispatch_ip(inner, pkt);
                 }
                 self.multicast.mld_report_state = MldReportState::Inactive;
@@ -574,7 +590,13 @@ impl IfaceState {
     }
 
     #[cfg(feature = "ipv6")]
-    fn mldv2_report_packet(&self, records: &[(MldRecordType, Ipv6Address)]) -> Option<PacketBuf> {
+    /// Build an MLDv2 report with one address record per item of `records`.
+    ///
+    /// Records past what fits in one packet are left out.
+    fn mldv2_report_packet(
+        &self,
+        records: impl Iterator<Item = (MldRecordType, Ipv6Address)> + Clone,
+    ) -> Option<PacketBuf> {
         // Per [RFC 3810 § 5.2.13], source addresses must be link-local, falling
         // back to the unspecified address if we haven't acquired one.
         // [RFC 3810 § 5.2.13]: https://tools.ietf.org/html/rfc3810#section-5.2.13
@@ -584,20 +606,28 @@ impl IfaceState {
         // [RFC 3810 § 5.2.14]: https://tools.ietf.org/html/rfc3810#section-5.2.14
         let dst_addr = IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS;
 
-        let records_len = records.len() * MLD_ADDRESS_RECORD_LEN;
-
         // MLD report: the report header (8 bytes) plus one record per group.
         let mut pkt = PacketBuf::new();
         pkt.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
-        pkt.set_len(8 + records_len);
+        let max_records = (pkt.tailroom() - 8) / MLD_ADDRESS_RECORD_LEN;
+        let record_count = records.clone().count();
+        if record_count > max_records {
+            warn!(
+                "mld: {} groups don't fit in one report, reporting {}",
+                record_count, max_records
+            );
+        }
+        let record_count = record_count.min(max_records);
+        let records = records.take(record_count);
+        pkt.set_len(8 + record_count * MLD_ADDRESS_RECORD_LEN);
         {
             let mut mld = Icmpv6Packet::new_unchecked(&mut pkt);
             mld.set_msg_type(Icmpv6Message::MldReport);
             mld.set_msg_code(0);
             mld.clear_reserved();
-            mld.set_nr_mcast_addr_rcrds(records.len() as u16);
+            mld.set_nr_mcast_addr_rcrds(record_count as u16);
             let mut payload = mld.payload_mut();
-            for &(record_type, mcast_addr) in records {
+            for (record_type, mcast_addr) in records {
                 let mut record = MldAddressRecord::new_unchecked(&mut payload[..MLD_ADDRESS_RECORD_LEN]);
                 record.set_record_type(record_type);
                 record.set_aux_data_len(0);
@@ -699,21 +729,24 @@ mod test {
         let rx = Rc::new(RefCell::new(VecDeque::new()));
         let tx = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_iface(
-            Box::new(TestDevice {
-                medium,
-                rx: rx.clone(),
-                tx: tx.clone(),
-            }),
-            match medium {
-                Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
-                Medium::Ip => HardwareAddress::Ip,
-            },
-        );
+        let handle = stack
+            .add_iface(
+                Box::new(TestDevice {
+                    medium,
+                    rx: rx.clone(),
+                    tx: tx.clone(),
+                }),
+                match medium {
+                    Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
+                    Medium::Ip => HardwareAddress::Ip,
+                },
+            )
+            .unwrap();
         assert_eq!(handle, IFACE);
         stack
             .iface(handle)
-            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_LL.into(), 64)]);
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_LL.into(), 64)])
+            .unwrap();
         (stack, rx, tx)
     }
 
@@ -1138,7 +1171,10 @@ mod test {
         );
 
         let new_addr = Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 2);
-        stack.iface(IFACE).add_ip_addr(IpCidr::new(new_addr.into(), 64));
+        stack
+            .iface(IFACE)
+            .add_ip_addr(IpCidr::new(new_addr.into(), 64))
+            .unwrap();
         stack.poll(Instant::ZERO);
         assert_eq!(
             recv_mld(medium, &tx),
@@ -1176,7 +1212,7 @@ mod test {
         let medium = Medium::Ip;
         let (mut stack, rx, _tx) = test_stack(medium);
         let group = Ipv4Address::new(224, 0, 0, 251);
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack
             .udp_socket(handle)
             .bind(5353, IpListenEndpoint::UNSPECIFIED)

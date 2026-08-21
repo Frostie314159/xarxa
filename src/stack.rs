@@ -3,9 +3,17 @@
 use alloc::boxed::Box;
 #[cfg(feature = "tcp")]
 use alloc::vec;
-use alloc::vec::Vec;
 
 use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
+#[cfg(feature = "raw")]
+use crate::config::RAW_SOCKET_COUNT;
+#[cfg(feature = "tcp-listener")]
+use crate::config::TCP_LISTENER_COUNT;
+#[cfg(feature = "tcp")]
+use crate::config::TCP_SOCKET_COUNT;
+#[cfg(feature = "udp")]
+use crate::config::UDP_SOCKET_COUNT;
+use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
 #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
 use crate::icmp_error::{IcmpError, parse_quoted_packet};
 use crate::iface::{IfaceCapabilities, Interface, Medium};
@@ -15,7 +23,7 @@ use crate::rand::Rand;
 #[cfg(feature = "raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketState};
 use crate::route::Routes;
-use crate::slab::Slab;
+use crate::storage::{Full, Slab, Vec};
 #[cfg(feature = "tcp")]
 use crate::tcp::{SocketBuffer, TcpHandle, TcpRepr, TcpSocket, TcpSocketState};
 #[cfg(feature = "tcp-listener")]
@@ -33,7 +41,7 @@ pub struct IfaceHandle(pub(crate) usize);
 /// A network stack.
 pub struct Stack {
     pub(crate) inner: StackInner,
-    pub(crate) ifaces: Slab<IfaceState>,
+    pub(crate) ifaces: Slab<IfaceState, IFACE_COUNT>,
     #[allow(unused)]
     pub(crate) sockets: Sockets,
 }
@@ -41,13 +49,13 @@ pub struct Stack {
 /// The stack's socket storage, one slab per socket type.
 pub(crate) struct Sockets {
     #[cfg(feature = "udp")]
-    pub(crate) udp: Slab<UdpSocketState>,
+    pub(crate) udp: Slab<UdpSocketState, UDP_SOCKET_COUNT>,
     #[cfg(feature = "raw")]
-    pub(crate) raw: Slab<RawSocketState>,
+    pub(crate) raw: Slab<RawSocketState, RAW_SOCKET_COUNT>,
     #[cfg(feature = "tcp")]
-    pub(crate) tcp: Slab<TcpSocketState>,
+    pub(crate) tcp: Slab<TcpSocketState, TCP_SOCKET_COUNT>,
     #[cfg(feature = "tcp-listener")]
-    pub(crate) tcp_listeners: Slab<TcpListenerState>,
+    pub(crate) tcp_listeners: Slab<TcpListenerState, TCP_LISTENER_COUNT>,
 }
 
 /// Where an interface address came from.
@@ -112,7 +120,7 @@ pub(crate) struct IfaceState {
     pub(crate) handle: IfaceHandle,
     dev: Box<dyn Interface>,
     pub(crate) hardware_addr: HardwareAddress,
-    pub(crate) ip_addrs: Vec<IfaceAddr>,
+    pub(crate) ip_addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT>,
     /// Bumped whenever the interface's addresses or routes change.
     config_generation: u32,
     #[cfg(feature = "async")]
@@ -129,7 +137,7 @@ pub(crate) struct IfaceState {
 pub struct Iface<'a> {
     #[cfg_attr(not(feature = "medium-ethernet"), allow(dead_code))]
     inner: &'a mut StackInner,
-    ifaces: &'a mut Slab<IfaceState>,
+    ifaces: &'a mut Slab<IfaceState, IFACE_COUNT>,
     index: usize,
 }
 
@@ -196,7 +204,9 @@ impl Iface<'_> {
             let had = ip_addrs.iter().any(|a| a.origin == AddrOrigin::LinkLocal);
             ip_addrs.retain(|a| a.origin != AddrOrigin::LinkLocal);
             if let Some(ll) = link_local_addr(addr) {
-                ip_addrs.push(ll);
+                if ip_addrs.push(ll).is_err() {
+                    warn!("iface: address table full, link-local address not assigned");
+                }
                 self.invalidate();
             } else if had {
                 self.invalidate();
@@ -224,7 +234,11 @@ impl Iface<'_> {
     ///
     /// # Panics
     /// Panics if the address is not unicast.
-    pub fn add_ip_addr(&mut self, cidr: IpCidr) -> Option<IpCidr> {
+    ///
+    /// Errors:
+    /// - `Full` if the interface has no room for another address. Only possible
+    ///   without the `alloc` feature, where the `iface-addr-count-N` feature sets the limit.
+    pub fn add_ip_addr(&mut self, cidr: IpCidr) -> core::result::Result<Option<IpCidr>, Full> {
         assert!(
             cidr.address().is_unicast(),
             "only unicast addresses can be assigned to an interface"
@@ -232,16 +246,16 @@ impl Iface<'_> {
 
         let ip_addrs = &mut self.state_mut().ip_addrs;
         match ip_addrs.iter().position(|old| old.cidr.address() == cidr.address()) {
-            Some(index) if ip_addrs[index].cidr == cidr => Some(cidr),
+            Some(index) if ip_addrs[index].cidr == cidr => Ok(Some(cidr)),
             Some(index) => {
                 let old = core::mem::replace(&mut ip_addrs[index], IfaceAddr::manual(cidr));
                 self.invalidate();
-                Some(old.cidr)
+                Ok(Some(old.cidr))
             }
             None => {
-                ip_addrs.push(IfaceAddr::manual(cidr));
+                ip_addrs.push(IfaceAddr::manual(cidr)).map_err(|_| Full)?;
                 self.state_mut().config_changed();
-                None
+                Ok(None)
             }
         }
     }
@@ -264,9 +278,15 @@ impl Iface<'_> {
     ///
     /// # Panics
     /// Panics if any of the addresses is not unicast.
-    pub fn set_ip_addrs(&mut self, addrs: impl IntoIterator<Item = IpCidr>) {
+    ///
+    /// Errors:
+    /// - `Full` if the addresses do not fit. Only possible without the `alloc`
+    ///   feature, where the `iface-addr-count-N` feature sets the limit. The
+    ///   interface is left unchanged.
+    pub fn set_ip_addrs(&mut self, new_addrs: impl IntoIterator<Item = IpCidr>) -> core::result::Result<(), Full> {
         #[allow(unused_mut)]
-        let mut addrs: Vec<IfaceAddr> = addrs.into_iter().map(IfaceAddr::manual).collect();
+        let mut addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT> = Vec::new();
+        addrs.try_extend(new_addrs.into_iter().map(IfaceAddr::manual))?;
         assert!(
             addrs.iter().all(|a| a.cidr.address().is_unicast()),
             "only unicast addresses can be assigned to an interface"
@@ -274,16 +294,17 @@ impl Iface<'_> {
         #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
         for a in self.state().ip_addrs.iter() {
             if a.origin == AddrOrigin::LinkLocal && !addrs.iter().any(|n| n.cidr.address() == a.cidr.address()) {
-                addrs.push(*a);
+                addrs.push(*a).map_err(|_| Full)?;
             }
         }
 
         let ip_addrs = &mut self.state_mut().ip_addrs;
         if *ip_addrs == addrs {
-            return;
+            return Ok(());
         }
         *ip_addrs = addrs;
         self.invalidate();
+        Ok(())
     }
 
     /// Purge state associated to this interface.
@@ -416,7 +437,7 @@ impl StackInner {
 /// in here, so socket code doesn't have to care about any of it.
 pub(crate) struct TxContext<'a> {
     pub(crate) inner: &'a mut StackInner,
-    pub(crate) ifaces: &'a mut Slab<IfaceState>,
+    pub(crate) ifaces: &'a mut Slab<IfaceState, IFACE_COUNT>,
 }
 
 /// A complete egress routing decision for one destination, produced by
@@ -695,16 +716,25 @@ impl Stack {
     /// let handle = stack.add_iface(
     ///     dev,
     ///     HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
-    /// );
+    /// ).unwrap();
     /// stack
     ///     .iface(handle)
-    ///     .add_ip_addr(IpCidr::new(Ipv4Address::new(192, 168, 1, 1).into(), 24));
+    ///     .add_ip_addr(IpCidr::new(Ipv4Address::new(192, 168, 1, 1).into(), 24))
+    ///     .unwrap();
     /// # }
     /// ```
     ///
     /// # Panics
     /// Panics if the hardware address is not of the kind the device's medium uses.
-    pub fn add_iface(&mut self, dev: Box<dyn Interface>, hardware_addr: HardwareAddress) -> IfaceHandle {
+    ///
+    /// Errors:
+    /// - `Full` if the stack has no room for another interface. Only possible
+    ///   without the `alloc` feature, where the `iface-count-N` feature sets the limit.
+    pub fn add_iface(
+        &mut self,
+        dev: Box<dyn Interface>,
+        hardware_addr: HardwareAddress,
+    ) -> core::result::Result<IfaceHandle, Full> {
         assert_eq!(
             hardware_addr.medium(),
             dev.capabilities().medium,
@@ -713,7 +743,10 @@ impl Stack {
         #[allow(unused_mut)]
         let mut ip_addrs = Vec::new();
         #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
-        ip_addrs.extend(link_local_addr(hardware_addr));
+        if let Some(ll) = link_local_addr(hardware_addr) {
+            // Can't fail: the table is empty and holds at least one address.
+            let _ = ip_addrs.push(ll);
+        }
         let index = self.ifaces.add_with(|index| IfaceState {
             handle: IfaceHandle(index),
             dev,
@@ -728,14 +761,14 @@ impl Stack {
             slaac: None,
             #[cfg(feature = "multicast")]
             multicast: crate::multicast::State::new(),
-        });
+        })?;
         // The link-local address is already assigned, so its solicited-node
         // group is joined before the first configuration change.
         #[cfg(all(feature = "multicast", feature = "ipv6", feature = "medium-ethernet"))]
         if self.ifaces.get(index).medium() == Medium::Ethernet {
             self.ifaces.get_mut(index).update_solicited_node_groups();
         }
-        IfaceHandle(index)
+        Ok(IfaceHandle(index))
     }
 
     /// Borrow an interface from the stack.
@@ -777,9 +810,13 @@ impl Stack {
     }
 
     /// Add a UDP socket to the stack, returning a handle to it.
+    ///
+    /// Errors:
+    /// - `Full` if the stack has no room for another UDP socket. Only possible
+    ///   without the `alloc` feature, where the `udp-socket-count-N` feature sets the limit.
     #[cfg(feature = "udp")]
-    pub fn add_udp_socket(&mut self) -> UdpHandle {
-        UdpHandle(self.sockets.udp.add_with(|_| UdpSocketState::new()))
+    pub fn add_udp_socket(&mut self) -> core::result::Result<UdpHandle, Full> {
+        Ok(UdpHandle(self.sockets.udp.add_with(|_| UdpSocketState::new())?))
     }
 
     /// Remove a UDP socket from the stack.
@@ -809,9 +846,13 @@ impl Stack {
     }
 
     /// Add a raw socket to the stack, returning a handle to it.
+    ///
+    /// Errors:
+    /// - `Full` if the stack has no room for another raw socket. Only possible
+    ///   without the `alloc` feature, where the `raw-socket-count-N` feature sets the limit.
     #[cfg(feature = "raw")]
-    pub fn add_raw_socket(&mut self) -> RawHandle {
-        RawHandle(self.sockets.raw.add_with(|_| RawSocketState::new()))
+    pub fn add_raw_socket(&mut self) -> core::result::Result<RawHandle, Full> {
+        Ok(RawHandle(self.sockets.raw.add_with(|_| RawSocketState::new())?))
     }
 
     /// Remove a raw socket from the stack.
@@ -840,14 +881,18 @@ impl Stack {
 
     /// Add a TCP socket to the stack, with the given receive and transmit buffer
     /// capacities, returning a handle to it.
+    ///
+    /// Errors:
+    /// - `Full` if the stack has no room for another TCP socket. Only possible
+    ///   without the `alloc` feature, where the `tcp-socket-count-N` feature sets the limit.
     #[cfg(feature = "tcp")]
-    pub fn add_tcp_socket(&mut self, rx_capacity: usize, tx_capacity: usize) -> TcpHandle {
-        TcpHandle(self.sockets.tcp.add_with(|_| {
+    pub fn add_tcp_socket(&mut self, rx_capacity: usize, tx_capacity: usize) -> core::result::Result<TcpHandle, Full> {
+        Ok(TcpHandle(self.sockets.tcp.add_with(|_| {
             TcpSocketState::new(
                 SocketBuffer::new(vec![0; rx_capacity]),
                 SocketBuffer::new(vec![0; tx_capacity]),
             )
-        }))
+        })?))
     }
 
     /// Remove a TCP socket from the stack.
@@ -880,9 +925,15 @@ impl Stack {
     }
 
     /// Add a TCP listener to the stack, returning a handle to it.
+    ///
+    /// Errors:
+    /// - `Full` if the stack has no room for another listener. Only possible
+    ///   without the `alloc` feature, where the `tcp-listener-count-N` feature sets the limit.
     #[cfg(feature = "tcp-listener")]
-    pub fn add_tcp_listener(&mut self) -> TcpListenerHandle {
-        TcpListenerHandle(self.sockets.tcp_listeners.add_with(|_| TcpListenerState::new()))
+    pub fn add_tcp_listener(&mut self) -> core::result::Result<TcpListenerHandle, Full> {
+        Ok(TcpListenerHandle(
+            self.sockets.tcp_listeners.add_with(|_| TcpListenerState::new())?,
+        ))
     }
 
     /// Remove a TCP listener from the stack.
@@ -1853,11 +1904,11 @@ impl Stack {
                     // RFC 4861 §7.3.3: answer each packet queued on the failed
                     // resolution with an ICMP destination unreachable error.
                     #[cfg(feature = "icmp-errors")]
-                    for packet in self.inner.pending.take_matching(&(iface, addr)) {
+                    while let Some(packet) = self.inner.pending.pop_matching(&(iface, addr)) {
                         self.deliver_neighbor_failure_error(iface, packet.buf);
                     }
                     #[cfg(not(feature = "icmp-errors"))]
-                    drop(self.inner.pending.take_matching(&(iface, addr)));
+                    while self.inner.pending.pop_matching(&(iface, addr)).is_some() {}
                 }
             }
         }
@@ -2202,7 +2253,7 @@ impl StackInner {
         let key = (iface.handle, addr);
         self.neighbor_cache.fill(key, hardware_addr, self.now);
 
-        for packet in self.pending.take_matching(&key) {
+        while let Some(packet) = self.pending.pop_matching(&key) {
             trace!("neighbor: {} resolved, flushing queued packet", addr);
             let ethertype = match packet.key.1 {
                 #[cfg(feature = "ipv4")]
@@ -2943,6 +2994,8 @@ mod test {
     use crate::tcp::State as TcpState;
     use crate::time::Duration;
     use crate::udp::RecvError as UdpRecvError;
+    #[allow(unused_imports)]
+    use std::vec::Vec;
 
     #[test]
     fn test_alloc_ephemeral_port() {
@@ -3002,20 +3055,23 @@ mod test {
         let rx = Rc::new(RefCell::new(VecDeque::new()));
         let tx = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack.add_iface(
-            Box::new(TestDevice {
-                medium,
-                rx: rx.clone(),
-                tx: tx.clone(),
-            }),
-            match medium {
-                Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
-                Medium::Ip => HardwareAddress::Ip,
-            },
-        );
+        let handle = stack
+            .add_iface(
+                Box::new(TestDevice {
+                    medium,
+                    rx: rx.clone(),
+                    tx: tx.clone(),
+                }),
+                match medium {
+                    Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
+                    Medium::Ip => HardwareAddress::Ip,
+                },
+            )
+            .unwrap();
         stack
             .iface(handle)
-            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)]);
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)])
+            .unwrap();
         // Drain the solicited-node multicast reports the new addresses trigger, so
         // the tests only see the frames they provoke.
         stack.poll(Instant::ZERO);
@@ -3065,7 +3121,10 @@ mod test {
                 .iter()
                 .any(|a| a.origin == AddrOrigin::LinkLocal)
         );
-        stack.iface(handle).set_ip_addrs([IpCidr::new(OUR_V6.into(), 64)]);
+        stack
+            .iface(handle)
+            .set_ip_addrs([IpCidr::new(OUR_V6.into(), 64)])
+            .unwrap();
         assert_eq!(
             stack.iface(handle).ip_addrs(),
             &[IfaceAddr::manual(IpCidr::new(OUR_V6.into(), 64))]
@@ -3209,7 +3268,7 @@ mod test {
         assert_eq!(tx.borrow().len(), 2);
 
         // Off-link traffic goes via the router, whose address is already resolved.
-        let udp = stack.add_udp_socket();
+        let udp = stack.add_udp_socket().unwrap();
         stack.udp_socket(udp).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
         stack
             .udp_socket(udp)
@@ -3434,17 +3493,20 @@ mod test {
         for addr in [IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V4_B.into(), 24)] {
             let rx = Rc::new(RefCell::new(VecDeque::new()));
             let tx = Rc::new(RefCell::new(Vec::new()));
-            let handle = stack.add_iface(
-                Box::new(TestDevice {
-                    medium: Medium::Ip,
-                    rx: rx.clone(),
-                    tx: tx.clone(),
-                }),
-                HardwareAddress::Ip,
-            );
+            let handle = stack
+                .add_iface(
+                    Box::new(TestDevice {
+                        medium: Medium::Ip,
+                        rx: rx.clone(),
+                        tx: tx.clone(),
+                    }),
+                    HardwareAddress::Ip,
+                )
+                .unwrap();
             stack
                 .iface(handle)
-                .set_ip_addrs([addr, IpCidr::new(LINK_LOCAL_V6.into(), 64)]);
+                .set_ip_addrs([addr, IpCidr::new(LINK_LOCAL_V6.into(), 64)])
+                .unwrap();
             rxs.push(rx);
             txs.push(tx);
         }
@@ -3530,7 +3592,7 @@ mod test {
         }
 
         // With a socket bound to the port, the datagram is delivered instead.
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack.udp_socket(handle).bind(7, IpListenEndpoint::UNSPECIFIED).unwrap();
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
@@ -3541,7 +3603,7 @@ mod test {
     fn test_icmpv4_port_unreachable_suppressed_by_raw_socket() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
         // An application handling UDP through a raw socket suppresses the error.
-        let handle = stack.add_raw_socket();
+        let handle = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(handle)
             .bind(RawMode::Ip {
@@ -3611,7 +3673,7 @@ mod test {
     #[test]
     fn test_icmpv6_hop_by_hop_passthrough() {
         let (mut stack, rx, _tx) = test_stack(Medium::Ip);
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack.udp_socket(handle).bind(7, IpListenEndpoint::UNSPECIFIED).unwrap();
 
         // PadN + an unknown option whose action is "skip" (high bits 00): the
@@ -3721,7 +3783,7 @@ mod test {
         let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
 
         // A raw socket listening for ICMPv4, the erring application.
-        let raw_handle = stack.add_raw_socket();
+        let raw_handle = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(raw_handle)
             .bind(RawMode::Ip {
@@ -3733,7 +3795,7 @@ mod test {
         // Send a datagram to an on-link address that will never resolve: the
         // packet is queued and an ARP request goes out.
         let dead = Ipv4Address::new(192, 168, 1, 99);
-        let udp_handle = stack.add_udp_socket();
+        let udp_handle = stack.add_udp_socket().unwrap();
         stack
             .udp_socket(udp_handle)
             .bind(5555, IpListenEndpoint::UNSPECIFIED)
@@ -3861,17 +3923,19 @@ mod test {
         let rx = Rc::new(RefCell::new(VecDeque::new()));
         let sent = Rc::new(RefCell::new(Vec::new()));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = stack.add_iface(
-            Box::new(PtpDevice {
-                rx: rx.clone(),
-                sent: sent.clone(),
-                tx_stamps: Rc::new(RefCell::new(VecDeque::new())),
-            }),
-            HardwareAddress::Ip,
-        );
-        stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24));
+        let iface = stack
+            .add_iface(
+                Box::new(PtpDevice {
+                    rx: rx.clone(),
+                    sent: sent.clone(),
+                    tx_stamps: Rc::new(RefCell::new(VecDeque::new())),
+                }),
+                HardwareAddress::Ip,
+            )
+            .unwrap();
+        stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
 
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack
             .udp_socket(handle)
             .bind(319, IpListenEndpoint::UNSPECIFIED)
@@ -3912,7 +3976,7 @@ mod test {
     #[test]
     fn test_udp_icmp_error_delivery() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack.udp_socket(handle).bind(5000, (REMOTE_V4, 53)).unwrap();
         stack.udp_socket(handle).send_slice(b"query", (REMOTE_V4, 53)).unwrap();
         let sent = tx.borrow().last().unwrap().clone();
@@ -3942,7 +4006,7 @@ mod test {
     #[test]
     fn test_udp_icmp_error_no_match() {
         let (mut stack, rx, _tx) = test_stack(Medium::Ip);
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack
             .udp_socket(handle)
             .bind(5000, IpListenEndpoint::UNSPECIFIED)
@@ -3969,7 +4033,7 @@ mod test {
     #[test]
     fn test_udp_icmp_error_delivery_v6() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack.udp_socket(handle).bind(5000, (REMOTE_V6, 53)).unwrap();
         stack.udp_socket(handle).send_slice(b"query", (REMOTE_V6, 53)).unwrap();
         let sent = tx.borrow().last().unwrap().clone();
@@ -3993,7 +4057,7 @@ mod test {
     fn test_neighbor_failure_reported_to_udp_socket() {
         let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
         let dead = Ipv4Address::new(192, 168, 1, 99);
-        let handle = stack.add_udp_socket();
+        let handle = stack.add_udp_socket().unwrap();
         stack
             .udp_socket(handle)
             .bind(5555, IpListenEndpoint::UNSPECIFIED)
@@ -4016,7 +4080,7 @@ mod test {
     #[test]
     fn test_tcp_connect_aborted_by_icmp_error() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
-        let handle = stack.add_tcp_socket(4096, 4096);
+        let handle = stack.add_tcp_socket(4096, 4096).unwrap();
         stack.tcp_socket(handle).connect((REMOTE_V4, 80), 0).unwrap();
         stack.poll(Instant::ZERO);
         assert_eq!(stack.tcp_socket(handle).state(), TcpState::SynSent);
@@ -4042,7 +4106,7 @@ mod test {
     #[test]
     fn test_tcp_established_icmp_error_is_soft() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
-        let handle = stack.add_tcp_socket(4096, 4096);
+        let handle = stack.add_tcp_socket(4096, 4096).unwrap();
         stack.tcp_socket(handle).connect((REMOTE_V4, 80), 0).unwrap();
         stack.poll(Instant::ZERO);
         let syn = tx.borrow().last().unwrap().clone();
@@ -4114,7 +4178,7 @@ mod test {
     fn test_neighbor_failure_aborts_tcp_connect() {
         let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
         let dead = Ipv4Address::new(192, 168, 1, 99);
-        let handle = stack.add_tcp_socket(4096, 4096);
+        let handle = stack.add_tcp_socket(4096, 4096).unwrap();
         stack.tcp_socket(handle).connect((dead, 80), 0).unwrap();
 
         // The SYN is queued on the unresolvable neighbor. When resolution fails, the
@@ -4179,7 +4243,10 @@ mod test {
         assert!(tx.borrow().is_empty());
 
         // A new address is appended, and ingress starts accepting it right away.
-        assert_eq!(stack.iface(iface).add_ip_addr(IpCidr::new(new_addr.into(), 8)), None);
+        assert_eq!(
+            stack.iface(iface).add_ip_addr(IpCidr::new(new_addr.into(), 8)).unwrap(),
+            None
+        );
         assert!(stack.iface(iface).has_ip_addr(new_addr));
         inject(&mut stack, &rx, echo.clone());
         assert_eq!(tx.borrow().len(), 1);
@@ -4189,7 +4256,10 @@ mod test {
         // Re-adding an address already assigned updates its prefix in place,
         // returning the CIDR it had.
         assert_eq!(
-            stack.iface(iface).add_ip_addr(IpCidr::new(new_addr.into(), 24)),
+            stack
+                .iface(iface)
+                .add_ip_addr(IpCidr::new(new_addr.into(), 24))
+                .unwrap(),
             Some(IpCidr::new(new_addr.into(), 8))
         );
         assert_eq!(
@@ -4215,7 +4285,10 @@ mod test {
         assert!(tx.borrow().is_empty());
 
         // Wholesale replacement.
-        stack.iface(iface).set_ip_addrs([IpCidr::new(new_addr.into(), 8)]);
+        stack
+            .iface(iface)
+            .set_ip_addrs([IpCidr::new(new_addr.into(), 8)])
+            .unwrap();
         assert_eq!(
             stack.iface(iface).ip_addrs(),
             [IfaceAddr::manual(IpCidr::new(new_addr.into(), 8))]
@@ -4229,7 +4302,8 @@ mod test {
         let (mut stack, _rx, _tx) = test_stack(Medium::Ip);
         stack
             .iface(IfaceHandle(0))
-            .add_ip_addr(IpCidr::new(Ipv4Address::new(224, 0, 0, 1).into(), 24));
+            .add_ip_addr(IpCidr::new(Ipv4Address::new(224, 0, 0, 1).into(), 24))
+            .unwrap();
     }
 
     #[test]
@@ -4261,7 +4335,7 @@ mod test {
         assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
 
         // The neighbor is now resolved: a datagram to it goes out immediately.
-        let udp = stack.add_udp_socket();
+        let udp = stack.add_udp_socket().unwrap();
         stack.udp_socket(udp).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
         stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
         assert_eq!(tx.borrow().len(), 2);
@@ -4275,7 +4349,10 @@ mod test {
 
         // Changing the interface's addresses invalidates both: the queued packet
         // is dropped (no solicitation is ever retransmitted for it)...
-        stack.iface(iface).set_ip_addrs([IpCidr::new(OUR_V4.into(), 24)]);
+        stack
+            .iface(iface)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24)])
+            .unwrap();
         for secs in 1..=4 {
             stack.poll(Instant::ZERO + Duration::from_secs(secs));
         }

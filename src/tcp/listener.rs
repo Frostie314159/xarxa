@@ -1,6 +1,5 @@
 //! TCP listeners.
 
-use alloc::collections::VecDeque;
 use alloc::vec;
 
 #[cfg(feature = "tcp-timestamps")]
@@ -9,9 +8,10 @@ use super::{
     DEFAULT_MSS, ListenError, MIN_REMOTE_MSS, SocketBuffer, State, TcpControl, TcpHandle, TcpRepr, TcpSocketState,
     Tuple,
 };
+use crate::config::{TCP_LISTENER_BACKLOG, TCP_LISTENER_COUNT, TCP_SOCKET_COUNT};
 use crate::rand::Rand;
-use crate::slab::Slab;
 use crate::stack::addr_score;
+use crate::storage::{BoundedDeque, Slab};
 use crate::tcp::TcpSeqNumber;
 use crate::tcp::congestion::Controller as _;
 #[cfg(feature = "async")]
@@ -54,7 +54,7 @@ pub(crate) struct TcpListenerState {
     /// exact address.
     local: IpListenEndpoint,
     /// The accept queue: SYNs waiting to be accepted, deduplicated by 4-tuple.
-    queue: VecDeque<PendingSyn>,
+    queue: BoundedDeque<PendingSyn, TCP_LISTENER_BACKLOG>,
     #[cfg(feature = "async")]
     accept_waker: WakerRegistration,
 }
@@ -63,7 +63,7 @@ impl TcpListenerState {
     pub(crate) fn new() -> TcpListenerState {
         TcpListenerState {
             local: IpListenEndpoint::UNSPECIFIED,
-            queue: VecDeque::new(),
+            queue: BoundedDeque::new(),
             #[cfg(feature = "async")]
             accept_waker: WakerRegistration::new(),
         }
@@ -115,8 +115,14 @@ impl TcpListenerState {
         if let Some(entry) = self.queue.iter_mut().find(|s| s.tuple == tuple) {
             *entry = syn;
         } else {
+            if self.queue.push_back(syn).is_err() {
+                trace!(
+                    "listener:{}: backlog full, dropping SYN from {}",
+                    self.local, tuple.remote
+                );
+                return;
+            }
             trace!("listener:{}: SYN from {}", self.local, tuple.remote);
-            self.queue.push_back(syn);
             // There's a connection attempt to accept, notify the waiting task if any.
             #[cfg(feature = "async")]
             self.accept_waker.wake();
@@ -133,13 +139,11 @@ impl TcpListenerState {
             local: IpEndpoint::new(*dst_addr, repr.dst_port),
             remote: IpEndpoint::new(*src_addr, repr.src_port),
         };
-        if let Some(index) = self
-            .queue
-            .iter()
-            .position(|s| s.tuple == tuple && repr.seq_number == s.remote_seq_no)
-        {
+        let before = self.queue.len();
+        self.queue
+            .retain(|s| !(s.tuple == tuple && repr.seq_number == s.remote_seq_no));
+        if self.queue.len() != before {
             trace!("listener: queued SYN {} reset by remote", tuple);
-            self.queue.remove(index);
             true
         } else {
             false
@@ -157,7 +161,7 @@ impl TcpListenerState {
 /// same port. An RST aimed at a recorded SYN removes it. Everything else is
 /// left to the caller's RST fallback.
 pub(crate) fn process_listeners(
-    listeners: &mut Slab<TcpListenerState>,
+    listeners: &mut Slab<TcpListenerState, TCP_LISTENER_COUNT>,
     src_addr: &IpAddress,
     dst_addr: &IpAddress,
     repr: &TcpRepr,
@@ -200,9 +204,9 @@ pub(crate) fn process_listeners(
 ///
 /// Connection attempts (SYN packets) are not answered (with a SYN|ACK packet) until you accept them.
 pub struct TcpListener<'a> {
-    pub(crate) listeners: &'a mut Slab<TcpListenerState>,
+    pub(crate) listeners: &'a mut Slab<TcpListenerState, TCP_LISTENER_COUNT>,
     pub(crate) index: usize,
-    pub(crate) tcp: &'a mut Slab<TcpSocketState>,
+    pub(crate) tcp: &'a mut Slab<TcpSocketState, TCP_SOCKET_COUNT>,
     pub(crate) rand: &'a mut Rand,
 }
 
@@ -301,8 +305,15 @@ impl TcpListener<'_> {
     ///
     /// The new socket starts in the SYN-RECEIVED state and is added to the stack.
     ///
-    /// Returns `None` if no connection attempt is queued.
+    /// Returns `None` if no connection attempt is queued, or if the stack has no
+    /// room for another TCP socket. In the second case the attempt stays queued
+    /// and `accept` can be retried after removing a socket.
     pub fn accept(&mut self, rx_capacity: usize, tx_capacity: usize) -> Option<TcpHandle> {
+        if self.tcp.is_full() {
+            // No room for the socket: leave the SYN queued, the caller can retry
+            // after freeing one.
+            return None;
+        }
         let state = self.listeners.get_mut(self.index);
         let syn = state.queue.pop_front()?;
         trace!("listener:{}: accepting {}", state.local, syn.tuple);
@@ -336,6 +347,7 @@ impl TcpListener<'_> {
             s.tsval_offset = TcpSocketState::random_tsval_offset(self.rand);
         }
 
-        Some(TcpHandle(self.tcp.add_with(|_| s)))
+        // Can't fail: checked for room above.
+        Some(TcpHandle(unwrap!(self.tcp.add_with(|_| s))))
     }
 }

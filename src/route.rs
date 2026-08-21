@@ -14,7 +14,8 @@
 //! [`Stack::routes`]: crate::Stack::routes
 //! [`Stack::routes_mut`]: crate::Stack::routes_mut
 
-use alloc::vec::Vec;
+use crate::config::ROUTE_COUNT;
+use crate::storage::{Full, Vec};
 
 use crate::stack::IfaceHandle;
 use crate::time::Instant;
@@ -103,7 +104,7 @@ impl Route {
 /// A routing table.
 #[derive(Debug, Default)]
 pub struct Routes {
-    storage: Vec<Route>,
+    storage: Vec<Route, ROUTE_COUNT>,
 }
 
 impl Routes {
@@ -112,29 +113,81 @@ impl Routes {
         Self { storage: Vec::new() }
     }
 
-    /// Update the routes of this node.
-    pub fn update<F: FnOnce(&mut Vec<Route>)>(&mut self, f: F) {
-        f(&mut self.storage);
+    /// Add a route.
+    ///
+    /// Errors:
+    /// - `Full` if the table has no room. Only possible without the `alloc`
+    ///   feature, where the size is set by the `route-count-N` feature.
+    pub fn add(&mut self, route: Route) -> Result<(), Full> {
+        self.storage.push(route).map_err(|_| Full)
+    }
+
+    /// Remove the route at `index` and return it.
+    ///
+    /// # Panics
+    /// Panics if `index` is out of bounds.
+    pub fn remove(&mut self, index: usize) -> Route {
+        self.storage.remove(index)
+    }
+
+    /// Keep only the routes for which `f` returns true.
+    pub fn retain(&mut self, f: impl FnMut(&Route) -> bool) {
+        self.storage.retain(f)
+    }
+
+    /// Remove all routes.
+    pub fn clear(&mut self) {
+        self.storage.clear()
+    }
+
+    /// Iterate over the routes.
+    pub fn iter(&self) -> impl Iterator<Item = &Route> {
+        self.storage.iter()
+    }
+
+    /// Iterate over the routes, mutably.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Route> {
+        self.storage.iter_mut()
+    }
+
+    /// Number of routes.
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// Whether there are no routes.
+    pub fn is_empty(&self) -> bool {
+        self.storage.is_empty()
     }
 
     /// Add a default ipv4 gateway (ie. "ip route add 0.0.0.0/0 via `gateway` dev `iface`").
     ///
     /// Returns the previous default route, if any.
+    ///
+    /// Errors:
+    /// - `Full` if the table has no room. Only possible without the `alloc`
+    ///   feature, where the `route-count-N` feature sets the limit.
     #[cfg(feature = "ipv4")]
-    pub fn add_default_ipv4_route(&mut self, gateway: Ipv4Address, iface: IfaceHandle) -> Option<Route> {
+    pub fn add_default_ipv4_route(&mut self, gateway: Ipv4Address, iface: IfaceHandle) -> Result<Option<Route>, Full> {
         let old = self.remove_default_ipv4_route();
-        self.storage.push(Route::new_ipv4_gateway(gateway, iface));
-        old
+        // If the table is full here, `old` was `None` and nothing was lost.
+        self.add(Route::new_ipv4_gateway(gateway, iface))?;
+        Ok(old)
     }
 
     /// Add a default ipv6 gateway (ie. "ip -6 route add ::/0 via `gateway` dev `iface`").
     ///
     /// Returns the previous default route, if any.
+    ///
+    /// Errors:
+    /// - `Full` if the table has no room. Only possible without the `alloc`
+    ///   feature, where the `route-count-N` feature sets the limit.
     #[cfg(feature = "ipv6")]
-    pub fn add_default_ipv6_route(&mut self, gateway: Ipv6Address, iface: IfaceHandle) -> Option<Route> {
+    pub fn add_default_ipv6_route(&mut self, gateway: Ipv6Address, iface: IfaceHandle) -> Result<Option<Route>, Full> {
         let old = self.remove_default_ipv6_route();
-        self.storage.push(Route::new_ipv6_gateway(gateway, iface));
-        old
+        // If the table is full here, `old` was `None` and nothing was lost.
+        self.add(Route::new_ipv6_gateway(gateway, iface))?;
+        Ok(old)
     }
 
     /// Returns the ipv4 default route if there is one in the route table.
@@ -192,6 +245,8 @@ impl Routes {
 #[cfg(all(test, feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
+    #[allow(unused_imports)]
+    use std::vec::Vec;
 
     const IF_0: IfaceHandle = IfaceHandle(0);
     const IF_1: IfaceHandle = IfaceHandle(1);
@@ -234,7 +289,7 @@ mod test {
             preferred_until: None,
             expires_at: None,
         };
-        routes.update(|storage| storage.push(route));
+        routes.add(route).unwrap();
 
         assert_eq!(lookup(&routes, ADDR_1A, 0), Some((ADDR_1A.into(), IF_0)));
         assert_eq!(lookup(&routes, ADDR_1B, 0), Some((ADDR_1A.into(), IF_0)));
@@ -250,7 +305,7 @@ mod test {
             preferred_until: Some(Instant::from_millis(10)),
             expires_at: Some(Instant::from_millis(10)),
         };
-        routes.update(|storage| storage.push(route2));
+        routes.add(route2).unwrap();
 
         assert_eq!(lookup(&routes, ADDR_1A, 0), Some((ADDR_1A.into(), IF_0)));
         assert_eq!(lookup(&routes, ADDR_2A, 0), Some((ADDR_2A.into(), IF_1)));
@@ -267,9 +322,9 @@ mod test {
     fn test_most_specific_wins() {
         let mut routes = Routes::new();
 
-        routes.add_default_ipv6_route(ADDR_1A, IF_0);
-        routes.update(|storage| {
-            storage.push(Route {
+        routes.add_default_ipv6_route(ADDR_1A, IF_0).unwrap();
+        routes
+            .add(Route {
                 cidr: cidr_2().into(),
                 via_router: ADDR_2A.into(),
                 iface: IF_1,
@@ -277,7 +332,7 @@ mod test {
                 preferred_until: None,
                 expires_at: None,
             })
-        });
+            .unwrap();
 
         // In cidr_2: the /64 wins over the default route.
         assert_eq!(lookup(&routes, ADDR_2B, 0), Some((ADDR_2A.into(), IF_1)));
@@ -292,10 +347,10 @@ mod test {
         let gw2 = Ipv4Address::new(192, 168, 1, 2);
 
         assert!(routes.get_default_ipv4_route().is_none());
-        assert!(routes.add_default_ipv4_route(gw1, IF_0).is_none());
+        assert!(routes.add_default_ipv4_route(gw1, IF_0).unwrap().is_none());
 
         // Adding a second default route replaces the first.
-        let old = routes.add_default_ipv4_route(gw2, IF_1).unwrap();
+        let old = routes.add_default_ipv4_route(gw2, IF_1).unwrap().unwrap();
         assert_eq!(old.via_router, gw1.into());
         let current = routes.get_default_ipv4_route().unwrap();
         assert_eq!(current.via_router, gw2.into());
@@ -308,24 +363,26 @@ mod test {
     #[test]
     fn test_purge_iface() {
         let mut routes = Routes::new();
-        routes.update(|storage| {
-            storage.push(Route {
+        routes
+            .add(Route {
                 cidr: cidr_1().into(),
                 via_router: ADDR_1A.into(),
                 iface: IF_0,
                 origin: RouteOrigin::Manual,
                 preferred_until: None,
                 expires_at: None,
-            });
-            storage.push(Route {
+            })
+            .unwrap();
+        routes
+            .add(Route {
                 cidr: cidr_2().into(),
                 via_router: ADDR_2A.into(),
                 iface: IF_1,
                 origin: RouteOrigin::Manual,
                 preferred_until: None,
                 expires_at: None,
-            });
-        });
+            })
+            .unwrap();
 
         routes.purge_iface(IF_0);
         assert_eq!(lookup(&routes, ADDR_1A, 0), None);

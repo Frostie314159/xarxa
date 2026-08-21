@@ -12,8 +12,6 @@ use crate::wire::{EthernetAddress, Ipv4Address};
 pub const SERVER_PORT: u16 = 67;
 /// The UDP port DHCP clients listen on.
 pub const CLIENT_PORT: u16 = 68;
-/// The most DNS servers a client keeps from a lease.
-pub const MAX_DNS_SERVER_COUNT: usize = 3;
 
 /// The magic cookie that starts the options field of every DHCP packet.
 pub const MAGIC_NUMBER: u32 = 0x63825363;

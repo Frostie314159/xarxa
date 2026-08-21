@@ -8,7 +8,8 @@
 //!
 //! Needs the `slaac` feature.
 
-use alloc::vec::Vec;
+use crate::config::{SLAAC_PREFIX_COUNT, SLAAC_ROUTER_COUNT};
+use crate::storage::Vec;
 
 use crate::buf::PacketBuf;
 use crate::route::{Route as IfaceRoute, RouteOrigin};
@@ -141,9 +142,9 @@ impl Route {
 #[derive(Debug)]
 pub(crate) struct Slaac {
     /// Set of prefixes received.
-    prefix: Vec<(Ipv6Cidr, PrefixInfo)>,
+    prefix: Vec<(Ipv6Cidr, PrefixInfo), SLAAC_PREFIX_COUNT>,
     /// Set of routes received.
-    routes: Vec<Route>,
+    routes: Vec<Route, SLAAC_ROUTER_COUNT>,
     /// Router discovery phase.
     phase: Phase,
     /// Signal for address and route updates.
@@ -191,8 +192,9 @@ impl Slaac {
         let prefix_info = PrefixInfo::from_prefix(prefix, now);
         if let Some((_, old_info)) = self.prefix.iter_mut().find(|(c, _)| c == cidr) {
             *old_info = prefix_info;
-        } else {
-            self.prefix.push((*cidr, prefix_info));
+        } else if self.prefix.push((*cidr, prefix_info)).is_err() {
+            warn!("slaac: prefix table full, ignoring prefix {}", cidr);
+            return;
         }
         // Unlike the original, a refreshed lifetime also syncs, so the expiry on
         // the installed address and route follows the latest advertisement.
@@ -210,12 +212,17 @@ impl Slaac {
     fn add_route(&mut self, cidr: &Ipv6Cidr, router: &Ipv6Address, valid_until: Instant) {
         if let Some(route) = self.routes.iter_mut().find(|r| r.same_route(cidr, router)) {
             route.valid_until = valid_until;
-        } else {
-            self.routes.push(Route {
+        } else if self
+            .routes
+            .push(Route {
                 cidr: *cidr,
                 via_router: *router,
                 valid_until,
-            });
+            })
+            .is_err()
+        {
+            warn!("slaac: router table full, ignoring route via {}", router);
+            return;
         }
         self.sync_required = true;
     }
@@ -347,13 +354,13 @@ impl Slaac {
 
 /// Form the address `link_prefix` + EUI-64 of `hardware_addr`, if the prefix is
 /// 64 bits long.
-fn from_link_prefix(link_prefix: &Ipv6Cidr, iface: &IfaceState) -> Option<Ipv6Cidr> {
+fn from_link_prefix(link_prefix: &Ipv6Cidr, ethernet_addr: crate::wire::EthernetAddress) -> Option<Ipv6Cidr> {
     if link_prefix.prefix_len() != 64 {
         return None;
     }
     let mut bytes = [0; 16];
     bytes[0..8].copy_from_slice(&link_prefix.address().octets()[0..8]);
-    bytes[8..16].copy_from_slice(&iface.ethernet_addr().as_eui_64());
+    bytes[8..16].copy_from_slice(&ethernet_addr.as_eui_64());
     Some(Ipv6Cidr::new(Ipv6Address::from_octets(bytes), 64))
 }
 
@@ -370,9 +377,8 @@ impl IfaceState {
         let flags = icmp_packet.router_flags();
         let router_lifetime = icmp_packet.router_lifetime();
 
-        // Walk the options: every prefix information option feeds SLAAC, and the
-        // source link-layer address option teaches us the router's MAC.
-        let mut prefixes: Vec<PrefixInformation> = Vec::new();
+        // First pass over the options: validate them all, and pick up the
+        // source link-layer address option, which teaches us the router's MAC.
         let mut lladdr: Option<RawHardwareAddress> = None;
         let options = icmp_packet.payload_mut();
         let mut offset = 0;
@@ -381,22 +387,32 @@ impl IfaceState {
                 trace!("ndisc: malformed router advertisement option");
                 return;
             };
-            let opt_len = opt.data_len() as usize * 8;
-            match opt.option_type() {
-                NdiscOptionType::PrefixInformation => prefixes.push(PrefixInformation {
-                    prefix_len: opt.prefix_len(),
-                    flags: opt.prefix_flags(),
-                    valid_lifetime: opt.valid_lifetime(),
-                    preferred_lifetime: opt.preferred_lifetime(),
-                    prefix: opt.prefix(),
-                }),
-                NdiscOptionType::SourceLinkLayerAddr => lladdr = Some(opt.link_layer_addr()),
-                _ => {}
+            if opt.option_type() == NdiscOptionType::SourceLinkLayerAddr {
+                lladdr = Some(opt.link_layer_addr());
             }
-            offset += opt_len;
+            offset += opt.data_len() as usize * 8;
         }
 
-        slaac.process_advertisement(&src_addr, flags, router_lifetime, prefixes.into_iter(), inner.now);
+        // Second pass: feed every prefix information option to SLAAC, straight
+        // from the packet. The first pass checked that they all parse.
+        let mut offset = 0;
+        let prefixes = core::iter::from_fn(|| {
+            while offset < options.len() {
+                let opt = NdiscOption::new_checked(&mut options[offset..]).ok()?;
+                offset += opt.data_len() as usize * 8;
+                if opt.option_type() == NdiscOptionType::PrefixInformation {
+                    return Some(PrefixInformation {
+                        prefix_len: opt.prefix_len(),
+                        flags: opt.prefix_flags(),
+                        valid_lifetime: opt.valid_lifetime(),
+                        preferred_lifetime: opt.preferred_lifetime(),
+                        prefix: opt.prefix(),
+                    });
+                }
+            }
+            None
+        });
+        slaac.process_advertisement(&src_addr, flags, router_lifetime, prefixes, inner.now);
 
         if let Some(lladdr) = lladdr
             && let Ok(lladdr) = lladdr.parse_ethernet()
@@ -409,32 +425,38 @@ impl IfaceState {
     /// Synchronize the slaac address and router state with the interface state.
     pub(crate) fn sync_slaac_state(&mut self, inner: &mut StackInner) {
         let timestamp = inner.now;
+        let ethernet_addr = self.ethernet_addr();
         let Some(slaac) = &self.slaac else { return };
-
-        let mut required_addresses: Vec<Ipv6Cidr> = Vec::new();
-        let mut removed_addresses: Vec<Ipv6Cidr> = Vec::new();
-        for (prefix, prefixinfo) in slaac.prefix.iter() {
-            if let Some(addr) = from_link_prefix(prefix, self) {
-                if prefixinfo.is_valid(timestamp) {
-                    required_addresses.push(addr);
-                } else {
-                    removed_addresses.push(addr);
-                }
-            }
-        }
 
         // Addresses come and go without touching the link state: the router that
         // advertised the prefix has just been entered into the neighbor cache.
-        for address in required_addresses {
+        //
+        // Every valid prefix gets its address...
+        for (prefix, prefixinfo) in slaac.prefix.iter() {
+            if !prefixinfo.is_valid(timestamp) {
+                continue;
+            }
+            let Some(address) = from_link_prefix(prefix, ethernet_addr) else {
+                continue;
+            };
             if !self.ip_addrs.iter().any(|a| a.cidr == IpCidr::Ipv6(address)) {
-                self.ip_addrs.push(IfaceAddr {
+                let new_addr = IfaceAddr {
                     cidr: IpCidr::Ipv6(address),
                     origin: AddrOrigin::Slaac,
-                });
+                };
+                if self.ip_addrs.push(new_addr).is_err() {
+                    warn!("slaac: address table full, {} not assigned", address);
+                }
             }
         }
+        // ...and the address of every expired prefix goes.
         self.ip_addrs.retain(|a| match a.cidr {
-            IpCidr::Ipv6(address) => !(a.origin == AddrOrigin::Slaac && removed_addresses.contains(&address)),
+            IpCidr::Ipv6(address) => {
+                !(a.origin == AddrOrigin::Slaac
+                    && slaac.prefix.iter().any(|(prefix, prefixinfo)| {
+                        !prefixinfo.is_valid(timestamp) && from_link_prefix(prefix, ethernet_addr) == Some(address)
+                    }))
+            }
             #[allow(unreachable_patterns)]
             _ => true,
         });
@@ -442,44 +464,45 @@ impl IfaceState {
         {
             let handle = self.handle;
             let slaac_routes = &slaac.routes;
-            inner.routes.update(|routes| {
-                routes.retain(|r| match (&r.cidr, &r.via_router) {
-                    (IpCidr::Ipv6(cidr), crate::wire::IpAddress::Ipv6(via_router)) => {
-                        !(r.origin == RouteOrigin::Slaac
-                            && r.iface == handle
-                            && slaac_routes
-                                .iter()
-                                .any(|f| !f.is_valid(timestamp) && f.same_route(cidr, via_router)))
-                    }
-                    #[allow(unreachable_patterns)]
-                    _ => true,
-                });
+            inner.routes.retain(|r| match (&r.cidr, &r.via_router) {
+                (IpCidr::Ipv6(cidr), crate::wire::IpAddress::Ipv6(via_router)) => {
+                    !(r.origin == RouteOrigin::Slaac
+                        && r.iface == handle
+                        && slaac_routes
+                            .iter()
+                            .any(|f| !f.is_valid(timestamp) && f.same_route(cidr, via_router)))
+                }
+                #[allow(unreachable_patterns)]
+                _ => true,
+            });
 
-                for route in slaac_routes.iter().filter(|r| r.is_valid(timestamp)) {
-                    if let Some(existing) = routes.iter_mut().find(|r| {
-                        r.origin == RouteOrigin::Slaac
-                            && r.iface == handle
-                            && match (&r.cidr, &r.via_router) {
-                                (IpCidr::Ipv6(cidr), crate::wire::IpAddress::Ipv6(via_router)) => {
-                                    route.same_route(cidr, via_router)
-                                }
-                                #[allow(unreachable_patterns)]
-                                _ => false,
+            for route in slaac_routes.iter().filter(|r| r.is_valid(timestamp)) {
+                if let Some(existing) = inner.routes.iter_mut().find(|r| {
+                    r.origin == RouteOrigin::Slaac
+                        && r.iface == handle
+                        && match (&r.cidr, &r.via_router) {
+                            (IpCidr::Ipv6(cidr), crate::wire::IpAddress::Ipv6(via_router)) => {
+                                route.same_route(cidr, via_router)
                             }
-                    }) {
-                        existing.expires_at = Some(route.valid_until);
-                    } else {
-                        routes.push(IfaceRoute {
-                            cidr: route.cidr.into(),
-                            via_router: route.via_router.into(),
-                            iface: handle,
-                            origin: RouteOrigin::Slaac,
-                            preferred_until: None,
-                            expires_at: Some(route.valid_until),
-                        });
+                            #[allow(unreachable_patterns)]
+                            _ => false,
+                        }
+                }) {
+                    existing.expires_at = Some(route.valid_until);
+                } else {
+                    let new_route = IfaceRoute {
+                        cidr: route.cidr.into(),
+                        via_router: route.via_router.into(),
+                        iface: handle,
+                        origin: RouteOrigin::Slaac,
+                        preferred_until: None,
+                        expires_at: Some(route.valid_until),
+                    };
+                    if inner.routes.add(new_route).is_err() {
+                        warn!("slaac: route table full, route via {} not installed", route.via_router);
                     }
                 }
-            });
+            }
         }
 
         self.slaac.as_mut().unwrap().update_slaac_state(timestamp);
@@ -537,7 +560,7 @@ impl IfaceState {
         let handle = self.handle;
         inner
             .routes
-            .update(|routes| routes.retain(|r| !(r.origin == RouteOrigin::Slaac && r.iface == handle)));
+            .retain(|r| !(r.origin == RouteOrigin::Slaac && r.iface == handle));
         self.config_changed();
     }
 }
@@ -545,6 +568,8 @@ impl IfaceState {
 #[cfg(test)]
 mod test {
     use super::*;
+    #[allow(unused_imports)]
+    use std::vec::Vec;
     mod mock {
         use super::super::*;
         pub const SOURCE: Ipv6Address = Ipv6Address::new(0xfe80, 0xdb8, 0, 0, 0, 0, 0, 0);
