@@ -3,8 +3,9 @@ name = "xarxa"
 version = "0.1.0"
 edition = "2024"
 
-[package.metadata.docs.rs]
-features = [
+[features]
+# All features are enabled by default, except embedded-specific ones (like `defmt`)
+default = [
     "std",
     "log",
     "async",
@@ -19,33 +20,15 @@ features = [
     "tcp",
     "tcp-listener",
     "dhcpv4",
+    "slaac",
     "dns",
     "mdns",
     "multicast",
-    "tcp-reno",
+    "tcp-cubic",
     "tcp-timestamps",
     "packetmeta-timestamp",
 ]
 
-[features]
-default = [
-    "std",
-    "log",
-    "icmp-ping-reply",
-    "icmp-errors",
-    "medium-ethernet",
-    "medium-ip",
-    "ipv4",
-    "ipv6",
-    "raw",
-    "udp",
-    "tcp",
-    "tcp-listener",
-    "dhcpv4",
-    "slaac",
-    "dns",
-    "multicast",
-]
 ## Enable functionality that requires the Rust standard library: the
 ## `TunTapInterface` device, `iface::wait`, and `Instant::now()`.
 std = ["dep:libc"]
