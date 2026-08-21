@@ -41,6 +41,8 @@ mod ethernet;
 mod icmpv4;
 #[cfg(feature = "ipv6")]
 mod icmpv6;
+#[cfg(all(feature = "ipv4", feature = "multicast"))]
+mod igmp;
 pub(crate) mod ip;
 #[cfg(feature = "ipv4")]
 pub(crate) mod ipv4;
@@ -48,6 +50,8 @@ pub(crate) mod ipv4;
 pub(crate) mod ipv6;
 #[cfg(feature = "ipv6")]
 mod ipv6ext;
+#[cfg(all(feature = "ipv6", feature = "multicast"))]
+mod mld;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
 mod ndisc;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
@@ -106,6 +110,7 @@ pub use self::ip::{
 #[cfg(feature = "ipv4")]
 pub use self::ipv4::{
     Address as Ipv4Address, Cidr as Ipv4Cidr, HEADER_LEN as IPV4_HEADER_LEN, MIN_MTU as IPV4_MIN_MTU,
+    MULTICAST_ALL_ROUTERS as IPV4_MULTICAST_ALL_ROUTERS, MULTICAST_ALL_SYSTEMS as IPV4_MULTICAST_ALL_SYSTEMS,
     Packet as Ipv4Packet,
 };
 
@@ -115,6 +120,7 @@ pub(crate) use self::ipv4::AddressExt as Ipv4AddressExt;
 #[cfg(feature = "ipv6")]
 pub use self::ipv6::{
     Address as Ipv6Address, Cidr as Ipv6Cidr, HEADER_LEN as IPV6_HEADER_LEN,
+    LINK_LOCAL_ALL_MLDV2_ROUTERS as IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS,
     LINK_LOCAL_ALL_NODES as IPV6_LINK_LOCAL_ALL_NODES, LINK_LOCAL_ALL_ROUTERS as IPV6_LINK_LOCAL_ALL_ROUTERS,
     MIN_MTU as IPV6_MIN_MTU, Packet as Ipv6Packet,
 };
@@ -124,7 +130,7 @@ pub(crate) use self::ipv6::{AddressExt as Ipv6AddressExt, MulticastScope as Ipv6
 #[cfg(feature = "ipv6")]
 pub use self::ipv6ext::{
     ExtHeader as Ipv6ExtHeader, OptionFailureAction as Ipv6OptionFailureAction, OptionType as Ipv6OptionType,
-    OptionsIter as Ipv6OptionsIter,
+    OptionsIter as Ipv6OptionsIter, RouterAlert as Ipv6RouterAlert,
 };
 
 #[cfg(feature = "ipv4")]
@@ -137,6 +143,14 @@ pub use self::icmpv4::{
 pub use self::icmpv6::{
     DstUnreachable as Icmpv6DstUnreachable, Message as Icmpv6Message, Packet as Icmpv6Packet,
     ParamProblem as Icmpv6ParamProblem, TimeExceeded as Icmpv6TimeExceeded,
+};
+
+#[cfg(all(feature = "ipv4", feature = "multicast"))]
+pub use self::igmp::{BUFFER_LEN as IGMP_BUFFER_LEN, IgmpVersion, Message as IgmpMessage, Packet as IgmpPacket};
+
+#[cfg(all(feature = "ipv6", feature = "multicast"))]
+pub use self::mld::{
+    ADDRESS_RECORD_LEN as MLD_ADDRESS_RECORD_LEN, AddressRecord as MldAddressRecord, RecordType as MldRecordType,
 };
 
 #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]

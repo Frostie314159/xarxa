@@ -770,6 +770,10 @@ mod test {
             HardwareAddress::Ethernet(OUR_HW),
         );
         assert_eq!(handle, IFACE);
+        // Drain the solicited-node multicast report the link-local address triggers,
+        // so the tests only see the frames DHCP provokes.
+        stack.poll(at(0));
+        tx.borrow_mut().clear();
         stack.iface(handle).set_dhcpv4(Some(DhcpConfig::default()));
         (stack, rx, tx)
     }

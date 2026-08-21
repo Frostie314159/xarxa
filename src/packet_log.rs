@@ -8,6 +8,8 @@
 //! and sends.
 
 use crate::PacketBuf;
+#[cfg(all(feature = "ipv4", feature = "multicast"))]
+use crate::wire::IgmpPacket;
 #[cfg(feature = "udp")]
 use crate::wire::UdpPacket;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
@@ -27,6 +29,8 @@ use crate::wire::{
     Ipv6OptionsIter, Ipv6Packet,
 };
 use crate::wire::{IpProtocol, IpVersion};
+#[cfg(all(feature = "ipv6", feature = "multicast"))]
+use crate::wire::{MLD_ADDRESS_RECORD_LEN, MldAddressRecord};
 #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
 use crate::wire::{NdiscOption, NdiscOptionType};
 #[cfg(feature = "tcp")]
@@ -258,9 +262,28 @@ fn log_transport(proto: IpProtocol, version: IpVersion, payload: &mut [u8]) {
         (IpProtocol::Icmp, IpVersion::Ipv4) => log_icmpv4(payload),
         #[cfg(feature = "ipv6")]
         (IpProtocol::Icmpv6, IpVersion::Ipv6) => log_icmpv6(payload),
+        #[cfg(all(feature = "ipv4", feature = "multicast"))]
+        (IpProtocol::Igmp, IpVersion::Ipv4) => log_igmp(payload),
         (IpProtocol::Ipv6NoNxt, _) => {}
         _ => trace!("{} payload len={}", proto, payload.len()),
     }
+}
+
+#[cfg(all(feature = "ipv4", feature = "multicast"))]
+fn log_igmp(buf: &mut [u8]) {
+    let packet = match IgmpPacket::new_checked(buf) {
+        Ok(p) => p,
+        Err(_) => {
+            trace!("IGMP: malformed");
+            return;
+        }
+    };
+    trace!(
+        "IGMP type={} max_resp_code={} group={}",
+        packet.msg_type(),
+        packet.max_resp_code(),
+        packet.group_addr()
+    );
 }
 
 #[cfg(feature = "udp")]
@@ -548,12 +571,27 @@ fn log_icmpv6(buf: &mut [u8]) {
             packet.target_addr(),
             packet.dest_addr()
         ),
+        #[cfg(feature = "multicast")]
+        Icmpv6Message::MldQuery => trace!(
+            "ICMPv6 type={} max_resp_code={} mcast_addr={} num_srcs={}",
+            ty,
+            packet.max_resp_code(),
+            packet.mcast_addr(),
+            packet.num_srcs()
+        ),
+        #[cfg(feature = "multicast")]
+        Icmpv6Message::MldReport => trace!("ICMPv6 type={} records={}", ty, packet.nr_mcast_addr_rcrds()),
         _ => trace!("ICMPv6 type={} code={} payload={}", ty, code, packet.payload().len()),
     }
 
     if ty.is_error() {
         log_ipv6(packet.payload_mut());
         return;
+    }
+
+    #[cfg(feature = "multicast")]
+    if ty == Icmpv6Message::MldReport {
+        log_mld_records(packet.payload_mut());
     }
 
     #[cfg(feature = "medium-ethernet")]
@@ -566,6 +604,32 @@ fn log_icmpv6(buf: &mut [u8]) {
             | Icmpv6Message::Redirect
     ) {
         log_ndisc_options(packet.payload_mut());
+    }
+}
+
+#[cfg(all(feature = "ipv6", feature = "multicast"))]
+fn log_mld_records(mut buf: &mut [u8]) {
+    while !buf.is_empty() {
+        let record = match MldAddressRecord::new_checked(buf) {
+            Ok(r) => r,
+            Err(_) => {
+                trace!("  mld record: malformed");
+                return;
+            }
+        };
+        trace!(
+            "  mld record type={} addr={} srcs={}",
+            record.record_type(),
+            record.mcast_addr(),
+            record.num_srcs()
+        );
+        // Each source is an address, the auxiliary data length is in 32-bit words.
+        let len = MLD_ADDRESS_RECORD_LEN + record.num_srcs() as usize * 16 + record.aux_data_len() as usize * 4;
+        if len > buf.len() {
+            trace!("  mld record: malformed");
+            return;
+        }
+        buf = &mut buf[len..];
     }
 }
 

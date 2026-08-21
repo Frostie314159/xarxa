@@ -79,6 +79,29 @@ open_enum! {
     }
 }
 
+open_enum! {
+    /// The value of an IPv6 Router Alert Header Option.
+    ///
+    /// Router Alert options always contain exactly one `u16`; see [RFC 2711 § 2.1].
+    ///
+    /// [RFC 2711 § 2.1]: https://tools.ietf.org/html/rfc2711#section-2.1
+    pub enum RouterAlert(u16) {
+        /// The packet contains a Multicast Listener Discovery message.
+        MulticastListenerDiscovery = 0,
+        /// The packet contains an RSVP message.
+        Rsvp = 1,
+        /// The packet contains an Active Networks message.
+        ActiveNetworks = 2,
+    }
+}
+
+impl RouterAlert {
+    /// Per [RFC 2711 § 2.1], Router Alert options always have 2 bytes of data.
+    ///
+    /// [RFC 2711 § 2.1]: https://tools.ietf.org/html/rfc2711#section-2.1
+    pub const DATA_LEN: u8 = 2;
+}
+
 /// The action required of a node that does not recognize an option, from the two
 /// highest-order bits of the option type (RFC 8200 §4.2).
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

@@ -540,14 +540,6 @@ impl IfaceState {
             .update(|routes| routes.retain(|r| !(r.origin == RouteOrigin::Slaac && r.iface == handle)));
         self.config_changed();
     }
-
-    /// Get the first link-local IPv6 address of the interface, if present.
-    fn link_local_ipv6_address(&self) -> Option<Ipv6Address> {
-        self.ip_addrs.iter().find_map(|a| match a.cidr {
-            IpCidr::Ipv6(cidr) if cidr.address().is_link_local() => Some(cidr.address()),
-            _ => None,
-        })
-    }
 }
 
 #[cfg(test)]

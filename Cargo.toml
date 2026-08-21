@@ -21,6 +21,7 @@ features = [
     "dhcpv4",
     "dns",
     "mdns",
+    "multicast",
     "tcp-reno",
     "tcp-timestamps",
     "packetmeta-timestamp",
@@ -43,6 +44,7 @@ default = [
     "dhcpv4",
     "slaac",
     "dns",
+    "multicast",
 ]
 ## Enable functionality that requires the Rust standard library: the
 ## `TunTapInterface` device, `iface::wait`, and `Instant::now()`.
@@ -77,6 +79,8 @@ slaac = ["ipv6", "medium-ethernet"]
 dns = ["udp"]
 ## Resolve `.local` names with multicast DNS in the DNS client.
 mdns = ["dns"]
+## Join IP multicast groups, with IGMP (IPv4) and MLD (IPv6) membership reports.
+multicast = []
 ## Send and receive the TCP timestamp option (RFC 7323).
 tcp-timestamps = ["tcp"]
 ## Automatically reply to pings (ICMP echo requests).
@@ -145,6 +149,14 @@ required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6
 [[example]]
 name = "dhcp"
 required-features = ["std", "log", "medium-ethernet", "ipv4", "dhcpv4"]
+
+[[example]]
+name = "multicast"
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "multicast", "raw", "udp"]
+
+[[example]]
+name = "multicast6"
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "multicast", "udp"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

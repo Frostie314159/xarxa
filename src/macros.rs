@@ -1,3 +1,17 @@
+/// Unwrap a parse result in ingress code, returning early (with the function's
+/// default return value) on a malformed packet.
+macro_rules! check {
+    ($e:expr) => {
+        match $e {
+            Ok(x) => x,
+            Err(_) => {
+                trace!("iface: malformed ingress packet");
+                return Default::default();
+            }
+        }
+    };
+}
+
 macro_rules! open_enum {
     (
         $( #[$enum_attr:meta] )*

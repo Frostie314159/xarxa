@@ -25,18 +25,6 @@ use crate::time::Instant;
 use crate::udp::{UdpHandle, UdpSocket, UdpSocketState};
 use crate::wire::*;
 
-macro_rules! check {
-    ($e:expr) => {
-        match $e {
-            Ok(x) => x,
-            Err(_) => {
-                trace!("iface: malformed ingress packet");
-                return Default::default();
-            }
-        }
-    };
-}
-
 /// A handle to an interface added to a [`Stack`].
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -133,6 +121,8 @@ pub(crate) struct IfaceState {
     pub(crate) dhcpv4: Option<crate::dhcpv4::Client>,
     #[cfg(feature = "slaac")]
     pub(crate) slaac: Option<crate::slaac::Slaac>,
+    #[cfg(feature = "multicast")]
+    pub(crate) multicast: crate::multicast::State,
 }
 
 /// An interface borrowed from a [`Stack`], returned by [`Stack::iface`].
@@ -145,12 +135,12 @@ pub struct Iface<'a> {
 
 impl Iface<'_> {
     #[inline]
-    fn state(&self) -> &IfaceState {
+    pub(crate) fn state(&self) -> &IfaceState {
         self.ifaces.get(self.index)
     }
 
     #[inline]
-    fn state_mut(&mut self) -> &mut IfaceState {
+    pub(crate) fn state_mut(&mut self) -> &mut IfaceState {
         self.ifaces.get_mut(self.index)
     }
 
@@ -736,7 +726,15 @@ impl Stack {
             dhcpv4: None,
             #[cfg(feature = "slaac")]
             slaac: None,
+            #[cfg(feature = "multicast")]
+            multicast: crate::multicast::State::new(),
         });
+        // The link-local address is already assigned, so its solicited-node
+        // group is joined before the first configuration change.
+        #[cfg(all(feature = "multicast", feature = "ipv6", feature = "medium-ethernet"))]
+        if self.ifaces.get(index).medium() == Medium::Ethernet {
+            self.ifaces.get_mut(index).update_solicited_node_groups();
+        }
         IfaceHandle(index)
     }
 
@@ -1004,6 +1002,9 @@ impl Stack {
                     iface.sync_slaac_state(&mut self.inner);
                 }
             }
+
+            #[cfg(feature = "multicast")]
+            self.ifaces.get_mut(index).multicast_egress(&mut self.inner);
         }
 
         #[allow(unused_mut)]
@@ -1051,6 +1052,15 @@ impl Stack {
                 .ifaces
                 .iter()
                 .filter_map(|(_, iface)| iface.slaac.as_ref().map(|s| s.poll_at(timestamp)))
+                .fold(deadline, Instant::min);
+        }
+
+        #[cfg(feature = "multicast")]
+        {
+            deadline = self
+                .ifaces
+                .iter()
+                .map(|(_, iface)| iface.multicast.poll_at())
                 .fold(deadline, Instant::min);
         }
 
@@ -1347,8 +1357,9 @@ impl Stack {
                 return;
             }
 
-            if !iface.has_ip_addr(dst_addr) && !iface.is_broadcast_v4(dst_addr) {
-                // Ignore IP packets not directed at us, or broadcast.
+            if !iface.has_ip_addr(dst_addr) && !iface.has_multicast_group(dst_addr) && !iface.is_broadcast_v4(dst_addr)
+            {
+                // Ignore IP packets not directed at us, or broadcast, or any of the multicast groups.
                 trace!("Rejecting IPv4 packet; not for us");
                 return;
             }
@@ -1376,6 +1387,8 @@ impl Stack {
         #[cfg(feature = "raw")]
         let Some((mut buf, handled_by_raw)) = ({
             let stack_wants = matches!(next_header, IpProtocol::Icmp | IpProtocol::Udp | IpProtocol::Tcp);
+            #[cfg(feature = "multicast")]
+            let stack_wants = stack_wants || next_header == IpProtocol::Igmp;
             self.process_raw_ip(IpVersion::Ipv4, next_header, stack_wants, buf)
         }) else {
             return;
@@ -1389,6 +1402,11 @@ impl Stack {
 
         match next_header {
             IpProtocol::Icmp => self.process_icmpv4(iface, src_addr, dst_addr, buf),
+            #[cfg(feature = "multicast")]
+            IpProtocol::Igmp => self
+                .ifaces
+                .get_mut(iface.0)
+                .process_igmp(&mut self.inner, dst_addr, buf),
             #[cfg(feature = "udp")]
             IpProtocol::Udp => self.process_udp(
                 iface,
@@ -1788,6 +1806,13 @@ impl Stack {
                 self.inner
                     .process_ndisc_advert(self.ifaces.get_mut(iface.0), src_addr, &mut icmp_packet)
             }
+
+            // [RFC 3810 § 6.2], reception checks
+            #[cfg(feature = "multicast")]
+            Icmpv6Message::MldQuery if hop_limit == 1 && src_addr.is_link_local() => self
+                .ifaces
+                .get_mut(iface.0)
+                .process_mldv2(&mut self.inner, dst_addr, &icmp_packet),
 
             // RFC 4861 §6.1.2: a router advertisement is only valid from a link-local
             // source, with the un-decremented hop limit.
@@ -2349,7 +2374,7 @@ impl StackInner {
         self.transmit_ip_frame(iface, dst, next_hop, buf, EthernetProtocol::Ipv4);
     }
 
-    fn transmit_ip_frame(
+    pub(crate) fn transmit_ip_frame(
         &mut self,
         iface: &mut IfaceState,
         dst_addr: IpAddress,
@@ -2416,7 +2441,7 @@ fn packet_log_layer(medium: Medium) -> crate::packet_log::Layer {
 
 /// Prepend an IPv4 header to a fully-built L4 payload.
 #[cfg(feature = "ipv4")]
-fn push_ipv4_header(
+pub(crate) fn push_ipv4_header(
     buf: &mut PacketBuf,
     src_addr: Ipv4Address,
     dst_addr: Ipv4Address,
@@ -2445,7 +2470,7 @@ fn push_ipv4_header(
 
 /// Prepend an IPv6 header to a fully-built L4 payload.
 #[cfg(feature = "ipv6")]
-fn push_ipv6_header(
+pub(crate) fn push_ipv6_header(
     buf: &mut PacketBuf,
     src_addr: Ipv6Address,
     dst_addr: Ipv6Address,
@@ -2574,7 +2599,10 @@ fn process_hop_by_hop(payload: &[u8]) -> crate::wire::Result<HopByHopAction> {
 
 impl IfaceState {
     /// The interface's medium.
-    #[cfg(all(feature = "raw", feature = "medium-ethernet"))]
+    #[cfg(all(
+        feature = "medium-ethernet",
+        any(feature = "raw", all(feature = "multicast", feature = "ipv6"))
+    ))]
     pub(crate) fn medium(&self) -> Medium {
         self.dev.capabilities().medium
     }
@@ -2590,7 +2618,14 @@ impl IfaceState {
 
     /// Note that the interface's configuration changed: bump the generation and
     /// wake whoever is waiting for it.
+    ///
+    /// Also keeps the solicited-node multicast groups in step with the addresses,
+    /// since every address change passes through here.
     pub(crate) fn config_changed(&mut self) {
+        #[cfg(all(feature = "multicast", feature = "ipv6", feature = "medium-ethernet"))]
+        if self.medium() == Medium::Ethernet {
+            self.update_solicited_node_groups();
+        }
         self.config_generation = self.config_generation.wrapping_add(1);
         #[cfg(feature = "async")]
         self.config_waker.wake();
@@ -2611,11 +2646,11 @@ impl IfaceState {
     }
 
     /// The assigned addresses, without their origin.
-    fn cidrs(&self) -> impl Iterator<Item = &IpCidr> + '_ {
+    pub(crate) fn cidrs(&self) -> impl Iterator<Item = &IpCidr> + '_ {
         self.ip_addrs.iter().map(|a| &a.cidr)
     }
 
-    fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
+    pub(crate) fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
         let addr = addr.into();
         self.cidrs().any(|probe| probe.address() == addr)
     }
@@ -2625,8 +2660,8 @@ impl IfaceState {
     }
 
     /// Get the first IPv4 address of the interface.
-    #[cfg(all(feature = "ipv4", feature = "icmp-ping-reply"))]
-    fn ipv4_addr(&self) -> Option<Ipv4Address> {
+    #[cfg(all(feature = "ipv4", any(feature = "icmp-ping-reply", feature = "multicast")))]
+    pub(crate) fn ipv4_addr(&self) -> Option<Ipv4Address> {
         self.cidrs().find_map(|addr| match *addr {
             IpCidr::Ipv4(cidr) => Some(cidr.address()),
             #[allow(unreachable_patterns)]
@@ -2711,7 +2746,7 @@ impl IfaceState {
     ///
     /// [RFC 4291 § 2.7.1]: https://tools.ietf.org/html/rfc4291#section-2.7.1
     #[cfg(feature = "ipv6")]
-    fn has_solicited_node(&self, addr: Ipv6Address) -> bool {
+    pub(crate) fn has_solicited_node(&self, addr: Ipv6Address) -> bool {
         self.cidrs().any(|cidr| {
             match *cidr {
                 IpCidr::Ipv6(cidr) if cidr.address() != Ipv6Address::LOCALHOST => {
@@ -2724,13 +2759,30 @@ impl IfaceState {
         })
     }
 
-    /// Check whether the given address is a multicast group the stack has joined.
-    ///
-    /// The stack implicitly joins the all-nodes multicast group and the solicited
-    /// node multicast group of each of its addresses.
-    #[cfg(feature = "ipv6")]
-    fn has_multicast_group(&self, addr: Ipv6Address) -> bool {
-        addr == IPV6_LINK_LOCAL_ALL_NODES || self.has_solicited_node(addr)
+    /// Check whether the interface listens to given destination multicast IP address.
+    pub(crate) fn has_multicast_group<T: Into<IpAddress>>(&self, addr: T) -> bool {
+        let addr = addr.into();
+
+        #[cfg(feature = "multicast")]
+        if self.multicast.has_multicast_group(addr) {
+            return true;
+        }
+
+        match addr {
+            #[cfg(feature = "ipv4")]
+            IpAddress::Ipv4(key) => key == IPV4_MULTICAST_ALL_SYSTEMS,
+            #[cfg(feature = "ipv6")]
+            IpAddress::Ipv6(key) => key == IPV6_LINK_LOCAL_ALL_NODES || self.has_solicited_node(key),
+        }
+    }
+
+    /// Get the first link-local IPv6 address of the interface, if present.
+    #[cfg(any(feature = "slaac", all(feature = "ipv6", feature = "multicast")))]
+    pub(crate) fn link_local_ipv6_address(&self) -> Option<Ipv6Address> {
+        self.cidrs().find_map(|cidr| match *cidr {
+            IpCidr::Ipv6(cidr) if cidr.address().is_link_local() => Some(cidr.address()),
+            _ => None,
+        })
     }
 
     /// Return the IPv6 address that is a candidate source address for the given destination
@@ -2884,6 +2936,7 @@ mod test {
     use crate::iface::IfaceCapabilities;
     use crate::neighbor::MAX_MULTICAST_SOLICIT;
     use crate::raw::RawMode;
+    #[cfg(feature = "slaac")]
     use crate::route::RouteOrigin;
     #[cfg(feature = "slaac")]
     use crate::slaac::{SlaacConfig, SlaacState};
@@ -2963,6 +3016,10 @@ mod test {
         stack
             .iface(handle)
             .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)]);
+        // Drain the solicited-node multicast reports the new addresses trigger, so
+        // the tests only see the frames they provoke.
+        stack.poll(Instant::ZERO);
+        tx.borrow_mut().clear();
         (stack, rx, tx)
     }
 

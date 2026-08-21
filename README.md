@@ -113,6 +113,10 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - DNS client (feature `dns`)
   - Multiple servers, retransmission with backoff.
   - Multicast DNS for `.local` names (feature `mdns`)
+- IP multicast (feature `multicast`)
+  - Join and leave multicast groups per interface.
+  - IGMPv1/IGMPv2 (IPv4) and MLDv2 (IPv6): membership is reported on join and leave, and in response to router queries.
+  - The IPv6 solicited-node groups of the interface's addresses are joined automatically.
 - Packet metadata
   - Support for hardware timestamping on both RX and TX. Allows implementing protocols like PTP, NTP. (feature `packetmeta-timestamp`)
   - Opaque ID for correlating packets through the stack. (feature `packetmeta-id`)
@@ -125,7 +129,6 @@ All of the below is planned. Please open an issue or reach out on [the Matrix ch
 - IPv6 DAD (duplicate address detection)
 - IPv6 RDNSS (DNS servers from router advertisements)
 - an equivalent to smoltcp's `any_ip`
-- Multicast (IGMP, MLD)
 - 6LoWPAN
 - IEEE 802.15.4
 - IP fragmentation and reassembly

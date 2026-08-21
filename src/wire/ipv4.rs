@@ -24,6 +24,12 @@ pub const MIN_MTU: usize = 576;
 /// [RFC 791 § 3.1]: https://tools.ietf.org/html/rfc791#section-3.1
 const MINIMUM_IHL_BYTES: u8 = 20;
 
+/// All multicast-capable nodes
+pub const MULTICAST_ALL_SYSTEMS: Address = Address::new(224, 0, 0, 1);
+
+/// All multicast-capable routers
+pub const MULTICAST_ALL_ROUTERS: Address = Address::new(224, 0, 0, 2);
+
 pub use core::net::Ipv4Addr as Address;
 
 pub(crate) trait AddressExt {

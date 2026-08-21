@@ -38,7 +38,8 @@ for extra in "" "defmt" "log" "std" "std,log" "std,defmt" "async" "std,log,async
              "tcp-timestamps" "tcp-timestamps,defmt" \
              "tcp-reno" "tcp-cubic" \
              "dhcpv4" "dhcpv4,async" "dhcpv4,defmt" \
-             "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,packet-log,dhcpv4"; do
+             "multicast" "multicast,defmt" "multicast,icmp-errors,icmp-ping-reply" \
+             "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,packet-log,dhcpv4,multicast"; do
   run cargo check --no-default-features \
     --features "medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp${extra:+,$extra}"
 done
@@ -50,7 +51,7 @@ for medium in "${MEDIA[@]}"; do
       # Bare, and with everything that adds code paths to the combination.
       run cargo check --no-default-features --features "$features"
       run cargo check --no-default-features \
-        --features "$features,std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp"
+        --features "$features,std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,multicast"
     done
   done
 done
@@ -63,7 +64,7 @@ for medium in "${MEDIA[@]}"; do
   for proto in "${PROTOS[@]}"; do
     for socket in "${SOCKETS[@]}"; do
       run cargo test --lib --no-default-features \
-        --features "$medium,$proto${socket:+,$socket},std,log,async,icmp-errors,icmp-ping-reply"
+        --features "$medium,$proto${socket:+,$socket},std,log,async,icmp-errors,icmp-ping-reply,multicast"
     done
   done
 done

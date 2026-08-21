@@ -31,4 +31,10 @@ impl Rand {
         let shift = 29 - (s >> 61);
         (s >> shift) as u32
     }
+
+    #[cfg(all(feature = "ipv6", feature = "multicast"))]
+    pub(crate) fn rand_u16(&mut self) -> u16 {
+        let n = self.rand_u32();
+        (n ^ (n >> 16)) as u16
+    }
 }

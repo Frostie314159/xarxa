@@ -126,8 +126,8 @@ pub struct Packet<'a> {
 
 // Ranges and constants describing key boundaries in the ICMPv6 header.
 pub(super) mod field {
-    // Some field offsets (MLD, router advertisements) are not used yet, they will be
-    // once the corresponding features return.
+    // Which field offsets are used depends on the enabled features (MLD needs
+    // `multicast`, router advertisements need `slaac`).
     #![allow(unused)]
 
     use crate::wire::field::*;

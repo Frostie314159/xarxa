@@ -31,6 +31,8 @@ pub mod dns;
 mod icmp_error;
 pub mod iface;
 pub mod meta;
+#[cfg(feature = "multicast")]
+pub mod multicast;
 #[cfg(feature = "medium-ethernet")]
 pub mod neighbor;
 #[cfg(feature = "packet-log")]
@@ -62,6 +64,8 @@ pub use icmp_error::IcmpError;
 pub use meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]
 pub use meta::{Timestamp, TxTimestamp};
+#[cfg(feature = "multicast")]
+pub use multicast::MulticastError;
 #[cfg(feature = "raw")]
 pub use raw::{RawHandle, RawMode, RawSocket};
 pub use route::{Route, RouteOrigin, Routes};

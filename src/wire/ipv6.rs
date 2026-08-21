@@ -27,6 +27,11 @@ pub const LINK_LOCAL_ALL_NODES: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0,
 /// [all routers multicast address]: https://tools.ietf.org/html/rfc4291#section-2.7.1
 pub const LINK_LOCAL_ALL_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 2);
 
+/// The link-local [all MLVDv2-capable routers multicast address].
+///
+/// [all MLVDv2-capable routers multicast address]: https://tools.ietf.org/html/rfc3810#section-11
+pub const LINK_LOCAL_ALL_MLDV2_ROUTERS: Address = Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x16);
+
 /// The [scope] of an address.
 ///
 /// [scope]: https://www.rfc-editor.org/rfc/rfc4291#section-2.7
