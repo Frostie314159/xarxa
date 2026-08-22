@@ -831,6 +831,7 @@ impl<'d> TcpSocketState<'d> {
             #[cfg(feature = "tcp-timestamps")]
             timestamp: None,
             payload: &[],
+            payload2: &[],
         }
     }
 
@@ -996,6 +997,8 @@ impl<'d> TcpSocketState<'d> {
         repr: &TcpRepr,
     ) -> Option<TcpRepr<'static>> {
         debug_assert!(self.accepts(src_addr, dst_addr, repr));
+        // Ingress reprs come from `parse`, which never splits the payload.
+        debug_assert!(repr.payload2.is_empty());
 
         // Consider how much the sequence number space differs from the transmit buffer space.
         let (sent_syn, sent_fin) = match self.state {
@@ -1870,6 +1873,7 @@ impl<'d> TcpSocketState<'d> {
             #[cfg(feature = "tcp-timestamps")]
             timestamp: self.timestamp_repr(cx.now(), self.last_remote_tsval),
             payload: &[],
+            payload2: &[],
         };
 
         let mut is_zero_window_probe = false;
@@ -1916,7 +1920,12 @@ impl<'d> TcpSocketState<'d> {
                 let offset = if self.pending_fast_retransmit {
                     let size = effective_mss.min(self.tx_buffer.len());
                     repr.seq_number = self.local_seq_no;
+                    // The ring buffer hands out contiguous slices, so a segment
+                    // straddling its wrap point comes as two chunks.
                     repr.payload = self.tx_buffer.get_allocated(0, size);
+                    repr.payload2 = self
+                        .tx_buffer
+                        .get_allocated(repr.payload.len(), size - repr.payload.len());
 
                     self.pending_fast_retransmit = false;
 
@@ -1960,16 +1969,21 @@ impl<'d> TcpSocketState<'d> {
                     };
 
                     let offset = self.flight_size();
+                    // The ring buffer hands out contiguous slices, so a segment
+                    // straddling its wrap point comes as two chunks.
                     repr.payload = self.tx_buffer.get_allocated(offset, size);
+                    repr.payload2 = self
+                        .tx_buffer
+                        .get_allocated(offset + repr.payload.len(), size - repr.payload.len());
                     offset
                 };
 
                 // If we've sent everything we had in the buffer, follow it with the PSH or FIN
                 // flags, depending on whether the transmit half of the connection is open.
-                if offset + repr.payload.len() == self.tx_buffer.len() {
+                if offset + repr.payload_len() == self.tx_buffer.len() {
                     match self.state {
                         State::FinWait1 | State::LastAck | State::Closing => repr.control = TcpControl::Fin,
-                        State::Established | State::CloseWait if !repr.payload.is_empty() => {
+                        State::Established | State::CloseWait if repr.payload_len() != 0 => {
                             repr.control = TcpControl::Psh
                         }
                         _ => (),
@@ -1997,14 +2011,14 @@ impl<'d> TcpSocketState<'d> {
         // Trace a summary of what will be sent.
         if is_keep_alive {
             trace!("sending a keep-alive");
-        } else if !repr.payload.is_empty() {
+        } else if repr.payload_len() != 0 {
             trace!(
                 "tx buffer: sending {} octets at offset {}",
-                repr.payload.len(),
+                repr.payload_len(),
                 self.flight_size()
             );
         }
-        if repr.control != TcpControl::None || repr.payload.is_empty() {
+        if repr.control != TcpControl::None || repr.payload_len() == 0 {
             let flags = match (repr.control, repr.ack_number) {
                 (TcpControl::Syn, None) => "SYN",
                 (TcpControl::Syn, Some(_)) => "SYN|ACK",
@@ -2880,6 +2894,7 @@ mod test {
         #[cfg(feature = "tcp-timestamps")]
         timestamp: None,
         payload: &[],
+        payload2: &[],
     };
     const RECV_TEMPL: TcpRepr<'static> = TcpRepr {
         src_port: LOCAL_PORT,
@@ -2895,6 +2910,7 @@ mod test {
         #[cfg(feature = "tcp-timestamps")]
         timestamp: None,
         payload: &[],
+        payload2: &[],
     };
 
     // =========================================================================================//
@@ -8924,7 +8940,8 @@ mod test {
         assert_eq!(s.tx_buffer.dequeue_many(3), &b"xxx"[..]);
         assert_eq!(s.tx_buffer.len(), 3);
 
-        // "abcdef" not contiguous in tx buffer
+        // "abcdef" not contiguous in tx buffer. The segment straddles the ring's
+        // wrap point, but is still sent as a single segment, in two chunks.
         assert_eq!(s.view().send_slice(b"abcdef"), Ok(6));
         recv!(
             s,
@@ -8932,18 +8949,11 @@ mod test {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &b"yyyabc"[..],
+                payload2: &b"def"[..],
                 ..RECV_TEMPL
             })
         );
-        recv!(
-            s,
-            Ok(TcpRepr {
-                seq_number: LOCAL_SEQ + 1 + 6,
-                ack_number: Some(REMOTE_SEQ + 1),
-                payload: &b"def"[..],
-                ..RECV_TEMPL
-            })
-        );
+        recv_nothing!(s);
     }
 
     // =========================================================================================//
@@ -9922,6 +9932,7 @@ mod stack_test {
         #[cfg(feature = "tcp-timestamps")]
         timestamp: None,
         payload: &[],
+        payload2: &[],
     };
 
     #[derive(Default)]

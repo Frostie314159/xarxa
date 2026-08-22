@@ -25,7 +25,12 @@ pub(crate) struct TcpRepr<'a> {
     pub sack_ranges: [Option<(u32, u32)>; 3],
     #[cfg(feature = "tcp-timestamps")]
     pub timestamp: Option<TcpTimestampRepr>,
+    // The segment payload is two chunks, sent back to back on the wire. Egress
+    // fills both when the segment straddles the tx ring buffer's wrap point, so
+    // a wrapped segment can still be a full MSS. Everywhere else (ingress
+    // parsing, control segments) `payload2` is empty.
     pub payload: &'a [u8],
+    pub payload2: &'a [u8],
 }
 
 /// The TCP timestamp option value (RFC 7323).
@@ -135,6 +140,7 @@ impl<'a> TcpRepr<'a> {
             #[cfg(feature = "tcp-timestamps")]
             timestamp,
             payload: packet.payload(),
+            payload2: &[],
         })
     }
 
@@ -167,9 +173,14 @@ impl<'a> TcpRepr<'a> {
         length
     }
 
+    /// Return the total payload length, both chunks combined.
+    pub const fn payload_len(&self) -> usize {
+        self.payload.len() + self.payload2.len()
+    }
+
     /// Return the length of a packet that will be emitted from this high-level representation.
     pub fn buffer_len(&self) -> usize {
-        self.header_len() + self.payload.len()
+        self.header_len() + self.payload_len()
     }
 
     /// Emit a high-level representation into a Transmission Control Protocol packet.
@@ -224,19 +235,21 @@ impl<'a> TcpRepr<'a> {
             }
         }
         packet.set_urgent_at(0);
-        packet.payload_mut().copy_from_slice(self.payload);
+        let payload = packet.payload_mut();
+        payload[..self.payload.len()].copy_from_slice(self.payload);
+        payload[self.payload.len()..].copy_from_slice(self.payload2);
         packet.fill_checksum(src_addr, dst_addr)
     }
 
     /// Return the length of the segment, in terms of sequence space.
     pub const fn segment_len(&self) -> usize {
-        self.payload.len() + self.control.len()
+        self.payload_len() + self.control.len()
     }
 
     /// Return whether the segment has no flags set (except PSH) and no data.
     pub const fn is_empty(&self) -> bool {
         match self.control {
-            _ if !self.payload.is_empty() => false,
+            _ if self.payload_len() != 0 => false,
             TcpControl::Syn | TcpControl::Fin | TcpControl::Rst => false,
             TcpControl::None | TcpControl::Psh => true,
         }
@@ -258,7 +271,7 @@ impl<'a> fmt::Display for TcpRepr<'a> {
             write!(f, " ack={ack_number}")?;
         }
         write!(f, " win={}", self.window_len)?;
-        write!(f, " len={}", self.payload.len())?;
+        write!(f, " len={}", self.payload_len())?;
         if let Some(max_seg_size) = self.max_seg_size {
             write!(f, " mss={max_seg_size}")?;
         }
@@ -296,6 +309,7 @@ mod test {
             #[cfg(feature = "tcp-timestamps")]
             timestamp: None,
             payload: &PAYLOAD_BYTES,
+            payload2: &[],
         }
     }
 
@@ -311,6 +325,18 @@ mod test {
     #[test]
     fn test_emit() {
         let repr = packet_repr();
+        let mut bytes = vec![0xa5; repr.buffer_len()];
+        let mut packet = TcpPacket::new_unchecked(&mut bytes);
+        repr.emit(&mut packet, &SRC_ADDR.into(), &DST_ADDR.into());
+        assert_eq!(&bytes[..], &SYN_PACKET_BYTES[..]);
+    }
+
+    #[test]
+    fn test_emit_split_payload() {
+        // A payload split in two chunks emits the same bytes as a contiguous one.
+        let mut repr = packet_repr();
+        repr.payload = &PAYLOAD_BYTES[..3];
+        repr.payload2 = &PAYLOAD_BYTES[3..];
         let mut bytes = vec![0xa5; repr.buffer_len()];
         let mut packet = TcpPacket::new_unchecked(&mut bytes);
         repr.emit(&mut packet, &SRC_ADDR.into(), &DST_ADDR.into());
