@@ -3,8 +3,8 @@
 #[cfg(feature = "tcp-timestamps")]
 use super::TcpTimestampRepr;
 use super::{
-    DEFAULT_MSS, ListenError, MIN_REMOTE_MSS, SocketBuffer, State, TcpControl, TcpHandle, TcpRepr, TcpSocketState,
-    Tuple,
+    AcceptError, DEFAULT_MSS, ListenError, MIN_REMOTE_MSS, SocketBuffer, State, TcpControl, TcpHandle, TcpRepr,
+    TcpSocketState, Tuple,
 };
 use crate::config::{TCP_LISTENER_BACKLOG, TCP_LISTENER_COUNT, TCP_SOCKET_COUNT};
 use crate::rand::Rand;
@@ -302,8 +302,9 @@ impl<'d> TcpListener<'_, 'd> {
     /// receive and transmit buffers of the given capacities.
     ///
     /// The buffers are allocated on the heap, so this needs the `alloc` feature.
-    /// Without it, or to use your own buffers, see
-    /// [`accept_with_bufs`](Self::accept_with_bufs).
+    /// Without it, use [`accept_with_bufs`](Self::accept_with_bufs) to lend your
+    /// own buffers, or [`accept_with_socket`](Self::accept_with_socket) to reuse
+    /// a socket you already have.
     ///
     /// The new socket starts in the SYN-RECEIVED state and is added to the stack.
     ///
@@ -326,7 +327,10 @@ impl<'d> TcpListener<'_, 'd> {
     ///
     /// The buffers are lent to the stack. It holds them until it is dropped or
     /// the socket is removed, so they must be declared before the stack, or be
-    /// `'static`.
+    /// `'static`. Removing the socket does not hand them back, so a program
+    /// that serves many connections from a fixed set of buffers should accept
+    /// into the same sockets over and over with
+    /// [`accept_with_socket`](Self::accept_with_socket) instead.
     ///
     /// The new socket starts in the SYN-RECEIVED state and is added to the stack.
     ///
@@ -339,6 +343,51 @@ impl<'d> TcpListener<'_, 'd> {
         self.accept_inner(SocketBuffer::new(rx_buffer), SocketBuffer::new(tx_buffer))
     }
 
+    /// Accept a queued connection attempt into an existing socket, reusing its
+    /// buffers.
+    ///
+    /// The socket must be closed (see [`is_open`](crate::tcp::TcpSocket::is_open)),
+    /// and is set up for the new connection exactly as [`connect`] sets it up for
+    /// an outgoing one: its buffers are cleared and everything you configured on
+    /// it (hop limit, timeout, keep-alive, Nagle, ACK delay) is kept. Its handle
+    /// stays valid.
+    ///
+    /// This is how to serve connections without a heap: create the sockets once,
+    /// with the buffers they will use for the program's whole life, and accept
+    /// into them again as each connection ends. [`accept`](Self::accept) and
+    /// [`accept_with_bufs`](Self::accept_with_bufs) create a new socket per
+    /// connection, and buffers lent to the stack are never handed back.
+    ///
+    /// The socket ends up in the SYN-RECEIVED state and sends the SYN|ACK on the
+    /// next [`Stack::poll`].
+    ///
+    /// Errors:
+    /// - `InvalidState` if the socket is still open.
+    /// - `Exhausted` if no connection attempt is queued.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handle does not belong to a socket of this stack.
+    ///
+    /// [`connect`]: crate::tcp::TcpSocket::connect
+    /// [`Stack::poll`]: crate::Stack::poll
+    pub fn accept_with_socket(&mut self, handle: TcpHandle) -> Result<(), AcceptError> {
+        if self.tcp.get(handle.0).is_open() {
+            return Err(AcceptError::InvalidState);
+        }
+        let state = self.listeners.get_mut(self.index);
+        let syn = state.queue.pop_front().ok_or(AcceptError::Exhausted)?;
+        trace!(
+            "listener:{}: accepting {} into socket {}",
+            state.local, syn.tuple, handle.0
+        );
+
+        let s = self.tcp.get_mut(handle.0);
+        s.reset();
+        Self::start_syn_received(s, syn, self.rand);
+        Ok(())
+    }
+
     fn accept_inner(&mut self, rx_buffer: SocketBuffer<'d>, tx_buffer: SocketBuffer<'d>) -> Option<TcpHandle> {
         if self.tcp.is_full() {
             // No room for the socket: leave the SYN queued, the caller can retry
@@ -349,13 +398,21 @@ impl<'d> TcpListener<'_, 'd> {
         let syn = state.queue.pop_front()?;
         trace!("listener:{}: accepting {}", state.local, syn.tuple);
 
-        // The SYN-RECEIVED socket continuing the recorded SYN. This mirrors
-        // what the SYN would have set up in a LISTEN-state socket: the SYN|ACK
-        // itself is built by the socket's dispatch from this state.
         let mut s = TcpSocketState::new(rx_buffer, tx_buffer);
-        s.state = State::SynReceived;
+        Self::start_syn_received(&mut s, syn, self.rand);
+
+        // Can't fail: checked for room above.
+        Some(TcpHandle(unwrap!(self.tcp.add_with(|_| s))))
+    }
+
+    /// Set up a closed socket as the SYN-RECEIVED socket continuing `syn`. This
+    /// mirrors what the SYN would have set up in a LISTEN-state socket: the
+    /// SYN|ACK itself is built by the socket's dispatch from this state.
+    fn start_syn_received(s: &mut TcpSocketState<'d>, syn: PendingSyn, rand: &mut Rand) {
+        debug_assert_eq!(s.state, State::Closed);
+        s.set_state(State::SynReceived);
         s.tuple = Some(syn.tuple);
-        s.local_seq_no = TcpSocketState::random_seq_no(self.rand);
+        s.local_seq_no = TcpSocketState::random_seq_no(rand);
         s.remote_seq_no = syn.remote_seq_no;
         s.remote_last_seq = s.local_seq_no;
         s.remote_has_sack = syn.remote_has_sack;
@@ -372,10 +429,7 @@ impl<'d> TcpListener<'_, 'd> {
         {
             s.timestamps = syn.timestamp.is_some();
             s.last_remote_tsval = syn.timestamp.map_or(0, |ts| ts.tsval);
-            s.tsval_offset = TcpSocketState::random_tsval_offset(self.rand);
+            s.tsval_offset = TcpSocketState::random_tsval_offset(rand);
         }
-
-        // Can't fail: checked for room above.
-        Some(TcpHandle(unwrap!(self.tcp.add_with(|_| s))))
     }
 }

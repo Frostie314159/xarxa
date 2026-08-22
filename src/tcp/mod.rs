@@ -87,6 +87,32 @@ impl Display for ListenError {
 #[cfg(feature = "tcp-listener")]
 impl core::error::Error for ListenError {}
 
+/// Error returned by [`TcpListener::accept_with_socket`]
+///
+/// Requires the `tcp-listener` feature.
+#[cfg(feature = "tcp-listener")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum AcceptError {
+    /// The socket is still open, so it can't be reused for a new connection.
+    InvalidState,
+    /// The accept queue is empty.
+    Exhausted,
+}
+
+#[cfg(feature = "tcp-listener")]
+impl Display for AcceptError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match *self {
+            AcceptError::InvalidState => write!(f, "invalid state"),
+            AcceptError::Exhausted => write!(f, "exhausted"),
+        }
+    }
+}
+
+#[cfg(feature = "tcp-listener")]
+impl core::error::Error for AcceptError {}
+
 /// Error returned by [`TcpSocket::connect`]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -688,6 +714,20 @@ impl<'d> TcpSocketState<'d> {
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
 
+    /// Whether the socket is open: it processes incoming and dispatches
+    /// outgoing packets. `false` means it can be reused for a new connection.
+    fn is_open(&self) -> bool {
+        match self.state {
+            State::Closed => false,
+            State::TimeWait => false,
+            _ => true,
+        }
+    }
+
+    /// Return the socket to the closed state, ready to be reused by `connect`
+    /// or `TcpListener::accept_with_socket`. Everything the user configured
+    /// (hop limit, timeout, keep-alive, Nagle, ACK delay) is kept; everything
+    /// belonging to the connection is cleared.
     fn reset(&mut self) {
         let rx_cap_log2 = mem::size_of::<usize>() * 8 - self.rx_buffer.capacity().leading_zeros() as usize;
 
@@ -711,11 +751,17 @@ impl<'d> TcpSocketState<'d> {
         self.remote_win_len = 0;
         self.remote_win_scale = None;
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
+        self.remote_has_sack = false;
         self.remote_mss = DEFAULT_MSS;
         self.ip_mtu = DEFAULT_IP_MTU;
         self.remote_last_ts = None;
+        self.local_rx_last_ack = None;
+        self.local_rx_last_seq = None;
+        self.local_rx_dup_acks = 0;
+        self.pending_fast_retransmit = false;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
+        self.congestion_controller = congestion::Congestion::new();
 
         #[cfg(feature = "async")]
         {
@@ -2508,11 +2554,7 @@ impl<'d> TcpSocket<'_, 'd> {
     /// or `TIME-WAIT` states.
     #[inline]
     pub fn is_open(&self) -> bool {
-        match self.inner().state {
-            State::Closed => false,
-            State::TimeWait => false,
-            _ => true,
-        }
+        self.inner().is_open()
     }
 
     /// Return whether a connection is active.
@@ -3331,6 +3373,56 @@ mod test {
             }
         );
         sanity!(s, socket_established());
+    }
+
+    #[cfg(feature = "tcp-listener")]
+    #[test]
+    fn test_listener_accept_with_socket() {
+        let (mut stack, h) = listener_stack();
+        let sh = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+
+        // Nothing queued yet.
+        assert_eq!(
+            stack.tcp_listener(h).accept_with_socket(sh),
+            Err(AcceptError::Exhausted)
+        );
+
+        // The queued SYN is accepted into the existing socket, which keeps its
+        // handle.
+        assert!(listener_deliver(&mut stack, &syn_repr()));
+        assert_eq!(stack.tcp_listener(h).accept_with_socket(sh), Ok(()));
+        assert!(!stack.tcp_listener(h).can_accept());
+        assert_eq!(stack.tcp_socket(sh).state(), State::SynReceived);
+        assert_eq!(stack.tcp_socket(sh).local_endpoint(), Some(LOCAL_END));
+        assert_eq!(stack.tcp_socket(sh).remote_endpoint(), Some(REMOTE_END));
+
+        // The socket is in use now: the next attempt is rejected and stays queued.
+        assert!(listener_deliver(
+            &mut stack,
+            &TcpRepr {
+                src_port: REMOTE_PORT + 1,
+                ..syn_repr()
+            }
+        ));
+        assert_eq!(
+            stack.tcp_listener(h).accept_with_socket(sh),
+            Err(AcceptError::InvalidState)
+        );
+        assert!(stack.tcp_listener(h).can_accept());
+
+        // Once the connection is over, the same socket serves the next one,
+        // with the previous connection's state gone.
+        assert_eq!(stack.sockets.tcp.get_mut(sh.0).tx_buffer.enqueue_slice(b"stale"), 5);
+        stack.tcp_socket(sh).abort();
+        assert_eq!(stack.tcp_listener(h).accept_with_socket(sh), Ok(()));
+        assert_eq!(stack.tcp_socket(sh).state(), State::SynReceived);
+        assert_eq!(
+            stack.tcp_socket(sh).remote_endpoint(),
+            Some(IpEndpoint::new(REMOTE_ADDR.into(), REMOTE_PORT + 1))
+        );
+        assert!(stack.sockets.tcp.get(sh.0).tx_buffer.is_empty());
     }
 
     #[cfg(feature = "tcp-listener")]
