@@ -1661,24 +1661,22 @@ impl<'d> Stack<'d> {
                     }
                 };
 
-                let Some(mut reply) = PacketBuf::try_new() else {
-                    trace!("icmpv4: no packet buffer for echo reply");
+                // The reply is the request with the message type changed: ident, seq
+                // and payload stay put. Reuse the incoming buffer instead of
+                // allocating one and copying the payload over.
+                if !buf.ensure_headroom(LINK_HEADER_LEN + IPV4_HEADER_LEN) {
+                    trace!("icmpv4: not enough headroom for echo reply");
                     return;
-                };
-                reply.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
-                reply.set_len(icmp_packet.header_len() + icmp_packet.data().len());
+                }
+                buf.set_meta(crate::meta::PacketMeta::default());
                 {
-                    let mut reply_icmp = Icmpv4Packet::new_unchecked(&mut reply);
+                    let mut reply_icmp = Icmpv4Packet::new_unchecked(&mut buf);
                     reply_icmp.set_msg_type(Icmpv4Message::EchoReply);
-                    reply_icmp.set_msg_code(0);
-                    reply_icmp.set_echo_ident(icmp_packet.echo_ident());
-                    reply_icmp.set_echo_seq_no(icmp_packet.echo_seq_no());
-                    reply_icmp.data_mut().copy_from_slice(icmp_packet.data());
                     reply_icmp.fill_checksum();
                 }
                 self.transmit_reply(
                     iface,
-                    reply,
+                    buf,
                     IpAddress::Ipv4(reply_src),
                     IpAddress::Ipv4(src_addr),
                     IpProtocol::Icmp,
@@ -1883,24 +1881,22 @@ impl<'d> Stack<'d> {
                     self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
                 };
 
-                let Some(mut reply) = PacketBuf::try_new() else {
-                    trace!("icmpv6: no packet buffer for echo reply");
+                // The reply is the request with the message type changed: ident, seq
+                // and payload stay put. Reuse the incoming buffer instead of
+                // allocating one and copying the payload over.
+                if !buf.ensure_headroom(LINK_HEADER_LEN + IPV6_HEADER_LEN) {
+                    trace!("icmpv6: not enough headroom for echo reply");
                     return;
-                };
-                reply.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
-                reply.set_len(icmp_packet.header_len() + icmp_packet.payload().len());
+                }
+                buf.set_meta(crate::meta::PacketMeta::default());
                 {
-                    let mut reply_icmp = Icmpv6Packet::new_unchecked(&mut reply);
+                    let mut reply_icmp = Icmpv6Packet::new_unchecked(&mut buf);
                     reply_icmp.set_msg_type(Icmpv6Message::EchoReply);
-                    reply_icmp.set_msg_code(0);
-                    reply_icmp.set_echo_ident(icmp_packet.echo_ident());
-                    reply_icmp.set_echo_seq_no(icmp_packet.echo_seq_no());
-                    reply_icmp.payload_mut().copy_from_slice(icmp_packet.payload());
                     reply_icmp.fill_checksum(&reply_src, &src_addr);
                 }
                 self.transmit_reply(
                     iface,
-                    reply,
+                    buf,
                     IpAddress::Ipv6(reply_src),
                     IpAddress::Ipv6(src_addr),
                     IpProtocol::Icmpv6,
@@ -3726,6 +3722,56 @@ mod test {
         assert_eq!(payload, b"hello");
     }
 
+    /// An echo request comes back as a reply with the identifier, sequence number
+    /// and payload unchanged. The payload is a full MTU's worth: the reply is built
+    /// in the request's own buffer, which has to fit the headers too.
+    #[test]
+    fn test_icmpv4_echo_reply() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let payload: Vec<u8> = (0..1472u16).map(|i| i as u8).collect();
+        let request = icmpv4_echo(Icmpv4Message::EchoRequest, 0x1234, 7, &payload);
+        inject(
+            &mut stack,
+            &rx,
+            ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &request),
+        );
+
+        let tx = tx.borrow();
+        assert_eq!(tx.len(), 1);
+        let (msg_type, msg_code, data) = parse_icmpv4_reply(&tx[0], OUR_V4, REMOTE_V4);
+        assert_eq!(msg_type, Icmpv4Message::EchoReply);
+        assert_eq!(msg_code, 0);
+        assert_eq!(data, payload);
+        assert_eq!(
+            tx[0][IPV4_HEADER_LEN..],
+            icmpv4_echo(Icmpv4Message::EchoReply, 0x1234, 7, &payload)[..]
+        );
+    }
+
+    /// Same for ICMPv6.
+    #[test]
+    fn test_icmpv6_echo_reply() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        let payload: Vec<u8> = (0..1452u16).map(|i| i as u8).collect();
+        let request = icmpv6_echo(Icmpv6Message::EchoRequest, 0x1234, 7, &payload, REMOTE_V6, OUR_V6);
+        inject(
+            &mut stack,
+            &rx,
+            ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol::Icmpv6, &request),
+        );
+
+        let tx = tx.borrow();
+        assert_eq!(tx.len(), 1);
+        let (msg_type, msg_code, _, data) = parse_icmpv6_reply(&tx[0], OUR_V6, REMOTE_V6);
+        assert_eq!(msg_type, Icmpv6Message::EchoReply);
+        assert_eq!(msg_code, 0);
+        assert_eq!(data, payload);
+        assert_eq!(
+            tx[0][IPV6_HEADER_LEN..],
+            icmpv6_echo(Icmpv6Message::EchoReply, 0x1234, 7, &payload, OUR_V6, REMOTE_V6)[..]
+        );
+    }
+
     #[test]
     fn test_icmpv4_no_error_to_broadcast() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
@@ -4371,16 +4417,39 @@ mod test {
         }
     }
 
-    /// An ICMPv4 echo request, checksum filled in.
-    fn icmpv4_echo_request(ident: u16, seq_no: u16) -> Vec<u8> {
-        let mut bytes = vec![0; 8];
+    /// An ICMPv4 echo request or reply, checksum filled in.
+    fn icmpv4_echo(msg_type: Icmpv4Message, ident: u16, seq_no: u16, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0; 8 + payload.len()];
         {
             let mut icmp = Icmpv4Packet::new_unchecked(&mut bytes[..]);
-            icmp.set_msg_type(Icmpv4Message::EchoRequest);
+            icmp.set_msg_type(msg_type);
             icmp.set_msg_code(0);
             icmp.set_echo_ident(ident);
             icmp.set_echo_seq_no(seq_no);
+            icmp.data_mut().copy_from_slice(payload);
             icmp.fill_checksum();
+        }
+        bytes
+    }
+
+    /// An ICMPv6 echo request or reply, checksum filled in.
+    fn icmpv6_echo(
+        msg_type: Icmpv6Message,
+        ident: u16,
+        seq_no: u16,
+        payload: &[u8],
+        src_addr: Ipv6Address,
+        dst_addr: Ipv6Address,
+    ) -> Vec<u8> {
+        let mut bytes = vec![0; 8 + payload.len()];
+        {
+            let mut icmp = Icmpv6Packet::new_unchecked(&mut bytes[..]);
+            icmp.set_msg_type(msg_type);
+            icmp.set_msg_code(0);
+            icmp.set_echo_ident(ident);
+            icmp.set_echo_seq_no(seq_no);
+            icmp.payload_mut().copy_from_slice(payload);
+            icmp.fill_checksum(&src_addr, &dst_addr);
         }
         bytes
     }
@@ -4408,7 +4477,12 @@ mod test {
         assert!(!stack.iface(iface).has_ip_addr(new_addr));
 
         // An echo request to an address we don't have is ignored.
-        let echo = ipv4_packet(REMOTE_V4, new_addr, IpProtocol::Icmp, &icmpv4_echo_request(0x1234, 1));
+        let echo = ipv4_packet(
+            REMOTE_V4,
+            new_addr,
+            IpProtocol::Icmp,
+            &icmpv4_echo(Icmpv4Message::EchoRequest, 0x1234, 1, &[]),
+        );
         inject(&mut stack, &rx, echo.clone());
         assert!(tx.borrow().is_empty());
 

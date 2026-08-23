@@ -227,6 +227,26 @@ impl PacketBuf {
         inner.len -= n as u16;
     }
 
+    /// Make room for `headroom` bytes in front of the payload, moving the payload
+    /// back if there isn't enough already.
+    ///
+    /// Returns `false` if the buffer can't fit `headroom` plus the payload, leaving
+    /// it unchanged.
+    pub fn ensure_headroom(&mut self, headroom: usize) -> bool {
+        if self.headroom() >= headroom {
+            return true;
+        }
+        let inner = self.inner_mut();
+        let len = inner.len as usize;
+        if headroom + len > PACKET_BUF_SIZE {
+            return false;
+        }
+        let old = inner.headroom as usize;
+        inner.data.copy_within(old..old + len, headroom);
+        inner.headroom = headroom as u16;
+        true
+    }
+
     /// Set the payload length, growing or shrinking it at the back.
     ///
     /// # Panics
@@ -314,6 +334,36 @@ mod tests {
         assert_eq!(buf.headroom(), 42);
         assert_eq!(buf.len(), 100);
         assert_eq!(buf[0], 0xaa);
+    }
+
+    #[test]
+    fn ensure_headroom() {
+        let mut buf = PacketBuf::try_new().unwrap();
+        buf.reserve(10);
+        buf.set_len(4);
+        buf.copy_from_slice(&[1, 2, 3, 4]);
+
+        // Already enough: nothing moves.
+        assert!(buf.ensure_headroom(4));
+        assert_eq!(buf.headroom(), 10);
+        assert_eq!(&*buf, &[1, 2, 3, 4]);
+
+        // Not enough: the payload moves back, unchanged.
+        assert!(buf.ensure_headroom(20));
+        assert_eq!(buf.headroom(), 20);
+        assert_eq!(buf.len(), 4);
+        assert_eq!(&*buf, &[1, 2, 3, 4]);
+
+        // The headroom overlapping the payload is fine, it's a move not a copy.
+        assert!(buf.ensure_headroom(22));
+        assert_eq!(&*buf, &[1, 2, 3, 4]);
+
+        // Doesn't fit: the buffer is left alone.
+        assert!(!buf.ensure_headroom(PACKET_BUF_SIZE - 3));
+        assert_eq!(buf.headroom(), 22);
+        assert_eq!(&*buf, &[1, 2, 3, 4]);
+        assert!(buf.ensure_headroom(PACKET_BUF_SIZE - 4));
+        assert_eq!(&*buf, &[1, 2, 3, 4]);
     }
 
     #[test]
