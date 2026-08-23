@@ -379,8 +379,8 @@ mod test {
     #[allow(unused_imports)]
     use std::vec::Vec;
 
-    const IF_0: IfaceHandle = IfaceHandle(0);
-    const IF_1: IfaceHandle = IfaceHandle(1);
+    const IF_0: IfaceHandle = IfaceHandle::new(0);
+    const IF_1: IfaceHandle = IfaceHandle::new(1);
 
     fn take_matching(queue: &mut PendingQueue, key: &Key) -> std::vec::Vec<PendingPacket> {
         let mut taken = std::vec::Vec::new();

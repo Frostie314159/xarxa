@@ -16,12 +16,12 @@ use crate::tcp::congestion::Controller as _;
 use crate::waker::WakerRegistration;
 use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
 
-/// A handle to a TCP listener added to a [`Stack`].
-///
-/// [`Stack`]: crate::Stack
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TcpListenerHandle(pub(crate) usize);
+define_handle! {
+    /// A handle to a TCP listener added to a [`Stack`].
+    ///
+    /// [`Stack`]: crate::Stack
+    TcpListenerHandle(crate::config::tcp_listener_index)
+}
 
 /// A SYN recorded in a listener's accept queue: the parsed handshake state
 /// needed to create the connection socket at accept time.
@@ -372,17 +372,19 @@ impl<'d> TcpListener<'_, 'd> {
     /// [`connect`]: crate::tcp::TcpSocket::connect
     /// [`Stack::poll`]: crate::Stack::poll
     pub fn accept_with_socket(&mut self, handle: TcpHandle) -> Result<(), AcceptError> {
-        if self.tcp.get(handle.0).is_open() {
+        if self.tcp.get(handle.index()).is_open() {
             return Err(AcceptError::InvalidState);
         }
         let state = self.listeners.get_mut(self.index);
         let syn = state.queue.pop_front().ok_or(AcceptError::Exhausted)?;
         trace!(
             "listener:{}: accepting {} into socket {}",
-            state.local, syn.tuple, handle.0
+            state.local,
+            syn.tuple,
+            handle.index()
         );
 
-        let s = self.tcp.get_mut(handle.0);
+        let s = self.tcp.get_mut(handle.index());
         s.reset();
         Self::start_syn_received(s, syn, self.rand);
         Ok(())
@@ -402,7 +404,7 @@ impl<'d> TcpListener<'_, 'd> {
         Self::start_syn_received(&mut s, syn, self.rand);
 
         // Can't fail: checked for room above.
-        Some(TcpHandle(unwrap!(self.tcp.add_with(|_| s))))
+        Some(TcpHandle::new(unwrap!(self.tcp.add_with(|_| s))))
     }
 
     /// Set up a closed socket as the SYN-RECEIVED socket continuing `syn`. This

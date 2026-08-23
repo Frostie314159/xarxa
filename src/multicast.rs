@@ -723,7 +723,7 @@ mod test {
     const REMOTE_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
     const OUR_LL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
     const REMOTE_LL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x100);
-    const IFACE: IfaceHandle = IfaceHandle(0);
+    const IFACE: IfaceHandle = IfaceHandle::new(0);
 
     /// A stack with one interface of the given medium, owning [`OUR_V4`]/24 and
     /// [`OUR_LL`]/64 (plus, on Ethernet, the automatic link-local address, whose

@@ -30,12 +30,12 @@ use crate::wire::Ipv6Packet;
 use crate::wire::{EthernetFrame, EthernetProtocol};
 use crate::wire::{IpAddress, IpProtocol, IpVersion, LINK_HEADER_LEN};
 
-/// A handle to a raw socket added to a [`Stack`].
-///
-/// [`Stack`]: crate::Stack
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RawHandle(pub(crate) usize);
+define_handle! {
+    /// A handle to a raw socket added to a [`Stack`].
+    ///
+    /// [`Stack`]: crate::Stack
+    RawHandle(crate::config::raw_index)
+}
 
 /// The mode of a raw socket, set by [`RawSocket::bind`].
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -241,7 +241,7 @@ impl RawSocket<'_, '_> {
         }
         #[cfg(feature = "medium-ethernet")]
         if let RawMode::Ethernet { iface, .. } = mode
-            && self.tx.ifaces.get(iface.0).medium() != Medium::Ethernet
+            && self.tx.ifaces.get(iface.index()).medium() != Medium::Ethernet
         {
             return Err(BindError::InvalidMedium);
         }

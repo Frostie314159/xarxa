@@ -40,13 +40,13 @@ use crate::wire::{
     IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, LINK_HEADER_LEN, UDP_HEADER_LEN, UdpPacket,
 };
 
-/// A handle to a UDP socket added to a [`Stack`].
-///
-/// [`Stack`]: crate::Stack
-/// [`Stack::remove_udp_socket`]: crate::Stack::remove_udp_socket
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct UdpHandle(pub(crate) usize);
+define_handle! {
+    /// A handle to a UDP socket added to a [`Stack`].
+    ///
+    /// [`Stack`]: crate::Stack
+    /// [`Stack::remove_udp_socket`]: crate::Stack::remove_udp_socket
+    UdpHandle(crate::config::udp_index)
+}
 
 /// Metadata for a sent or received UDP datagram.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -860,7 +860,7 @@ impl Stack<'_> {
 
         // Sockets bound to a specific address also accept broadcast/multicast traffic
         // on their port.
-        let dst_is_bcast = self.ifaces.get(iface.0).is_broadcast(&dst_addr) || dst_addr.is_multicast();
+        let dst_is_bcast = self.ifaces.get(iface.index()).is_broadcast(&dst_addr) || dst_addr.is_multicast();
 
         // Linear scan, most specific match wins: every candidate whose
         // specified tuple parts all match is scored by how specific those parts
@@ -1044,7 +1044,7 @@ mod test {
         let mut buf = queued_packet_from(src_addr, src_port, dst_addr, payload);
         buf.pull_front(IPV4_HEADER_LEN);
         stack.process_udp(
-            IfaceHandle(0),
+            IfaceHandle::new(0),
             src_addr.into(),
             dst_addr.into(),
             IPV4_HEADER_LEN,

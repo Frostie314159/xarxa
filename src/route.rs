@@ -248,8 +248,8 @@ mod test {
     #[allow(unused_imports)]
     use std::vec::Vec;
 
-    const IF_0: IfaceHandle = IfaceHandle(0);
-    const IF_1: IfaceHandle = IfaceHandle(1);
+    const IF_0: IfaceHandle = IfaceHandle::new(0);
+    const IF_1: IfaceHandle = IfaceHandle::new(1);
 
     const ADDR_1A: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 2, 0, 0, 0, 1);
     const ADDR_1B: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 2, 0, 0, 0, 13);

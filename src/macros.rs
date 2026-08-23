@@ -87,3 +87,82 @@ macro_rules! open_enum {
         }
     }
 }
+
+/// Define a handle type over one of the generated `config::*_index` modules.
+///
+/// Each handle wraps an index type chosen by `build.rs` from the matching
+/// `*_COUNT` knob: `()` when only one slot exists, `u8`/`u16`/`u32` for
+/// larger counts, and `usize` with `alloc` (where the knobs are ignored).
+/// The generated `config::*_index` modules hold the type and its `usize`
+/// conversions.
+macro_rules! define_handle {
+    ($(#[$m:meta])* $name:ident($($index:ident)::+)) => {
+        $(#[$m])*
+        #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub struct $name($($index)::+::Index);
+
+        impl $name {
+            #[inline]
+            pub(crate) const fn new(index: usize) -> Self {
+                Self($($index)::+::from_usize(index))
+            }
+
+            #[inline]
+            pub(crate) const fn index(self) -> usize {
+                $($index)::+::to_usize(self.0)
+            }
+        }
+    };
+}
+
+#[cfg(test)]
+mod tests {
+    use core::mem::size_of;
+
+    /// The size a handle over a slab of `count` slots should have.
+    ///
+    /// Mirrors the type choice in `build.rs`. With `alloc` the knobs are
+    /// ignored and every handle is a `usize`.
+    fn expected_size(count: usize) -> usize {
+        if cfg!(feature = "alloc") {
+            size_of::<usize>()
+        } else {
+            match count {
+                1 => 0,
+                2..=256 => 1,
+                257..=65536 => 2,
+                _ => 4,
+            }
+        }
+    }
+
+    /// Check a handle's size, and that `new`/`index` round-trip every index a
+    /// full slab can hold.
+    macro_rules! check_handle {
+        ($handle:ty, $count:expr) => {
+            let count: usize = $count;
+            assert_eq!(size_of::<$handle>(), expected_size(count));
+            for i in 0..count {
+                let h = <$handle>::new(i);
+                assert_eq!(h.index(), i);
+                assert_eq!(h, <$handle>::new(i));
+            }
+        };
+    }
+
+    #[test]
+    fn handle_sizes() {
+        check_handle!(crate::stack::IfaceHandle, crate::config::IFACE_COUNT);
+        #[cfg(feature = "udp")]
+        check_handle!(crate::udp::UdpHandle, crate::config::UDP_SOCKET_COUNT);
+        #[cfg(feature = "raw")]
+        check_handle!(crate::raw::RawHandle, crate::config::RAW_SOCKET_COUNT);
+        #[cfg(feature = "tcp")]
+        check_handle!(crate::tcp::TcpHandle, crate::config::TCP_SOCKET_COUNT);
+        #[cfg(feature = "tcp-listener")]
+        check_handle!(crate::tcp::TcpListenerHandle, crate::config::TCP_LISTENER_COUNT);
+        #[cfg(feature = "dns")]
+        check_handle!(crate::dns::DnsQueryHandle, crate::config::DNS_MAX_QUERY_COUNT);
+    }
+}

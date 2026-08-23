@@ -42,6 +42,8 @@ fn main() {
     // other file changed.
     println!("cargo:rerun-if-changed=build.rs");
 
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ALLOC");
+
     // Rebuild if config envvar changed.
     for (name, _) in CONFIGS {
         println!("cargo:rerun-if-env-changed=XARXA_{name}");
@@ -100,6 +102,45 @@ fn main() {
 
     for (name, cfg) in &configs {
         writeln!(&mut data, "pub const {}: usize = {};", name, cfg.value).unwrap();
+    }
+
+    // Index types for handles. Without `alloc` the slabs are bounded by the
+    // `*_COUNT` knobs, so a handle only needs enough bits for that count.
+    // With `alloc` the knobs are ignored and handles stay `usize`.
+    let alloc = env::var_os("CARGO_FEATURE_ALLOC").is_some();
+    for (module, count) in [
+        ("iface_index", "IFACE_COUNT"),
+        ("udp_index", "UDP_SOCKET_COUNT"),
+        ("raw_index", "RAW_SOCKET_COUNT"),
+        ("tcp_index", "TCP_SOCKET_COUNT"),
+        ("tcp_listener_index", "TCP_LISTENER_COUNT"),
+        ("dns_query_index", "DNS_MAX_QUERY_COUNT"),
+    ] {
+        let n = configs[count].value;
+        let (ty, from, to) = match n {
+            _ if alloc => ("usize", "i", "i"),
+            1 => ("()", "{ core::debug_assert!(i == 0); }", "{ let () = i; 0 }"),
+            2..=256 => (
+                "u8",
+                "{ core::debug_assert!(i <= u8::MAX as usize); i as u8 }",
+                "i as usize",
+            ),
+            257..=65536 => (
+                "u16",
+                "{ core::debug_assert!(i <= u16::MAX as usize); i as u16 }",
+                "i as usize",
+            ),
+            _ => (
+                "u32",
+                "{ core::debug_assert!(i <= u32::MAX as usize); i as u32 }",
+                "i as usize",
+            ),
+        };
+        writeln!(&mut data, "pub mod {module} {{").unwrap();
+        writeln!(&mut data, "    pub type Index = {ty};").unwrap();
+        writeln!(&mut data, "    pub const fn from_usize(i: usize) -> Index {{ {from} }}").unwrap();
+        writeln!(&mut data, "    pub const fn to_usize(i: Index) -> usize {{ {to} }}").unwrap();
+        writeln!(&mut data, "}}").unwrap();
     }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());

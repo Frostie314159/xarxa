@@ -767,7 +767,7 @@ mod test {
     const OFFERED_IP: Ipv4Address = Ipv4Address::new(192, 168, 1, 50);
     const DNS_IP: Ipv4Address = Ipv4Address::new(1, 1, 1, 1);
     const XID: u32 = 0x12345678;
-    const IFACE: IfaceHandle = IfaceHandle(0);
+    const IFACE: IfaceHandle = IfaceHandle::new(0);
 
     /// A stack with one Ethernet interface, no addresses, DHCP on.
     fn test_stack() -> (Stack<'static>, Queue, Sent) {

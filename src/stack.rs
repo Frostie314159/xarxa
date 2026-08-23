@@ -29,10 +29,10 @@ use crate::time::Instant;
 use crate::udp::{UdpHandle, UdpSocket, UdpSocketState};
 use crate::wire::*;
 
-/// A handle to an interface added to a [`Stack`].
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct IfaceHandle(pub(crate) usize);
+define_handle! {
+    /// A handle to an interface added to a [`Stack`].
+    IfaceHandle(crate::config::iface_index)
+}
 
 /// A network stack.
 pub struct Stack<'d> {
@@ -308,7 +308,7 @@ impl<'d> Iface<'_, 'd> {
 
     /// Purge state associated to this interface.
     fn invalidate(&mut self) {
-        let handle = IfaceHandle(self.index);
+        let handle = IfaceHandle::new(self.index);
         self.inner.purge_iface_link_state(handle);
         self.state_mut().config_changed();
     }
@@ -479,14 +479,14 @@ impl TxContext<'_, '_> {
     #[cfg(any(feature = "udp", feature = "tcp"))]
     pub(crate) fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
         let route = self.route(dst_addr)?;
-        self.ifaces.get(route.iface.0).get_source_address(dst_addr)
+        self.ifaces.get(route.iface.index()).get_source_address(dst_addr)
     }
 
     /// A source address for sending to `dst_addr` out of the interface `route`
     /// names.
     #[cfg(feature = "udp")]
     pub(crate) fn get_source_address_routed(&self, route: &EgressRoute, dst_addr: &IpAddress) -> Option<IpAddress> {
-        self.ifaces.get(route.iface.0).get_source_address(dst_addr)
+        self.ifaces.get(route.iface.index()).get_source_address(dst_addr)
     }
 
     /// Whether the interface can take one more frame right now.
@@ -498,7 +498,7 @@ impl TxContext<'_, '_> {
     /// Panics if the handle is stale (the interface was removed).
     #[cfg(any(feature = "udp", feature = "tcp", feature = "raw"))]
     pub(crate) fn can_transmit(&mut self, iface: IfaceHandle) -> bool {
-        self.ifaces.get_mut(iface.0).dev.can_transmit()
+        self.ifaces.get_mut(iface.index()).dev.can_transmit()
     }
 
     /// Make the egress routing decision for a destination: the interface the
@@ -529,7 +529,7 @@ impl TxContext<'_, '_> {
         Some(EgressRoute {
             iface: route.iface,
             next_hop: route.via_router,
-            ip_mtu: self.ifaces.get(route.iface.0).ip_mtu(),
+            ip_mtu: self.ifaces.get(route.iface.index()).ip_mtu(),
         })
     }
 
@@ -552,7 +552,7 @@ impl TxContext<'_, '_> {
             return Some(EgressRoute {
                 iface: arrival,
                 next_hop: *dst_addr,
-                ip_mtu: self.ifaces.get(arrival.0).ip_mtu(),
+                ip_mtu: self.ifaces.get(arrival.index()).ip_mtu(),
             });
         }
 
@@ -572,7 +572,7 @@ impl TxContext<'_, '_> {
         next_header: IpProtocol,
         hop_limit: u8,
     ) {
-        let iface = self.ifaces.get_mut(route.iface.0);
+        let iface = self.ifaces.get_mut(route.iface.index());
         let ethertype = match (src_addr, dst_addr) {
             #[cfg(feature = "ipv4")]
             (IpAddress::Ipv4(src), IpAddress::Ipv4(dst)) => {
@@ -599,14 +599,14 @@ impl TxContext<'_, '_> {
     /// Panics if the handle is stale (the interface was removed).
     #[cfg(all(feature = "raw", feature = "medium-ethernet"))]
     pub(crate) fn transmit_ethernet(&mut self, iface: IfaceHandle, buf: PacketBuf) {
-        let iface = self.ifaces.get_mut(iface.0);
+        let iface = self.ifaces.get_mut(iface.index());
         self.inner.transmit_raw(iface, buf);
     }
 
     /// Transmit a fully-built IP packet (IP header included, emitted as-is).
     #[cfg(feature = "raw")]
     pub(crate) fn transmit_raw_ip(&mut self, route: &EgressRoute, buf: PacketBuf, dst_addr: IpAddress) {
-        let iface = self.ifaces.get_mut(route.iface.0);
+        let iface = self.ifaces.get_mut(route.iface.index());
         let ethertype = match dst_addr {
             #[cfg(feature = "ipv4")]
             IpAddress::Ipv4(_) => EthernetProtocol::Ipv4,
@@ -767,7 +767,7 @@ impl<'d> Stack<'d> {
             let _ = ip_addrs.push(ll);
         }
         let index = self.ifaces.add_with(|index| IfaceState {
-            handle: IfaceHandle(index),
+            handle: IfaceHandle::new(index),
             dev,
             hardware_addr,
             ip_addrs,
@@ -787,7 +787,7 @@ impl<'d> Stack<'d> {
         if self.ifaces.get(index).medium() == Medium::Ethernet {
             self.ifaces.get_mut(index).update_solicited_node_groups();
         }
-        Ok(IfaceHandle(index))
+        Ok(IfaceHandle::new(index))
     }
 
     /// Borrow an interface from the stack.
@@ -795,11 +795,11 @@ impl<'d> Stack<'d> {
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
     pub fn iface(&mut self, handle: IfaceHandle) -> Iface<'_, 'd> {
-        self.ifaces.get(handle.0); // Stale handles panic here, not on first use.
+        self.ifaces.get(handle.index()); // Stale handles panic here, not on first use.
         Iface {
             inner: &mut self.inner,
             ifaces: &mut self.ifaces,
-            index: handle.0,
+            index: handle.index(),
         }
     }
 
@@ -808,7 +808,7 @@ impl<'d> Stack<'d> {
     /// # Panics
     /// Panics if the handle is stale (the interface was already removed).
     pub fn remove_iface(&mut self, handle: IfaceHandle) {
-        self.ifaces.remove(handle.0);
+        self.ifaces.remove(handle.index());
         #[cfg(feature = "medium-ethernet")]
         {
             self.inner.neighbor_cache.purge_iface(handle);
@@ -834,7 +834,7 @@ impl<'d> Stack<'d> {
     ///   without the `alloc` feature, where the `udp-socket-count-N` feature sets the limit.
     #[cfg(feature = "udp")]
     pub fn add_udp_socket(&mut self) -> core::result::Result<UdpHandle, Full> {
-        Ok(UdpHandle(self.sockets.udp.add_with(|_| UdpSocketState::new())?))
+        Ok(UdpHandle::new(self.sockets.udp.add_with(|_| UdpSocketState::new())?))
     }
 
     /// Remove a UDP socket from the stack.
@@ -843,7 +843,7 @@ impl<'d> Stack<'d> {
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "udp")]
     pub fn remove_udp_socket(&mut self, handle: UdpHandle) {
-        self.sockets.udp.remove(handle.0);
+        self.sockets.udp.remove(handle.index());
     }
 
     /// Borrow a UDP socket from the stack.
@@ -852,10 +852,10 @@ impl<'d> Stack<'d> {
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "udp")]
     pub fn udp_socket(&mut self, handle: UdpHandle) -> UdpSocket<'_, 'd> {
-        self.sockets.udp.get(handle.0); // Stale handles panic here, not on first use.
+        self.sockets.udp.get(handle.index()); // Stale handles panic here, not on first use.
         UdpSocket {
             sockets: &mut self.sockets.udp,
-            index: handle.0,
+            index: handle.index(),
             tx: TxContext {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
@@ -870,7 +870,7 @@ impl<'d> Stack<'d> {
     ///   without the `alloc` feature, where the `raw-socket-count-N` feature sets the limit.
     #[cfg(feature = "raw")]
     pub fn add_raw_socket(&mut self) -> core::result::Result<RawHandle, Full> {
-        Ok(RawHandle(self.sockets.raw.add_with(|_| RawSocketState::new())?))
+        Ok(RawHandle::new(self.sockets.raw.add_with(|_| RawSocketState::new())?))
     }
 
     /// Remove a raw socket from the stack.
@@ -879,7 +879,7 @@ impl<'d> Stack<'d> {
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "raw")]
     pub fn remove_raw_socket(&mut self, handle: RawHandle) {
-        self.sockets.raw.remove(handle.0);
+        self.sockets.raw.remove(handle.index());
     }
 
     /// Borrow a raw socket from the stack.
@@ -889,7 +889,7 @@ impl<'d> Stack<'d> {
     #[cfg(feature = "raw")]
     pub fn raw_socket(&mut self, handle: RawHandle) -> RawSocket<'_, 'd> {
         RawSocket {
-            state: self.sockets.raw.get_mut(handle.0),
+            state: self.sockets.raw.get_mut(handle.index()),
             tx: TxContext {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
@@ -953,7 +953,7 @@ impl<'d> Stack<'d> {
         rx_buffer: SocketBuffer<'d>,
         tx_buffer: SocketBuffer<'d>,
     ) -> core::result::Result<TcpHandle, Full> {
-        Ok(TcpHandle(
+        Ok(TcpHandle::new(
             self.sockets
                 .tcp
                 .add_with(|_| TcpSocketState::new(rx_buffer, tx_buffer))?,
@@ -969,7 +969,7 @@ impl<'d> Stack<'d> {
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "tcp")]
     pub fn remove_tcp_socket(&mut self, handle: TcpHandle) {
-        self.sockets.tcp.remove(handle.0);
+        self.sockets.tcp.remove(handle.index());
     }
 
     /// Borrow a TCP socket from the stack.
@@ -978,10 +978,10 @@ impl<'d> Stack<'d> {
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "tcp")]
     pub fn tcp_socket(&mut self, handle: TcpHandle) -> TcpSocket<'_, 'd> {
-        self.sockets.tcp.get(handle.0); // Stale handles panic here, not on first use.
+        self.sockets.tcp.get(handle.index()); // Stale handles panic here, not on first use.
         TcpSocket {
             sockets: &mut self.sockets.tcp,
-            index: handle.0,
+            index: handle.index(),
             tx: TxContext {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
@@ -996,7 +996,7 @@ impl<'d> Stack<'d> {
     ///   without the `alloc` feature, where the `tcp-listener-count-N` feature sets the limit.
     #[cfg(feature = "tcp-listener")]
     pub fn add_tcp_listener(&mut self) -> core::result::Result<TcpListenerHandle, Full> {
-        Ok(TcpListenerHandle(
+        Ok(TcpListenerHandle::new(
             self.sockets.tcp_listeners.add_with(|_| TcpListenerState::new())?,
         ))
     }
@@ -1007,7 +1007,7 @@ impl<'d> Stack<'d> {
     /// Panics if the handle is stale (the listener was already removed).
     #[cfg(feature = "tcp-listener")]
     pub fn remove_tcp_listener(&mut self, handle: TcpListenerHandle) {
-        self.sockets.tcp_listeners.remove(handle.0);
+        self.sockets.tcp_listeners.remove(handle.index());
     }
 
     /// Borrow a TCP listener from the stack.
@@ -1016,10 +1016,10 @@ impl<'d> Stack<'d> {
     /// Panics if the handle is stale (the listener was already removed).
     #[cfg(feature = "tcp-listener")]
     pub fn tcp_listener(&mut self, handle: TcpListenerHandle) -> TcpListener<'_, 'd> {
-        self.sockets.tcp_listeners.get(handle.0); // Stale handles panic here, not on first use.
+        self.sockets.tcp_listeners.get(handle.index()); // Stale handles panic here, not on first use.
         TcpListener {
             listeners: &mut self.sockets.tcp_listeners,
-            index: handle.0,
+            index: handle.index(),
             tcp: &mut self.sockets.tcp,
             rand: &mut self.inner.rand,
         }
@@ -1091,7 +1091,7 @@ impl<'d> Stack<'d> {
         let mut next = 0;
         while let Some(index) = self.ifaces.next_occupied(next) {
             next = index + 1;
-            let handle = IfaceHandle(index);
+            let handle = IfaceHandle::new(index);
 
             #[cfg(feature = "medium-ethernet")]
             self.poll_neighbor_timers(handle);
@@ -1214,7 +1214,7 @@ impl<'d> IfaceIter<'_, 'd> {
     pub fn next(&mut self) -> Option<(IfaceHandle, Iface<'_, 'd>)> {
         let index = self.stack.ifaces.next_occupied(self.next)?;
         self.next = index + 1;
-        let handle = IfaceHandle(index);
+        let handle = IfaceHandle::new(index);
         Some((handle, self.stack.iface(handle)))
     }
 }
@@ -1248,7 +1248,7 @@ impl<'d> UdpSocketIter<'_, 'd> {
     pub fn next(&mut self) -> Option<(UdpHandle, UdpSocket<'_, 'd>)> {
         let index = self.stack.sockets.udp.next_occupied(self.next)?;
         self.next = index + 1;
-        let handle = UdpHandle(index);
+        let handle = UdpHandle::new(index);
         Some((handle, self.stack.udp_socket(handle)))
     }
 }
@@ -1282,7 +1282,7 @@ impl<'d> RawSocketIter<'_, 'd> {
     pub fn next(&mut self) -> Option<(RawHandle, RawSocket<'_, 'd>)> {
         let index = self.stack.sockets.raw.next_occupied(self.next)?;
         self.next = index + 1;
-        let handle = RawHandle(index);
+        let handle = RawHandle::new(index);
         Some((handle, self.stack.raw_socket(handle)))
     }
 }
@@ -1316,7 +1316,7 @@ impl<'d> TcpSocketIter<'_, 'd> {
     pub fn next(&mut self) -> Option<(TcpHandle, TcpSocket<'_, 'd>)> {
         let index = self.stack.sockets.tcp.next_occupied(self.next)?;
         self.next = index + 1;
-        let handle = TcpHandle(index);
+        let handle = TcpHandle::new(index);
         Some((handle, self.stack.tcp_socket(handle)))
     }
 }
@@ -1350,14 +1350,14 @@ impl<'d> TcpListenerIter<'_, 'd> {
     pub fn next(&mut self) -> Option<(TcpListenerHandle, TcpListener<'_, 'd>)> {
         let index = self.stack.sockets.tcp_listeners.next_occupied(self.next)?;
         self.next = index + 1;
-        let handle = TcpListenerHandle(index);
+        let handle = TcpListenerHandle::new(index);
         Some((handle, self.stack.tcp_listener(handle)))
     }
 }
 
 impl<'d> Stack<'d> {
     fn process(&mut self, iface: IfaceHandle, buf: PacketBuf) {
-        match self.ifaces.get(iface.0).dev.capabilities().medium {
+        match self.ifaces.get(iface.index()).dev.capabilities().medium {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => self.process_ethernet(iface, buf),
             #[cfg(feature = "medium-ip")]
@@ -1372,7 +1372,7 @@ impl<'d> Stack<'d> {
         // Ignore any packets not directed to our hardware address or any of the multicast groups.
         if !eth_frame.dst_addr().is_broadcast()
             && !eth_frame.dst_addr().is_multicast()
-            && eth_frame.dst_addr() != self.ifaces.get(iface.0).ethernet_addr()
+            && eth_frame.dst_addr() != self.ifaces.get(iface.index()).ethernet_addr()
         {
             return;
         }
@@ -1398,7 +1398,7 @@ impl<'d> Stack<'d> {
 
         match ethertype {
             #[cfg(feature = "ipv4")]
-            EthernetProtocol::Arp => self.inner.process_arp(self.ifaces.get_mut(iface.0), buf),
+            EthernetProtocol::Arp => self.inner.process_arp(self.ifaces.get_mut(iface.index()), buf),
             #[cfg(feature = "ipv4")]
             EthernetProtocol::Ipv4 => self.process_ipv4(iface, Some(src_addr), buf),
             #[cfg(feature = "ipv6")]
@@ -1448,7 +1448,7 @@ impl<'d> Stack<'d> {
         // be addressed to the address being leased, which isn't ours yet, or to
         // broadcast.
         #[cfg(feature = "dhcpv4")]
-        if next_header == IpProtocol::Udp && self.ifaces.get(iface.0).dhcpv4.is_some() {
+        if next_header == IpProtocol::Udp && self.ifaces.get(iface.index()).dhcpv4.is_some() {
             let udp_len = match buf.get_mut(header_len..total_len).map(UdpPacket::new_checked) {
                 Some(Ok(udp)) if udp.src_port() == DHCP_SERVER_PORT && udp.dst_port() == DHCP_CLIENT_PORT => {
                     if !udp.verify_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr)) {
@@ -1462,14 +1462,14 @@ impl<'d> Stack<'d> {
             if let Some(udp_len) = udp_len {
                 let payload = &mut buf[header_len + UDP_HEADER_LEN..header_len + udp_len];
                 self.ifaces
-                    .get_mut(iface.0)
+                    .get_mut(iface.index())
                     .dhcpv4_process(&mut self.inner, src_addr, payload);
                 return;
             }
         }
 
         {
-            let iface = self.ifaces.get(iface.0);
+            let iface = self.ifaces.get(iface.index());
             if !iface.is_unicast_v4(src_addr) && !src_addr.is_unspecified() {
                 // Discard packets with non-unicast source addresses but allow unspecified
                 debug!("non-unicast or unspecified source address");
@@ -1524,7 +1524,7 @@ impl<'d> Stack<'d> {
             #[cfg(feature = "multicast")]
             IpProtocol::Igmp => self
                 .ifaces
-                .get_mut(iface.0)
+                .get_mut(iface.index())
                 .process_igmp(&mut self.inner, dst_addr, buf),
             #[cfg(feature = "udp")]
             IpProtocol::Udp => self.process_udp(
@@ -1642,7 +1642,7 @@ impl<'d> Stack<'d> {
             #[cfg(feature = "icmp-ping-reply")]
             (Icmpv4Message::EchoRequest, 0) => {
                 let reply_src = {
-                    let iface = self.ifaces.get(iface.0);
+                    let iface = self.ifaces.get(iface.index());
                     // Do not send ICMP replies to non-unicast sources.
                     if !iface.is_unicast_v4(src_addr) {
                         return;
@@ -1746,7 +1746,7 @@ impl<'d> Stack<'d> {
         }
 
         {
-            let iface = self.ifaces.get(iface.0);
+            let iface = self.ifaces.get(iface.index());
             if !iface.has_ip_addr(dst_addr) && !iface.has_multicast_group(dst_addr) && !dst_addr.is_loopback() {
                 trace!("Rejecting IPv6 packet; not for us");
                 return;
@@ -1877,7 +1877,7 @@ impl<'d> Stack<'d> {
                 let reply_src = if dst_addr.x_is_unicast() {
                     dst_addr
                 } else {
-                    self.ifaces.get(iface.0).get_source_address_ipv6(&src_addr)
+                    self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
                 };
 
                 let mut reply = PacketBuf::new();
@@ -1918,19 +1918,19 @@ impl<'d> Stack<'d> {
             #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
             Icmpv6Message::NeighborSolicit if hop_limit == 0xff && eth_src.is_some() => self
                 .inner
-                .process_ndisc_solicit(self.ifaces.get_mut(iface.0), src_addr, dst_addr, &mut icmp_packet),
+                .process_ndisc_solicit(self.ifaces.get_mut(iface.index()), src_addr, dst_addr, &mut icmp_packet),
 
             #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
             Icmpv6Message::NeighborAdvert if hop_limit == 0xff && eth_src.is_some() => {
                 self.inner
-                    .process_ndisc_advert(self.ifaces.get_mut(iface.0), src_addr, &mut icmp_packet)
+                    .process_ndisc_advert(self.ifaces.get_mut(iface.index()), src_addr, &mut icmp_packet)
             }
 
             // [RFC 3810 § 6.2], reception checks
             #[cfg(feature = "multicast")]
             Icmpv6Message::MldQuery if hop_limit == 1 && src_addr.is_link_local() => self
                 .ifaces
-                .get_mut(iface.0)
+                .get_mut(iface.index())
                 .process_mldv2(&mut self.inner, dst_addr, &icmp_packet),
 
             // RFC 4861 §6.1.2: a router advertisement is only valid from a link-local
@@ -1942,9 +1942,11 @@ impl<'d> Stack<'d> {
                     && src_addr.is_link_local()
                     && (dst_addr == IPV6_LINK_LOCAL_ALL_NODES || dst_addr.is_link_local()) =>
             {
-                self.ifaces
-                    .get_mut(iface.0)
-                    .slaac_process_advertisement(&mut self.inner, src_addr, &mut icmp_packet)
+                self.ifaces.get_mut(iface.index()).slaac_process_advertisement(
+                    &mut self.inner,
+                    src_addr,
+                    &mut icmp_packet,
+                )
             }
 
             _ => {}
@@ -1965,7 +1967,7 @@ impl<'d> Stack<'d> {
             match event {
                 ProbeEvent::Retransmit(addr) => {
                     debug!("neighbor {} still unresolved, retransmitting solicitation", addr);
-                    self.inner.solicit_neighbor(self.ifaces.get_mut(iface.0), addr);
+                    self.inner.solicit_neighbor(self.ifaces.get_mut(iface.index()), addr);
                 }
                 ProbeEvent::Failed(addr) => {
                     debug!("neighbor {} resolution failed, dropping queued packets", addr);
@@ -2006,7 +2008,7 @@ impl<'d> Stack<'d> {
                     return;
                 }
                 let reply_src = {
-                    let iface = self.ifaces.get(iface.0);
+                    let iface = self.ifaces.get(iface.index());
                     if !iface.is_unicast_v4(src_addr) {
                         return;
                     }
@@ -2040,7 +2042,7 @@ impl<'d> Stack<'d> {
                 if !src_addr.x_is_unicast() {
                     return;
                 }
-                let reply_src = self.ifaces.get(iface.0).get_source_address_ipv6(&src_addr);
+                let reply_src = self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr);
                 let mut reply = build_icmpv6_error(
                     &orig,
                     &reply_src,
@@ -2075,7 +2077,7 @@ impl<'d> Stack<'d> {
             (packet.src_addr(), packet.dst_addr())
         };
         {
-            let iface = self.ifaces.get(iface.0);
+            let iface = self.ifaces.get(iface.index());
             if !iface.is_unicast_v4(src_addr) || !iface.is_unicast_v4(dst_addr) {
                 return;
             }
@@ -2120,7 +2122,7 @@ impl<'d> Stack<'d> {
         let reply_src = if dst_addr.x_is_unicast() {
             dst_addr
         } else {
-            self.ifaces.get(iface.0).get_source_address_ipv6(&src_addr)
+            self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
         };
         let reply = build_icmpv6_error(orig, &reply_src, &src_addr, msg_type, msg_code, pointer);
         self.transmit_reply(
@@ -2578,12 +2580,12 @@ impl StackInner {
     fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
         #[cfg(feature = "packet-log")]
         {
-            trace!("sent on iface {}", iface.handle.0);
+            trace!("sent on iface {}", iface.handle.index());
             let medium = iface.dev.capabilities().medium;
             crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
         }
         if iface.dev.transmit(buf).is_err() {
-            warn!("iface {}: device refused a frame, dropping it", iface.handle.0);
+            warn!("iface {}: device refused a frame, dropping it", iface.handle.index());
         }
     }
 }
@@ -3221,7 +3223,7 @@ mod test {
             origin: AddrOrigin::LinkLocal,
         };
         let (mut stack, _rx, _tx) = test_stack(Medium::Ethernet);
-        let handle = IfaceHandle(0);
+        let handle = IfaceHandle::new(0);
 
         // Present after add_iface, survives set_ip_addrs.
         assert!(stack.iface(handle).ip_addrs().contains(&ll));
@@ -3331,7 +3333,7 @@ mod test {
     #[cfg(feature = "slaac")]
     fn test_slaac() {
         let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
-        let iface = IfaceHandle(0);
+        let iface = IfaceHandle::new(0);
         let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
         let router_ll = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
         let prefix = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
@@ -3492,7 +3494,7 @@ mod test {
     #[cfg(feature = "slaac")]
     fn test_slaac_ignores_invalid_advert() {
         let (mut stack, rx, _tx) = test_stack(Medium::Ethernet);
-        let iface = IfaceHandle(0);
+        let iface = IfaceHandle::new(0);
         stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
         rx.borrow_mut().push_back(router_advert(
             EthernetAddress([0x02, 0, 0, 0, 0, 0x02]),
@@ -4364,7 +4366,7 @@ mod test {
     #[test]
     fn test_iface_ip_addrs() {
         let (mut stack, rx, tx) = test_stack(Medium::Ip);
-        let iface = IfaceHandle(0);
+        let iface = IfaceHandle::new(0);
         let new_addr = Ipv4Address::new(10, 0, 0, 1);
 
         assert_eq!(
@@ -4441,7 +4443,7 @@ mod test {
     fn test_iface_reject_non_unicast_ip_addr() {
         let (mut stack, _rx, _tx) = test_stack(Medium::Ip);
         stack
-            .iface(IfaceHandle(0))
+            .iface(IfaceHandle::new(0))
             .add_ip_addr(IpCidr::new(Ipv4Address::new(224, 0, 0, 1).into(), 24))
             .unwrap();
     }
@@ -4486,7 +4488,7 @@ mod test {
         stack
             .raw_socket(raw)
             .bind(RawMode::Ethernet {
-                iface: IfaceHandle(0),
+                iface: IfaceHandle::new(0),
                 ethertype: None,
             })
             .unwrap();
@@ -4599,7 +4601,7 @@ mod test {
     #[test]
     fn test_iface_addr_change_invalidates_link_state() {
         let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
-        let iface = IfaceHandle(0);
+        let iface = IfaceHandle::new(0);
         let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
 
         // Learn the remote's hardware address from an ARP request for us.

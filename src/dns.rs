@@ -148,10 +148,10 @@ struct CompletedQuery {
     addresses: Vec<IpAddress, DNS_MAX_RESULT_COUNT>,
 }
 
-/// A handle to an in-progress DNS query.
-#[derive(Clone, Copy, Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct DnsQueryHandle(usize);
+define_handle! {
+    /// A handle to an in-progress DNS query.
+    DnsQueryHandle(crate::config::dns_query_index)
+}
 
 /// A DNS client.
 ///
@@ -300,7 +300,7 @@ impl DnsClient {
             waker: WakerRegistration::new(),
         });
         let index = index.map_err(|_| StartQueryError::NoFreeSlot)?;
-        Ok(DnsQueryHandle(index))
+        Ok(DnsQueryHandle::new(index))
     }
 
     /// Get the result of a query.
@@ -313,18 +313,18 @@ impl DnsClient {
         &mut self,
         handle: DnsQueryHandle,
     ) -> Result<Vec<IpAddress, DNS_MAX_RESULT_COUNT>, GetQueryResultError> {
-        let q = self.queries.get_mut(handle.0);
+        let q = self.queries.get_mut(handle.index());
         match &mut q.state {
             // Query is not done yet.
             State::Pending(_) => Err(GetQueryResultError::Pending),
             // Query is done
             State::Completed(q) => {
                 let res = q.addresses.clone();
-                self.queries.remove(handle.0); // Free up the slot for recycling.
+                self.queries.remove(handle.index()); // Free up the slot for recycling.
                 Ok(res)
             }
             State::Failure => {
-                self.queries.remove(handle.0); // Free up the slot for recycling.
+                self.queries.remove(handle.index()); // Free up the slot for recycling.
                 Err(GetQueryResultError::Failed)
             }
         }
@@ -336,7 +336,7 @@ impl DnsClient {
     /// Panics if the handle corresponds to an already free slot.
     pub fn cancel_query(&mut self, handle: DnsQueryHandle) {
         // Panics if the slot is free.
-        self.queries.remove(handle.0);
+        self.queries.remove(handle.index());
     }
 
     /// Assign a waker to a query slot.
@@ -347,7 +347,7 @@ impl DnsClient {
     /// Panics if the handle corresponds to an already free slot.
     #[cfg(feature = "async")]
     pub fn register_query_waker(&mut self, handle: DnsQueryHandle, waker: &Waker) {
-        self.queries.get_mut(handle.0).waker.register(waker);
+        self.queries.get_mut(handle.index()).waker.register(waker);
     }
 
     /// Advance the client: process received responses and send due queries.

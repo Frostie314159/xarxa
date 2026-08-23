@@ -53,12 +53,12 @@ use self::ring_buffer::RingBuffer;
 /// before sizing or sending anything, so this only stands in while there is no route.
 const DEFAULT_IP_MTU: usize = 1500;
 
-/// A handle to a TCP socket added to a [`Stack`].
-///
-/// [`Stack`]: crate::Stack
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct TcpHandle(pub(crate) usize);
+define_handle! {
+    /// A handle to a TCP socket added to a [`Stack`].
+    ///
+    /// [`Stack`]: crate::Stack
+    TcpHandle(crate::config::tcp_index)
+}
 
 /// Error returned by [`TcpListener::listen`]
 ///
@@ -3395,7 +3395,7 @@ mod test {
         let mut s = TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
-                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0)).unwrap();
+                sockets.add_with(|_| stack.sockets.tcp.remove(sh.index())).unwrap();
                 sockets
             },
             stack,
@@ -3461,7 +3461,10 @@ mod test {
 
         // Once the connection is over, the same socket serves the next one,
         // with the previous connection's state gone.
-        assert_eq!(stack.sockets.tcp.get_mut(sh.0).tx_buffer.enqueue_slice(b"stale"), 5);
+        assert_eq!(
+            stack.sockets.tcp.get_mut(sh.index()).tx_buffer.enqueue_slice(b"stale"),
+            5
+        );
         stack.tcp_socket(sh).abort();
         assert_eq!(stack.tcp_listener(h).accept_with_socket(sh), Ok(()));
         assert_eq!(stack.tcp_socket(sh).state(), State::SynReceived);
@@ -3469,7 +3472,7 @@ mod test {
             stack.tcp_socket(sh).remote_endpoint(),
             Some(IpEndpoint::new(REMOTE_ADDR.into(), REMOTE_PORT + 1))
         );
-        assert!(stack.sockets.tcp.get(sh.0).tx_buffer.is_empty());
+        assert!(stack.sockets.tcp.get(sh.index()).tx_buffer.is_empty());
     }
 
     #[cfg(feature = "tcp-listener")]
@@ -3533,7 +3536,7 @@ mod test {
                 .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
                 .is_none()
         );
-        assert_eq!(stack.sockets.tcp.get(sh.0).remote_seq_no, REMOTE_SEQ + 101);
+        assert_eq!(stack.sockets.tcp.get(sh.index()).remote_seq_no, REMOTE_SEQ + 101);
     }
 
     #[cfg(feature = "tcp-listener")]
@@ -3628,7 +3631,7 @@ mod test {
                 .tcp_listener(h)
                 .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
                 .unwrap();
-            assert_eq!(stack.sockets.tcp.get(sh.0).remote_mss, effective);
+            assert_eq!(stack.sockets.tcp.get(sh.index()).remote_mss, effective);
         }
     }
 
@@ -3651,13 +3654,13 @@ mod test {
                 .tcp_listener(h)
                 .accept_with_bufs(vec![0; buffer_size].leak(), vec![0; 64].leak())
                 .unwrap();
-            assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_scale, Some(7));
-            assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_shift, shift);
+            assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_scale, Some(7));
+            assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_shift, shift);
 
             let mut s = TestSocket {
                 sockets: {
                     let mut sockets = Slab::new();
-                    sockets.add_with(|_| stack.sockets.tcp.remove(sh.0)).unwrap();
+                    sockets.add_with(|_| stack.sockets.tcp.remove(sh.index())).unwrap();
                     sockets
                 },
                 stack,
@@ -3683,12 +3686,12 @@ mod test {
             .tcp_listener(h)
             .accept_with_bufs(vec![0; 65536].leak(), vec![0; 64].leak())
             .unwrap();
-        assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_scale, None);
-        assert_eq!(stack.sockets.tcp.get(sh.0).remote_win_shift, 0);
+        assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_scale, None);
+        assert_eq!(stack.sockets.tcp.get(sh.index()).remote_win_shift, 0);
         let mut s = TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
-                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0)).unwrap();
+                sockets.add_with(|_| stack.sockets.tcp.remove(sh.index())).unwrap();
                 sockets
             },
             stack,
@@ -9715,7 +9718,7 @@ mod test {
         TestSocket {
             sockets: {
                 let mut sockets = Slab::new();
-                sockets.add_with(|_| stack.sockets.tcp.remove(sh.0)).unwrap();
+                sockets.add_with(|_| stack.sockets.tcp.remove(sh.index())).unwrap();
                 sockets
             },
             stack,
