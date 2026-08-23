@@ -318,7 +318,24 @@ impl PendingQueue {
         }
     }
 
-    /// Remove and return all packets waiting for `key`, in FIFO order.
+    /// Whether any packet is waiting for `key`.
+    pub fn has_matching(&self, key: &Key) -> bool {
+        self.packets.iter().any(|packet| packet.key == *key)
+    }
+
+    /// The index and key of the first packet at or after `cursor` that is parked
+    /// on `iface`, or `None` once there is none. This is how a caller walks the
+    /// queue while removing packets from it.
+    pub fn next_on(&self, iface: IfaceHandle, cursor: usize) -> Option<(usize, Key)> {
+        self.packets
+            .iter()
+            .enumerate()
+            .skip(cursor)
+            .find(|(_, packet)| packet.key.0 == iface)
+            .map(|(index, packet)| (index, packet.key))
+    }
+
+    /// Remove and return the first packet waiting for `key` (FIFO order).
     pub fn pop_matching(&mut self, key: &Key) -> Option<PendingPacket> {
         let index = self.packets.iter().position(|packet| packet.key == *key)?;
         Some(self.packets.remove(index))

@@ -756,6 +756,9 @@ mod test {
             self.tx.borrow_mut().push(buf.to_vec());
             Ok(())
         }
+        fn can_transmit(&mut self) -> bool {
+            true
+        }
     }
 
     const OUR_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);

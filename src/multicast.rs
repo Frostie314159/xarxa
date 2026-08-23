@@ -420,7 +420,7 @@ impl IfaceState<'_> {
             ),
             Err(_) => return,
         };
-        inner.transmit_ip_frame(self, dst_addr, dst_addr, buf, ethertype);
+        inner.transmit_ip(self, dst_addr, dst_addr, buf, ethertype);
     }
 
     /// Host duties of the **IGMPv2** protocol.
@@ -711,6 +711,9 @@ mod test {
         fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
             self.tx.borrow_mut().push(buf.to_vec());
             Ok(())
+        }
+        fn can_transmit(&mut self) -> bool {
+            true
         }
     }
 

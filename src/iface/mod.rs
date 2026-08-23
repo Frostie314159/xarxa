@@ -89,6 +89,17 @@ pub trait Interface {
     /// here. It travels with the packet up to the socket that receives it.
     fn receive(&mut self) -> Option<PacketBuf>;
 
+    /// Whether the device can transmit one frame right now.
+    ///
+    /// Devices typically have a transmit packet queue. This returns
+    /// whether this queue has space to take one more frame.
+    ///
+    /// If this returns `true`, the next `transmit()` call must not fail.
+    ///
+    /// In devices where there's no queue so transmit always succeeds, this
+    /// should always return `true`.
+    fn can_transmit(&mut self) -> bool;
+
     /// Queue a frame for transmission, transferring ownership of the buffer to the iface.
     ///
     /// The iface holds the buffer until the hardware is done with it, then drops it.

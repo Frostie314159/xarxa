@@ -124,6 +124,8 @@ pub enum SendError {
     Unaddressable,
     /// The payload does not fit in a packet buffer, or no buffer is available.
     BufferFull,
+    /// The interface the packet would go out of has no room for it right now.
+    DeviceBusy,
 }
 
 impl fmt::Display for SendError {
@@ -132,6 +134,7 @@ impl fmt::Display for SendError {
             SendError::InvalidState => write!(f, "invalid state"),
             SendError::Unaddressable => write!(f, "unaddressable"),
             SendError::BufferFull => write!(f, "buffer full"),
+            SendError::DeviceBusy => write!(f, "device busy"),
         }
     }
 }
@@ -749,6 +752,11 @@ impl UdpSocket<'_, '_> {
             return Err(SendError::Unaddressable);
         }
 
+        // Route the destination first: the source address may come from the
+        // egress interface, and the packet is only built once that interface has
+        // room for it.
+        let route = self.tx.route(&meta.endpoint.addr).ok_or(SendError::Unaddressable)?;
+
         // Pick the source address: explicit in the metadata, else the socket's bound
         // address (only a concrete one is an address, the wildcards are filters),
         // else one chosen from the destination.
@@ -756,7 +764,7 @@ impl UdpSocket<'_, '_> {
             Some(addr) => addr,
             None => self
                 .tx
-                .get_source_address(&meta.endpoint.addr)
+                .get_source_address_routed(&route, &meta.endpoint.addr)
                 .ok_or(SendError::Unaddressable)?,
         };
         if src_addr.version() != meta.endpoint.addr.version() {
@@ -780,6 +788,9 @@ impl UdpSocket<'_, '_> {
         };
         let headroom = LINK_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
 
+        if !self.tx.can_transmit(route.iface) {
+            return Err(SendError::DeviceBusy);
+        }
         let mut buf = PacketBuf::new();
         if max_size > buf.capacity() - headroom {
             return Err(SendError::BufferFull);
@@ -804,7 +815,7 @@ impl UdpSocket<'_, '_> {
         trace!("udp:{}:{}: sending {} octets", local, meta.endpoint, size);
 
         self.tx
-            .transmit_ip(buf, src_addr, meta.endpoint.addr, IpProtocol::Udp, hop_limit);
+            .transmit_ip(&route, buf, src_addr, meta.endpoint.addr, IpProtocol::Udp, hop_limit);
         Ok(())
     }
 }
@@ -973,6 +984,10 @@ mod test {
 
         fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
             Ok(())
+        }
+
+        fn can_transmit(&mut self) -> bool {
+            true
         }
     }
 
@@ -1393,6 +1408,9 @@ mod test {
             fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
                 self.0.borrow_mut().push(buf.meta());
                 Ok(())
+            }
+            fn can_transmit(&mut self) -> bool {
+                true
             }
         }
 

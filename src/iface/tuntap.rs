@@ -208,4 +208,8 @@ impl Interface for TunTapInterface {
             Err(err) => core::panic!("{}", err),
         }
     }
+
+    fn can_transmit(&mut self) -> bool {
+        true
+    }
 }

@@ -99,6 +99,8 @@ pub enum SendError {
     /// Ethernet mode, malformed IP header in IP mode), or does not match the
     /// socket's bind filters.
     Malformed,
+    /// The interface the packet would go out of has no room for it right now.
+    DeviceBusy,
 }
 
 impl fmt::Display for SendError {
@@ -108,6 +110,7 @@ impl fmt::Display for SendError {
             SendError::Unaddressable => write!(f, "unaddressable"),
             SendError::BufferFull => write!(f, "buffer full"),
             SendError::Malformed => write!(f, "malformed"),
+            SendError::DeviceBusy => write!(f, "device busy"),
         }
     }
 }
@@ -452,6 +455,16 @@ impl RawSocket<'_, '_> {
             RawMode::Ip { .. } => LINK_HEADER_LEN,
         };
 
+        // An Ethernet-mode socket knows its interface up front, so it can ask for
+        // room before building. An IP-mode packet names its destination inside,
+        // so it is built first and routed after.
+        #[cfg(feature = "medium-ethernet")]
+        if let RawMode::Ethernet { iface, .. } = mode
+            && !self.tx.can_transmit(iface)
+        {
+            return Err(SendError::DeviceBusy);
+        }
+
         let mut buf = PacketBuf::new();
         if max_size > buf.capacity() - headroom {
             return Err(SendError::BufferFull);
@@ -475,7 +488,7 @@ impl RawSocket<'_, '_> {
                     }
                 }
                 trace!("raw: sending {} octet frame", buf.len());
-                self.tx.transmit_ethernet_frame(iface, buf);
+                self.tx.transmit_ethernet(iface, buf);
                 Ok(())
             }
             RawMode::Ip { version, protocol } => {
@@ -485,10 +498,12 @@ impl RawSocket<'_, '_> {
                 if version.is_some_and(|v| v != dst_addr.version()) || protocol.is_some_and(|p| p != next_header) {
                     return Err(SendError::Malformed);
                 }
-                trace!("raw: sending {} octets to {}", buf.len(), dst_addr);
-                if !self.tx.transmit_raw_ip(buf, dst_addr) {
-                    return Err(SendError::Unaddressable);
+                let route = self.tx.route(&dst_addr).ok_or(SendError::Unaddressable)?;
+                if !self.tx.can_transmit(route.iface) {
+                    return Err(SendError::DeviceBusy);
                 }
+                trace!("raw: sending {} octets to {}", buf.len(), dst_addr);
+                self.tx.transmit_raw_ip(&route, buf, dst_addr);
                 Ok(())
             }
         }
@@ -624,6 +639,9 @@ mod test {
         fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
             self.tx.borrow_mut().push(buf.to_vec());
             Ok(())
+        }
+        fn can_transmit(&mut self) -> bool {
+            true
         }
     }
 
@@ -914,6 +932,9 @@ mod test {
             fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
                 self.0.borrow_mut().push(buf.meta());
                 Ok(())
+            }
+            fn can_transmit(&mut self) -> bool {
+                true
             }
         }
 

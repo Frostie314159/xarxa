@@ -14,7 +14,7 @@ use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
 use crate::icmp_error::{IcmpError, parse_quoted_packet};
 use crate::iface::{IfaceCapabilities, Interface, Medium};
 #[cfg(feature = "medium-ethernet")]
-use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, PendingQueue, ProbeEvent};
+use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, Key as NeighborKey, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
 #[cfg(feature = "raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketState};
@@ -430,10 +430,6 @@ impl StackInner {
 }
 
 /// Borrowed stack context for socket egress.
-///
-/// Sockets hand fully-built L4 packets to [`TxContext::transmit_ip`]. Picking the
-/// egress interface, building the IP header and resolving the neighbor all happen
-/// in here, so socket code doesn't have to care about any of it.
 pub(crate) struct TxContext<'a, 'd> {
     pub(crate) inner: &'a mut StackInner,
     pub(crate) ifaces: &'a mut Slab<IfaceState<'d>, IFACE_COUNT>,
@@ -484,6 +480,25 @@ impl TxContext<'_, '_> {
     pub(crate) fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
         let route = self.route(dst_addr)?;
         self.ifaces.get(route.iface.0).get_source_address(dst_addr)
+    }
+
+    /// A source address for sending to `dst_addr` out of the interface `route`
+    /// names.
+    #[cfg(feature = "udp")]
+    pub(crate) fn get_source_address_routed(&self, route: &EgressRoute, dst_addr: &IpAddress) -> Option<IpAddress> {
+        self.ifaces.get(route.iface.0).get_source_address(dst_addr)
+    }
+
+    /// Whether the interface can take one more frame right now.
+    ///
+    /// Asked before a packet is built, so that a device with no room holds the
+    /// sender back instead of losing the packet.
+    ///
+    /// # Panics
+    /// Panics if the handle is stale (the interface was removed).
+    #[cfg(any(feature = "udp", feature = "tcp", feature = "raw"))]
+    pub(crate) fn can_transmit(&mut self, iface: IfaceHandle) -> bool {
+        self.ifaces.get_mut(iface.0).dev.can_transmit()
     }
 
     /// Make the egress routing decision for a destination: the interface the
@@ -548,26 +563,7 @@ impl TxContext<'_, '_> {
     ///
     /// `src_addr` and `dst_addr` must belong to the same address family, the packet
     /// is dropped otherwise.
-    #[cfg(feature = "udp")]
     pub(crate) fn transmit_ip(
-        &mut self,
-        buf: PacketBuf,
-        src_addr: IpAddress,
-        dst_addr: IpAddress,
-        next_header: IpProtocol,
-        hop_limit: u8,
-    ) {
-        let Some(route) = self.route(&dst_addr) else {
-            debug!("no route to {}, dropping packet", dst_addr);
-            return;
-        };
-        self.transmit_ip_routed(&route, buf, src_addr, dst_addr, next_header, hop_limit);
-    }
-
-    /// [`transmit_ip`](Self::transmit_ip) for a destination the caller already
-    /// routed: transmit on the decided interface, resolving `route.next_hop`
-    /// instead of routing again.
-    pub(crate) fn transmit_ip_routed(
         &mut self,
         route: &EgressRoute,
         mut buf: PacketBuf,
@@ -594,8 +590,7 @@ impl TxContext<'_, '_> {
                 return;
             }
         };
-        self.inner
-            .transmit_ip_frame(iface, dst_addr, route.next_hop, buf, ethertype);
+        self.inner.transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype);
     }
 
     /// Transmit a fully-built Ethernet frame on the given interface, as-is.
@@ -603,22 +598,14 @@ impl TxContext<'_, '_> {
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
     #[cfg(all(feature = "raw", feature = "medium-ethernet"))]
-    pub(crate) fn transmit_ethernet_frame(&mut self, iface: IfaceHandle, buf: PacketBuf) {
+    pub(crate) fn transmit_ethernet(&mut self, iface: IfaceHandle, buf: PacketBuf) {
         let iface = self.ifaces.get_mut(iface.0);
         self.inner.transmit_raw(iface, buf);
     }
 
-    /// Transmit a fully-built IP packet (IP header included, emitted as-is): pick
-    /// the egress interface from the destination address, resolve the neighbor, and
-    /// hand the frame to the device.
-    ///
-    /// Returns `false` if there is no route to the destination.
+    /// Transmit a fully-built IP packet (IP header included, emitted as-is).
     #[cfg(feature = "raw")]
-    pub(crate) fn transmit_raw_ip(&mut self, buf: PacketBuf, dst_addr: IpAddress) -> bool {
-        let Some(route) = self.route(&dst_addr) else {
-            debug!("no route to {}, dropping packet", dst_addr);
-            return false;
-        };
+    pub(crate) fn transmit_raw_ip(&mut self, route: &EgressRoute, buf: PacketBuf, dst_addr: IpAddress) {
         let iface = self.ifaces.get_mut(route.iface.0);
         let ethertype = match dst_addr {
             #[cfg(feature = "ipv4")]
@@ -626,9 +613,7 @@ impl TxContext<'_, '_> {
             #[cfg(feature = "ipv6")]
             IpAddress::Ipv6(_) => EthernetProtocol::Ipv6,
         };
-        self.inner
-            .transmit_ip_frame(iface, dst_addr, route.next_hop, buf, ethertype);
-        true
+        self.inner.transmit_ip(iface, dst_addr, route.next_hop, buf, ethertype);
     }
 }
 
@@ -1122,6 +1107,9 @@ impl<'d> Stack<'d> {
                 self.process(handle, buf);
             }
 
+            #[cfg(feature = "medium-ethernet")]
+            self.inner.flush_resolved_pending(self.ifaces.get_mut(index));
+
             #[cfg(feature = "dhcpv4")]
             self.ifaces.get_mut(index).dhcpv4_dispatch(&mut self.inner);
 
@@ -1151,15 +1139,15 @@ impl<'d> Stack<'d> {
                 ifaces: &mut self.ifaces,
             };
             for (_, socket) in self.sockets.tcp.iter_mut() {
-                crate::tcp::flush(socket, &mut cx);
+                // A socket held back by a full device is not due again until the
+                // device has room, which wakes this task on its own. Only its
+                // connection timeout counts.
+                let socket_deadline = match crate::tcp::flush(socket, &mut cx) {
+                    Ok(()) => socket.poll_at(),
+                    Err(crate::tcp::Blocked) => socket.poll_at_blocked(),
+                };
+                deadline = deadline.min(socket_deadline);
             }
-
-            deadline = self
-                .sockets
-                .tcp
-                .iter()
-                .map(|(_, socket)| socket.poll_at())
-                .fold(deadline, Instant::min);
         }
 
         #[cfg(feature = "medium-ethernet")]
@@ -2165,7 +2153,7 @@ impl<'d> Stack<'d> {
             debug!("no route to {}, dropping reply", dst_addr);
             return;
         };
-        tx.transmit_ip_routed(&route, buf, src_addr, dst_addr, next_header, hop_limit);
+        tx.transmit_ip(&route, buf, src_addr, dst_addr, next_header, hop_limit);
     }
 }
 
@@ -2337,9 +2325,22 @@ impl StackInner {
     ) {
         let key = (iface.handle, addr);
         self.neighbor_cache.fill(key, hardware_addr, self.now);
+        self.flush_pending(iface, &key, hardware_addr);
+    }
 
-        while let Some(packet) = self.pending.pop_matching(&key) {
-            trace!("neighbor: {} resolved, flushing queued packet", addr);
+    /// Transmit the packets parked on `key`, now resolved to `hardware_addr`, in
+    /// FIFO order, for as long as the device has room. The rest stay parked, and
+    /// `flush_resolved_pending` retries them on the next `poll`.
+    #[cfg(feature = "medium-ethernet")]
+    fn flush_pending(&mut self, iface: &mut IfaceState<'_>, key: &NeighborKey, hardware_addr: EthernetAddress) {
+        while self.pending.has_matching(key) {
+            if !iface.dev.can_transmit() {
+                trace!("neighbor: device has no room, {} stays parked", key.1);
+                return;
+            }
+            // NOTE(unwrap): checked by `has_matching` above.
+            let packet = unwrap!(self.pending.pop_matching(key));
+            trace!("neighbor: {} resolved, flushing queued packet", key.1);
             let ethertype = match packet.key.1 {
                 #[cfg(feature = "ipv4")]
                 IpAddress::Ipv4(_) => EthernetProtocol::Ipv4,
@@ -2347,6 +2348,29 @@ impl StackInner {
                 IpAddress::Ipv6(_) => EthernetProtocol::Ipv6,
             };
             self.transmit_ethernet(iface, hardware_addr, packet.buf, ethertype);
+        }
+    }
+
+    /// Retry the packets parked on this interface whose neighbor is resolved:
+    /// they were left parked because the device had no room when the
+    /// resolution came in.
+    #[cfg(feature = "medium-ethernet")]
+    pub(crate) fn flush_resolved_pending(&mut self, iface: &mut IfaceState<'_>) {
+        let mut cursor = 0;
+        while let Some((index, key)) = self.pending.next_on(iface.handle, cursor) {
+            match self.neighbor_cache.lookup(&key, self.now) {
+                NeighborAnswer::Found(hardware_addr) => {
+                    self.flush_pending(iface, &key, hardware_addr);
+                    if self.pending.has_matching(&key) {
+                        // Out of room. Everything else waits too.
+                        return;
+                    }
+                    // Every packet on `key` is gone, so what came after the one
+                    // at `index` is at `index` now.
+                    cursor = index;
+                }
+                _ => cursor = index + 1,
+            }
         }
     }
 
@@ -2466,7 +2490,7 @@ impl StackInner {
         dst_addr: Ipv6Address,
     ) {
         push_ipv6_header(&mut buf, src_addr, dst_addr, IpProtocol::Icmpv6, 0xff);
-        self.transmit_ip_frame(
+        self.transmit_ip(
             iface,
             IpAddress::Ipv6(dst_addr),
             IpAddress::Ipv6(dst_addr),
@@ -2507,10 +2531,10 @@ impl StackInner {
                 .map(|route| route.via_router)
                 .unwrap_or(dst)
         };
-        self.transmit_ip_frame(iface, dst, next_hop, buf, EthernetProtocol::Ipv4);
+        self.transmit_ip(iface, dst, next_hop, buf, EthernetProtocol::Ipv4);
     }
 
-    pub(crate) fn transmit_ip_frame(
+    pub(crate) fn transmit_ip(
         &mut self,
         iface: &mut IfaceState<'_>,
         dst_addr: IpAddress,
@@ -2559,7 +2583,7 @@ impl StackInner {
             crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
         }
         if iface.dev.transmit(buf).is_err() {
-            debug!("iface: cannot transmit, dropping packet");
+            warn!("iface {}: device refused a frame, dropping it", iface.handle.0);
         }
     }
 }
@@ -3064,7 +3088,7 @@ fn ndisc_lladdr_option(
     feature = "tcp"
 ))]
 mod test {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
 
@@ -3099,11 +3123,15 @@ mod test {
     }
 
     /// A mock device: receives injected packets, records transmitted frames.
+    /// `room` limits how many more frames it accepts (`None`: unlimited).
     struct TestDevice {
         medium: Medium,
         rx: Rc<RefCell<VecDeque<Vec<u8>>>>,
         tx: Rc<RefCell<Vec<Vec<u8>>>>,
+        room: Room,
     }
+
+    type Room = Rc<Cell<Option<usize>>>;
 
     impl Interface for TestDevice {
         fn capabilities(&self) -> IfaceCapabilities {
@@ -3119,7 +3147,16 @@ mod test {
             buf.copy_from_slice(&bytes);
             Some(buf)
         }
+        fn can_transmit(&mut self) -> bool {
+            self.room.get().is_none_or(|room| room > 0)
+        }
         fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
+            if !self.can_transmit() {
+                return Err(buf);
+            }
+            if let Some(room) = self.room.get() {
+                self.room.set(Some(room - 1));
+            }
             self.tx.borrow_mut().push(buf.to_vec());
             Ok(())
         }
@@ -3137,8 +3174,15 @@ mod test {
     /// A stack with one interface of the given medium, owning [`OUR_V4`]/24 and
     /// [`OUR_V6`]/64.
     fn test_stack(medium: Medium) -> (Stack<'static>, Queue, Sent) {
+        let (stack, rx, tx, _room) = test_stack_with_room(medium);
+        (stack, rx, tx)
+    }
+
+    /// [`test_stack`], also handing out the device's transmit room control.
+    fn test_stack_with_room(medium: Medium) -> (Stack<'static>, Queue, Sent, Room) {
         let rx = Rc::new(RefCell::new(VecDeque::new()));
         let tx = Rc::new(RefCell::new(Vec::new()));
+        let room = Rc::new(Cell::new(None));
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = stack
             .add_iface_borrowed(
@@ -3146,6 +3190,7 @@ mod test {
                     medium,
                     rx: rx.clone(),
                     tx: tx.clone(),
+                    room: room.clone(),
                 })),
                 match medium {
                     Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
@@ -3161,7 +3206,7 @@ mod test {
         // the tests only see the frames they provoke.
         stack.poll(Instant::ZERO);
         tx.borrow_mut().clear();
-        (stack, rx, tx)
+        (stack, rx, tx, room)
     }
 
     /// OUR_HW 02:00:00:00:00:01 -> fe80::ff:fe00:1 (modified EUI-64 flips the U/L bit back).
@@ -3584,6 +3629,7 @@ mod test {
                         medium: Medium::Ip,
                         rx: rx.clone(),
                         tx: tx.clone(),
+                        room: Rc::new(Cell::new(None)),
                     })),
                     HardwareAddress::Ip,
                 )
@@ -4003,6 +4049,9 @@ mod test {
             fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
                 self.tx_stamps.borrow_mut().pop_front()
             }
+            fn can_transmit(&mut self) -> bool {
+                true
+            }
         }
 
         let rx = Rc::new(RefCell::new(VecDeque::new()));
@@ -4397,13 +4446,10 @@ mod test {
             .unwrap();
     }
 
-    #[test]
-    fn test_iface_addr_change_invalidates_link_state() {
-        let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
-        let iface = IfaceHandle(0);
-        let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
-
-        // Learn the remote's hardware address from an ARP request for us.
+    /// An ARP request for [`OUR_V4`] from `remote_hw`/`remote_ip`, as an Ethernet
+    /// frame. Processing it teaches the stack the sender's mapping.
+    #[cfg(feature = "medium-ethernet")]
+    fn arp_request_from(remote_hw: EthernetAddress, remote_ip: Ipv4Address) -> Vec<u8> {
         let mut request = vec![0; ETHERNET_HEADER_LEN + ARP_BUFFER_LEN];
         {
             let mut eth = EthernetFrame::new_unchecked(&mut request[..]);
@@ -4417,11 +4463,147 @@ mod test {
             arp.set_protocol_len(4);
             arp.set_operation(ArpOperation::Request);
             arp.set_source_hardware_addr(remote_hw.as_bytes());
-            arp.set_source_protocol_addr(&REMOTE_V4.octets());
+            arp.set_source_protocol_addr(&remote_ip.octets());
             arp.set_target_hardware_addr(&[0; 6]);
             arp.set_target_protocol_addr(&OUR_V4.octets());
         }
-        inject(&mut stack, &rx, request);
+        request
+    }
+
+    /// A device with no room holds socket sends back with `DeviceBusy`, and never
+    /// loses a packet: the same send goes through once there is room.
+    #[test]
+    #[cfg(all(feature = "medium-ethernet", feature = "ipv4", feature = "udp", feature = "raw"))]
+    fn test_device_full_holds_sends_back() {
+        let (mut stack, rx, tx, room) = test_stack_with_room(Medium::Ethernet);
+        let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        inject(&mut stack, &rx, arp_request_from(remote_hw, REMOTE_V4));
+        tx.borrow_mut().clear();
+
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
+        let raw = stack.add_raw_socket().unwrap();
+        stack
+            .raw_socket(raw)
+            .bind(RawMode::Ethernet {
+                iface: IfaceHandle(0),
+                ethertype: None,
+            })
+            .unwrap();
+        let raw_ip = stack.add_raw_socket().unwrap();
+        stack
+            .raw_socket(raw_ip)
+            .bind(RawMode::Ip {
+                version: None,
+                protocol: None,
+            })
+            .unwrap();
+        let mut frame = vec![0; ETHERNET_HEADER_LEN + 4];
+        EthernetFrame::new_unchecked(&mut frame[..]).set_ethertype(EthernetProtocol::Ipv4);
+        let packet = ipv4_packet(OUR_V4, REMOTE_V4, IpProtocol::Udp, &[0; 8]);
+
+        room.set(Some(0));
+        assert_eq!(
+            stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)),
+            Err(crate::udp::SendError::DeviceBusy)
+        );
+        assert_eq!(
+            stack.raw_socket(raw).send_slice(&frame),
+            Err(crate::raw::SendError::DeviceBusy)
+        );
+        assert_eq!(
+            stack.raw_socket(raw_ip).send_slice(&packet),
+            Err(crate::raw::SendError::DeviceBusy)
+        );
+        assert!(tx.borrow().is_empty());
+
+        room.set(Some(3));
+        stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
+        stack.raw_socket(raw).send_slice(&frame).unwrap();
+        stack.raw_socket(raw_ip).send_slice(&packet).unwrap();
+        assert_eq!(tx.borrow().len(), 3);
+        assert_eq!(room.get(), Some(0));
+    }
+
+    /// Packets parked on a neighbor resolution stay parked if the device has no
+    /// room when the resolution comes in, and go out on a later poll.
+    #[test]
+    #[cfg(all(feature = "medium-ethernet", feature = "ipv4", feature = "udp"))]
+    fn test_device_full_keeps_packets_parked() {
+        let (mut stack, rx, tx, room) = test_stack_with_room(Medium::Ethernet);
+        let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
+
+        // Two datagrams park on the unresolved neighbor. Only the ARP request
+        // reaches the wire.
+        room.set(Some(2));
+        stack.udp_socket(udp).send_slice(b"one", (REMOTE_V4, 1000)).unwrap();
+        stack.udp_socket(udp).send_slice(b"two", (REMOTE_V4, 1000)).unwrap();
+        assert_eq!(tx.borrow().len(), 1);
+        assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
+
+        // The neighbor resolves while the device is full: nothing is flushed and
+        // nothing is lost. (The ARP reply we owe is best-effort and is dropped.)
+        room.set(Some(0));
+        inject(&mut stack, &rx, arp_request_from(remote_hw, REMOTE_V4));
+        assert_eq!(tx.borrow().len(), 1);
+
+        // Room for one: the first parked datagram goes out, the second waits.
+        room.set(Some(1));
+        stack.poll(Instant::ZERO);
+        assert_eq!(tx.borrow().len(), 2);
+        assert_eq!(ethertype_of(&tx.borrow()[1]), EthernetProtocol::Ipv4);
+        assert!(tx.borrow()[1].ends_with(b"one"));
+
+        room.set(None);
+        stack.poll(Instant::ZERO);
+        assert_eq!(tx.borrow().len(), 3);
+        assert!(tx.borrow()[2].ends_with(b"two"));
+    }
+
+    /// TCP holds a segment back while the device is full, leaving the socket as
+    /// if it had never tried, and does not ask to be polled again for it: the
+    /// device wakes the poll task when it has room.
+    #[test]
+    #[cfg(all(feature = "medium-ethernet", feature = "ipv4", feature = "tcp"))]
+    fn test_device_full_holds_tcp_segment_back() {
+        let (mut stack, rx, tx, room) = test_stack_with_room(Medium::Ethernet);
+        let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        inject(&mut stack, &rx, arp_request_from(remote_hw, REMOTE_V4));
+        tx.borrow_mut().clear();
+
+        let handle = stack
+            .add_tcp_socket_with_bufs(vec![0; 4096].leak(), vec![0; 4096].leak())
+            .unwrap();
+        stack.tcp_socket(handle).connect((REMOTE_V4, 80), 0).unwrap();
+
+        room.set(Some(0));
+        for secs in 0..5 {
+            assert_eq!(stack.poll(Instant::from_secs(secs)), Instant::MAX);
+        }
+        assert!(tx.borrow().is_empty());
+        assert_eq!(stack.tcp_socket(handle).state(), TcpState::SynSent);
+
+        // With room, the SYN goes out once, and the retransmit timer is armed
+        // only now.
+        room.set(Some(1));
+        let deadline = stack.poll(Instant::from_secs(5));
+        assert_eq!(tx.borrow().len(), 1);
+        assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Ipv4);
+        assert!(deadline > Instant::from_secs(5) && deadline < Instant::MAX);
+        assert_eq!(stack.poll(Instant::from_secs(5)), deadline);
+        assert_eq!(tx.borrow().len(), 1);
+    }
+
+    #[test]
+    fn test_iface_addr_change_invalidates_link_state() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
+        let iface = IfaceHandle(0);
+        let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+
+        // Learn the remote's hardware address from an ARP request for us.
+        inject(&mut stack, &rx, arp_request_from(remote_hw, REMOTE_V4));
         assert_eq!(tx.borrow().len(), 1); // the ARP reply
         assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
 

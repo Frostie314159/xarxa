@@ -2149,6 +2149,19 @@ impl<'d> TcpSocketState<'d> {
             self.timer.poll_at().min(timeout_poll_at).min(delayed_ack_poll_at)
         }
     }
+
+    /// [`poll_at`](Self::poll_at) for a socket whose segment was held back
+    /// ([`Blocked`]). Wanting to send is not a reason to poll: the device wakes
+    /// the poll task when it has room, and every timer that fires in the meantime
+    /// would only produce the same held-back segment. The one exception is the
+    /// connection timeout, which must abort the connection even if the device
+    /// never frees up.
+    pub(crate) fn poll_at_blocked(&self) -> Instant {
+        match (self.remote_last_ts, self.timeout) {
+            (Some(remote_last_ts), Some(timeout)) => remote_last_ts + timeout,
+            (_, _) => Instant::MAX,
+        }
+    }
 }
 
 /// Copy a TCP segment out of the socket state into a fresh packet buffer, with
@@ -2192,32 +2205,46 @@ pub(crate) fn process_icmp_error(
     }
 }
 
+/// A segment could not be transmitted right now: the egress device has no room.
+/// The socket is left as if it had never tried, and
+/// [`Stack::poll`](crate::Stack::poll) retries once the device has room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Blocked;
+
 /// Drive the socket's egress until it has nothing more it wants to transmit right
 /// now: data and flag segments, ACKs, window updates, retransmissions, probes.
 /// Called from [`Stack::poll`](crate::Stack::poll), which is the only place TCP
 /// segments are transmitted from.
 ///
 /// Each emitted segment goes down the stack's egress path
-/// ([`TxContext::transmit_ip`]): routing, IP header construction, and neighbor
+/// ([`TxContext::transmit_ip_routed`]): routing, IP header construction, and neighbor
 /// resolution.
-pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) {
+///
+/// Returns [`Blocked`] if it stopped because the egress device has no room. The
+/// socket's state is untouched by the segment it could not send, so nothing is
+/// lost and no retransmission timer has to cover it.
+pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) -> Result<(), Blocked> {
     loop {
         let mut emitted = false;
-        let result: Result<(), core::convert::Infallible> =
-            state.dispatch(cx, |cx, (route, src_addr, dst_addr, hop_limit, repr)| {
-                emitted = true;
-                match route {
-                    Some(route) => {
-                        let buf = build_tcp_packet(&repr, &src_addr, &dst_addr);
-                        cx.transmit_ip_routed(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, hop_limit);
-                    }
-                    None => debug!("no route to {}, dropping packet", dst_addr),
-                }
-                Ok(())
-            });
-        let Ok(()) = result;
+        state.dispatch(cx, |cx, (route, src_addr, dst_addr, hop_limit, repr)| {
+            emitted = true;
+            // No route drops the segment and leaves the socket as if it had been
+            // sent: the retransmit timer owns recovery. A full device instead
+            // holds the segment back, socket untouched.
+            let Some(route) = route else {
+                debug!("no route to {}, dropping packet", dst_addr);
+                return Ok(());
+            };
+            if !cx.can_transmit(route.iface) {
+                trace!("device has no room for segment to {}, holding it back", dst_addr);
+                return Err(Blocked);
+            }
+            let buf = build_tcp_packet(&repr, &src_addr, &dst_addr);
+            cx.transmit_ip(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, hop_limit);
+            Ok(())
+        })?;
         if !emitted {
-            break;
+            return Ok(());
         }
     }
 }
@@ -2934,6 +2961,10 @@ mod test {
 
         fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
             Ok(())
+        }
+
+        fn can_transmit(&mut self) -> bool {
+            true
         }
     }
 
@@ -5376,6 +5407,10 @@ mod test {
 
             fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
                 Ok(())
+            }
+
+            fn can_transmit(&mut self) -> bool {
+                true
             }
         }
 
@@ -9959,6 +9994,10 @@ mod stack_test {
         fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
             self.0.borrow_mut().tx.push_back(buf[..].to_vec());
             Ok(())
+        }
+
+        fn can_transmit(&mut self) -> bool {
+            true
         }
     }
 
