@@ -93,14 +93,16 @@ pub enum SendError {
     InvalidState,
     /// (IP mode) There is no route to the packet's destination.
     Unaddressable,
-    /// The packet does not fit in a packet buffer, or no buffer is available.
+    /// The packet does not fit in a packet buffer.
     BufferFull,
+    /// No packet buffer is free. Wait for one to be freed, then retry.
+    NoBuffer,
+    /// The interface the packet would go out of has no room for it right now.
+    DeviceBusy,
     /// The packet fails basic validation (too short for an Ethernet header in
     /// Ethernet mode, malformed IP header in IP mode), or does not match the
     /// socket's bind filters.
     Malformed,
-    /// The interface the packet would go out of has no room for it right now.
-    DeviceBusy,
 }
 
 impl fmt::Display for SendError {
@@ -109,8 +111,9 @@ impl fmt::Display for SendError {
             SendError::InvalidState => write!(f, "invalid state"),
             SendError::Unaddressable => write!(f, "unaddressable"),
             SendError::BufferFull => write!(f, "buffer full"),
-            SendError::Malformed => write!(f, "malformed"),
+            SendError::NoBuffer => write!(f, "no buffer"),
             SendError::DeviceBusy => write!(f, "device busy"),
+            SendError::Malformed => write!(f, "malformed"),
         }
     }
 }
@@ -179,15 +182,19 @@ impl RawSocketState {
 }
 
 /// Copy a packet into a freshly allocated buffer. Used when both a raw socket and
-/// the stack's own protocol handlers want an ingress packet.
-fn copy_packet(buf: &PacketBuf) -> PacketBuf {
-    let mut copy = PacketBuf::new();
+/// the stack's own protocol handlers want an ingress packet. `None` if the pool
+/// is empty: the socket misses the packet, the stack still processes it.
+fn copy_packet(buf: &PacketBuf) -> Option<PacketBuf> {
+    let Some(mut copy) = PacketBuf::try_new() else {
+        trace!("raw: no packet buffer for a copy, socket misses the packet");
+        return None;
+    };
     copy.set_len(buf.len());
     copy.copy_from_slice(buf);
     // The copy is the same packet: it carries the same metadata (arrival timestamp,
     // driver-assigned id).
     copy.set_meta(buf.meta());
-    copy
+    Some(copy)
 }
 
 /// Parse the destination address and protocol out of an outgoing IP packet,
@@ -423,6 +430,7 @@ impl RawSocket<'_, '_> {
     /// mode), or does not match the socket's bind filters.
     /// Returns `Err(SendError::BufferFull)` if the packet cannot fit in a packet
     /// buffer.
+    /// Returns `Err(SendError::NoBuffer)` if every packet buffer is in use.
     ///
     /// # Panics
     /// Panics if the socket is bound (Ethernet mode) to an interface that has been
@@ -465,7 +473,9 @@ impl RawSocket<'_, '_> {
             return Err(SendError::DeviceBusy);
         }
 
-        let mut buf = PacketBuf::new();
+        let Some(mut buf) = PacketBuf::try_new() else {
+            return Err(SendError::NoBuffer);
+        };
         if max_size > buf.capacity() - headroom {
             return Err(SendError::BufferFull);
         }
@@ -545,7 +555,9 @@ impl Stack<'_> {
 
             trace!("raw: receiving {} octet frame (ethertype {})", buf.len(), ethertype);
             if stack_wants {
-                socket.rx_enqueue(copy_packet(&buf));
+                if let Some(copy) = copy_packet(&buf) {
+                    socket.rx_enqueue(copy);
+                }
                 return Some(buf);
             } else {
                 socket.rx_enqueue(buf);
@@ -590,7 +602,9 @@ impl Stack<'_> {
 
             trace!("raw: receiving {} octets ({} {})", buf.len(), version, protocol);
             if stack_wants {
-                socket.rx_enqueue(copy_packet(&buf));
+                if let Some(copy) = copy_packet(&buf) {
+                    socket.rx_enqueue(copy);
+                }
                 return Some((buf, true));
             } else {
                 socket.rx_enqueue(buf);
@@ -713,7 +727,7 @@ mod test {
     }
 
     fn buf_from(bytes: &[u8]) -> PacketBuf {
-        let mut buf = PacketBuf::new();
+        let mut buf = PacketBuf::try_new().unwrap();
         buf.set_len(bytes.len());
         buf.copy_from_slice(bytes);
         buf

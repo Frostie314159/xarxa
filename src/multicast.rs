@@ -505,7 +505,7 @@ impl IfaceState<'_> {
     #[cfg(feature = "ipv4")]
     fn igmp_report_packet(&self, version: IgmpVersion, group_addr: Ipv4Address) -> Option<PacketBuf> {
         let iface_addr = self.ipv4_addr()?;
-        let mut pkt = PacketBuf::new();
+        let mut pkt = PacketBuf::try_new()?;
         pkt.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
@@ -526,20 +526,19 @@ impl IfaceState<'_> {
 
     #[cfg(feature = "ipv4")]
     fn igmp_leave_packet(&self, group_addr: Ipv4Address) -> Option<PacketBuf> {
-        self.ipv4_addr().map(|iface_addr| {
-            let mut pkt = PacketBuf::new();
-            pkt.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
-            pkt.set_len(IGMP_BUFFER_LEN);
-            {
-                let mut igmp_packet = IgmpPacket::new_unchecked(&mut pkt);
-                igmp_packet.set_msg_type(IgmpMessage::LeaveGroup);
-                igmp_packet.set_max_resp_code(0);
-                igmp_packet.set_group_address(group_addr);
-                igmp_packet.fill_checksum();
-            }
-            crate::stack::push_ipv4_header(&mut pkt, iface_addr, IPV4_MULTICAST_ALL_ROUTERS, IpProtocol::Igmp, 1);
-            pkt
-        })
+        let iface_addr = self.ipv4_addr()?;
+        let mut pkt = PacketBuf::try_new()?;
+        pkt.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
+        pkt.set_len(IGMP_BUFFER_LEN);
+        {
+            let mut igmp_packet = IgmpPacket::new_unchecked(&mut pkt);
+            igmp_packet.set_msg_type(IgmpMessage::LeaveGroup);
+            igmp_packet.set_max_resp_code(0);
+            igmp_packet.set_group_address(group_addr);
+            igmp_packet.fill_checksum();
+        }
+        crate::stack::push_ipv4_header(&mut pkt, iface_addr, IPV4_MULTICAST_ALL_ROUTERS, IpProtocol::Igmp, 1);
+        Some(pkt)
     }
 
     /// Host duties of the **MLDv2** protocol.
@@ -607,7 +606,7 @@ impl IfaceState<'_> {
         let dst_addr = IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS;
 
         // MLD report: the report header (8 bytes) plus one record per group.
-        let mut pkt = PacketBuf::new();
+        let mut pkt = PacketBuf::try_new()?;
         pkt.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
         let max_records = (pkt.tailroom() - 8) / MLD_ADDRESS_RECORD_LEN;
         let record_count = records.clone().count();
@@ -703,7 +702,7 @@ mod test {
         }
         fn receive(&mut self) -> Option<PacketBuf> {
             let bytes = self.rx.borrow_mut().pop_front()?;
-            let mut buf = PacketBuf::new();
+            let mut buf = PacketBuf::try_new().unwrap();
             buf.set_len(bytes.len());
             buf.copy_from_slice(&bytes);
             Some(buf)

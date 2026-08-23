@@ -2165,20 +2165,21 @@ impl<'d> TcpSocketState<'d> {
 }
 
 /// Copy a TCP segment out of the socket state into a fresh packet buffer, with
-/// headroom reserved for the IP and Ethernet headers below it.
-pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_addr: &IpAddress) -> PacketBuf {
+/// headroom reserved for the IP and Ethernet headers below it. `None` if the
+/// pool is empty.
+pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_addr: &IpAddress) -> Option<PacketBuf> {
     let ip_header_len = match dst_addr {
         #[cfg(feature = "ipv4")]
         IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
         #[cfg(feature = "ipv6")]
         IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
     };
-    let mut buf = PacketBuf::new();
+    let mut buf = PacketBuf::try_new()?;
     buf.reserve(LINK_HEADER_LEN + ip_header_len);
     buf.set_len(repr.buffer_len());
     let mut packet = TcpPacket::new_unchecked(&mut buf);
     repr.emit(&mut packet, src_addr, dst_addr);
-    buf
+    Some(buf)
 }
 
 /// Deliver an ICMP error to the TCP connection whose segment provoked it: exact
@@ -2205,9 +2206,9 @@ pub(crate) fn process_icmp_error(
     }
 }
 
-/// A segment could not be transmitted right now: the egress device has no room.
-/// The socket is left as if it had never tried, and
-/// [`Stack::poll`](crate::Stack::poll) retries once the device has room.
+/// A segment could not be transmitted right now: the egress device has no room,
+/// or the packet pool is empty. The socket is left as if it had never tried, and
+/// [`Stack::poll`](crate::Stack::poll) retries once the device frees a buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Blocked;
 
@@ -2217,20 +2218,20 @@ pub(crate) struct Blocked;
 /// segments are transmitted from.
 ///
 /// Each emitted segment goes down the stack's egress path
-/// ([`TxContext::transmit_ip_routed`]): routing, IP header construction, and neighbor
+/// ([`TxContext::transmit_ip`]): routing, IP header construction, and neighbor
 /// resolution.
 ///
-/// Returns [`Blocked`] if it stopped because the egress device has no room. The
-/// socket's state is untouched by the segment it could not send, so nothing is
-/// lost and no retransmission timer has to cover it.
+/// Returns [`Blocked`] if it stopped because the egress device has no room (or
+/// the pool is empty). The socket's state is untouched by the segment it could
+/// not send, so nothing is lost and no retransmission timer has to cover it.
 pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) -> Result<(), Blocked> {
     loop {
         let mut emitted = false;
         state.dispatch(cx, |cx, (route, src_addr, dst_addr, hop_limit, repr)| {
             emitted = true;
             // No route drops the segment and leaves the socket as if it had been
-            // sent: the retransmit timer owns recovery. A full device instead
-            // holds the segment back, socket untouched.
+            // sent: the retransmit timer owns recovery. A full device or an empty
+            // pool instead holds the segment back, socket untouched.
             let Some(route) = route else {
                 debug!("no route to {}, dropping packet", dst_addr);
                 return Ok(());
@@ -2239,7 +2240,10 @@ pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) 
                 trace!("device has no room for segment to {}, holding it back", dst_addr);
                 return Err(Blocked);
             }
-            let buf = build_tcp_packet(&repr, &src_addr, &dst_addr);
+            let Some(buf) = build_tcp_packet(&repr, &src_addr, &dst_addr) else {
+                trace!("no packet buffer for segment to {}, holding it back", dst_addr);
+                return Err(Blocked);
+            };
             cx.transmit_ip(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, hop_limit);
             Ok(())
         })?;
@@ -10020,18 +10024,8 @@ mod stack_test {
     /// Build a full IPv4+TCP packet from the remote to the local endpoint,
     /// checksums filled, ready for injection into the device RX queue.
     fn tcp_packet(repr: &TcpRepr) -> PacketBuf {
-        let mut buf = build_tcp_packet(repr, &REMOTE_ADDR.into(), &LOCAL_ADDR.into());
-        let total_len = IPV4_HEADER_LEN + buf.len();
-        buf.push_front(IPV4_HEADER_LEN);
-        let mut ip = Ipv4Packet::new_unchecked(&mut buf);
-        ip.set_version(4);
-        ip.set_header_len(IPV4_HEADER_LEN as u8);
-        ip.set_total_len(total_len as u16);
-        ip.set_hop_limit(64);
-        ip.set_next_header(IpProtocol::Tcp);
-        ip.set_src_addr(REMOTE_ADDR);
-        ip.set_dst_addr(LOCAL_ADDR);
-        ip.fill_checksum();
+        let mut buf = build_tcp_packet(repr, &REMOTE_ADDR.into(), &LOCAL_ADDR.into()).unwrap();
+        crate::stack::push_ipv4_header(&mut buf, REMOTE_ADDR, LOCAL_ADDR, IpProtocol::Tcp, 64);
         buf
     }
 

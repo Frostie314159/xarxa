@@ -8,7 +8,7 @@
 
 _xarxa_ is a standalone network stack designed for embedded, real-time systems.
 
-It is `no_std` compatible. It currently requires `alloc` but it will be made optional soon.
+It can work without `std` and without `alloc`.
 
 The design goals are the following, in order of decreasing priority:
 
