@@ -471,6 +471,7 @@ dependencies = [
  "heapless",
  "libc",
  "log",
+ "portable-atomic",
  "rand",
 ]
 

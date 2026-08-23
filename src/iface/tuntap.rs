@@ -186,7 +186,7 @@ impl Interface for TunTapInterface {
     }
 
     fn receive(&mut self) -> Option<PacketBuf> {
-        let mut buf = PacketBuf::new();
+        let mut buf = PacketBuf::try_new()?;
         buf.set_len(buf.capacity());
         match self.recv(&mut buf[..]) {
             Ok(size) => {

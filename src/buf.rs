@@ -1,8 +1,17 @@
 //! Owned packet buffers.
+//!
+//! Every packet in the stack is a [`PacketBuf`]: one fixed-size buffer, owned by
+//! whoever holds it (the driver, the stack, a socket, the application).
+//!
+//! Buffers are allocated from a static pool.
 
-use alloc::boxed::Box;
+use core::cell::UnsafeCell;
 use core::fmt;
+use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
+use core::ptr::NonNull;
+
+use portable_atomic::{AtomicU32, Ordering};
 
 use crate::meta::PacketMeta;
 
@@ -11,6 +20,20 @@ use crate::meta::PacketMeta;
 /// Currently hardcoded to 1514 (max size of an Ethernet frame without FCS)
 /// rounded up to nearest 4 multiple.
 pub const PACKET_BUF_SIZE: usize = 1516;
+
+/// Number of buffers in the pool.
+#[cfg(not(test))]
+const PACKET_BUF_COUNT: usize = crate::config::PACKET_BUF_COUNT;
+// The unit tests run in parallel threads of one process, all sharing the one
+// pool. The default is too small.
+#[cfg(test)]
+const PACKET_BUF_COUNT: usize = if crate::config::PACKET_BUF_COUNT > 1024 {
+    crate::config::PACKET_BUF_COUNT
+} else {
+    1024
+};
+
+const BITMAP_WORDS: usize = PACKET_BUF_COUNT.div_ceil(32);
 
 // Align is needed by some DMA engines.
 // TODO: find a more generic way to do this. Maybe let the user set a custom packet pool impl.
@@ -26,29 +49,105 @@ struct PacketBufInner {
     data: [u8; PACKET_BUF_SIZE],
 }
 
+struct Pool {
+    /// Bit `i` is set while slot `i` is owned by a `PacketBuf`.
+    used: [AtomicU32; BITMAP_WORDS],
+    slots: [UnsafeCell<MaybeUninit<PacketBufInner>>; PACKET_BUF_COUNT],
+}
+
+// SAFETY: a slot is handed to at most one `PacketBuf` at a time. Its bit is
+// set by the one CAS that wins it in `alloc_slot`, and cleared only by the
+// `PacketBuf` that owns it, in `Drop`. So no two threads ever touch the same
+// slot, and the bitmap is atomic.
+unsafe impl Sync for Pool {}
+
+static POOL: Pool = Pool {
+    used: [const { AtomicU32::new(0) }; BITMAP_WORDS],
+    slots: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; PACKET_BUF_COUNT],
+};
+
+/// Claim a free slot: the first zero bit of the bitmap, set with a CAS.
+fn alloc_slot() -> Option<usize> {
+    for (w, word) in POOL.used.iter().enumerate() {
+        let mut cur = word.load(Ordering::Relaxed);
+        loop {
+            let bit = cur.trailing_ones() as usize;
+            if bit >= 32 {
+                break;
+            }
+            let index = w * 32 + bit;
+            if index >= PACKET_BUF_COUNT {
+                // Only the last word can have bits past the end. Everything
+                // before it was full, so the pool is.
+                return None;
+            }
+            // Acquire pairs with the Release in `Drop`: the previous owner's
+            // writes to the slot are done before ours start.
+            match word.compare_exchange_weak(cur, cur | (1 << bit), Ordering::Acquire, Ordering::Relaxed) {
+                Ok(_) => return Some(index),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+    None
+}
+
+/// Give a slot back: clear its bit.
+fn free_slot(index: usize) {
+    POOL.used[index / 32].fetch_and(!(1 << (index % 32)), Ordering::Release);
+}
+
 /// An owned network packet buffer.
 ///
 /// ```text
 /// | headroom | data (len) | tailroom |
 /// ```
-///
-/// Currently allocated with `Box`; this will move to a static pool for no-std/no-alloc
-/// targets later.
 pub struct PacketBuf {
-    inner: Box<PacketBufInner>,
+    inner: NonNull<PacketBufInner>,
 }
 
+// SAFETY: a `PacketBuf` is the unique owner of its slot, like a `Box` of it.
+unsafe impl Send for PacketBuf {}
+unsafe impl Sync for PacketBuf {}
+
 impl PacketBuf {
-    /// Allocate a new, empty packet buffer with zero headroom and default metadata.
-    pub fn new() -> Self {
-        Self {
-            inner: Box::new(PacketBufInner {
-                headroom: 0,
-                len: 0,
-                meta: PacketMeta::default(),
-                data: [0; PACKET_BUF_SIZE],
-            }),
+    /// Allocate a buffer.
+    ///
+    /// - Zero headroom, len.
+    /// - Default metadata.
+    /// - **Uninitialized** data.
+    pub fn try_new() -> Option<Self> {
+        let index = alloc_slot()?;
+        let ptr = POOL.slots[index].get().cast::<PacketBufInner>();
+        // SAFETY:
+        // - the slot is ours (its bit is set), and nothing else points into it.
+        // - `data` is valid thanks to `MaybeUninit::zeroed()`, we don't have to initialize it.
+        // - We do initialize the header.
+        unsafe {
+            (&raw mut (*ptr).headroom).write(0);
+            (&raw mut (*ptr).len).write(0);
+            (&raw mut (*ptr).meta).write(PacketMeta::default());
+            // Catch code that relies on fresh buffers being zeroed.
+            #[cfg(test)]
+            (*ptr).data.fill(0xa5);
         }
+        Some(Self {
+            // SAFETY: a pointer into a static is never null.
+            inner: unsafe { NonNull::new_unchecked(ptr) },
+        })
+    }
+
+    #[inline]
+    fn inner(&self) -> &PacketBufInner {
+        // SAFETY: we own the slot for as long as `self` exists.
+        unsafe { self.inner.as_ref() }
+    }
+
+    #[inline]
+    fn inner_mut(&mut self) -> &mut PacketBufInner {
+        // SAFETY: we own the slot for as long as `self` exists, and `&mut self`
+        // makes this the only reference.
+        unsafe { self.inner.as_mut() }
     }
 
     /// The packet's metadata.
@@ -58,17 +157,17 @@ impl PacketBuf {
     /// [`Interface::transmit`](crate::iface::Interface::transmit). It travels with the
     /// buffer through the whole stack, unaffected by header pushes and pulls.
     pub fn meta(&self) -> PacketMeta {
-        self.inner.meta
+        self.inner().meta
     }
 
     /// Mutable reference to the packet's metadata.
     pub fn meta_mut(&mut self) -> &mut PacketMeta {
-        &mut self.inner.meta
+        &mut self.inner_mut().meta
     }
 
     /// Replace the packet's metadata.
     pub fn set_meta(&mut self, meta: PacketMeta) {
-        self.inner.meta = meta;
+        self.inner_mut().meta = meta;
     }
 
     /// Total storage capacity of the buffer, in bytes.
@@ -78,17 +177,17 @@ impl PacketBuf {
 
     /// Amount of free space in front of the payload.
     pub fn headroom(&self) -> usize {
-        self.inner.headroom as usize
+        self.inner().headroom as usize
     }
 
     /// Length of the payload.
     pub fn len(&self) -> usize {
-        self.inner.len as usize
+        self.inner().len as usize
     }
 
     /// Whether the payload is empty.
     pub fn is_empty(&self) -> bool {
-        self.inner.len == 0
+        self.inner().len == 0
     }
 
     /// Amount of free space behind the payload.
@@ -101,9 +200,9 @@ impl PacketBuf {
     /// # Panics
     /// Panics if the buffer is not empty, or if `headroom > capacity`.
     pub fn reserve(&mut self, headroom: usize) {
-        assert!(self.inner.len == 0);
+        assert!(self.inner().len == 0);
         assert!(headroom <= PACKET_BUF_SIZE);
-        self.inner.headroom = headroom as u16;
+        self.inner_mut().headroom = headroom as u16;
     }
 
     /// Grow the payload at the front by `n` bytes, taking them from the headroom.
@@ -112,8 +211,9 @@ impl PacketBuf {
     /// Panics if `n > headroom`.
     pub fn push_front(&mut self, n: usize) {
         assert!(n <= self.headroom());
-        self.inner.headroom -= n as u16;
-        self.inner.len += n as u16;
+        let inner = self.inner_mut();
+        inner.headroom -= n as u16;
+        inner.len += n as u16;
     }
 
     /// Shrink the payload at the front by `n` bytes, returning them to the headroom.
@@ -122,8 +222,9 @@ impl PacketBuf {
     /// Panics if `n > len`.
     pub fn pull_front(&mut self, n: usize) {
         assert!(n <= self.len());
-        self.inner.headroom += n as u16;
-        self.inner.len -= n as u16;
+        let inner = self.inner_mut();
+        inner.headroom += n as u16;
+        inner.len -= n as u16;
     }
 
     /// Set the payload length, growing or shrinking it at the back.
@@ -132,36 +233,41 @@ impl PacketBuf {
     /// Panics if `headroom + len > capacity`.
     pub fn set_len(&mut self, len: usize) {
         assert!(self.headroom() + len <= PACKET_BUF_SIZE);
-        self.inner.len = len as u16;
+        self.inner_mut().len = len as u16;
     }
 
     /// The whole underlying storage, ignoring headroom and length.
     ///
     /// The returned slice is guaranteed to be 4-byte aligned.
     pub fn storage_mut(&mut self) -> &mut [u8] {
-        &mut self.inner.data
+        &mut self.inner_mut().data
     }
 }
 
-impl Default for PacketBuf {
-    fn default() -> Self {
-        Self::new()
+impl Drop for PacketBuf {
+    fn drop(&mut self) {
+        let base = POOL.slots.as_ptr() as usize;
+        let index =
+            (self.inner.as_ptr() as usize - base) / core::mem::size_of::<UnsafeCell<MaybeUninit<PacketBufInner>>>();
+        free_slot(index);
     }
 }
 
 impl Deref for PacketBuf {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
-        let start = self.inner.headroom as usize;
-        let end = start + self.inner.len as usize;
-        &self.inner.data[start..end]
+        let inner = self.inner();
+        let start = inner.headroom as usize;
+        let end = start + inner.len as usize;
+        &inner.data[start..end]
     }
 }
 impl DerefMut for PacketBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let start = self.inner.headroom as usize;
-        let end = start + self.inner.len as usize;
-        &mut self.inner.data[start..end]
+        let inner = self.inner_mut();
+        let start = inner.headroom as usize;
+        let end = start + inner.len as usize;
+        &mut inner.data[start..end]
     }
 }
 
@@ -187,7 +293,7 @@ mod tests {
 
     #[test]
     fn push_pull() {
-        let mut buf = PacketBuf::new();
+        let mut buf = PacketBuf::try_new().unwrap();
         assert_eq!(buf.len(), 0);
         assert_eq!(buf.headroom(), 0);
         assert_eq!(buf.tailroom(), PACKET_BUF_SIZE);
@@ -213,7 +319,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn push_beyond_headroom() {
-        let mut buf = PacketBuf::new();
+        let mut buf = PacketBuf::try_new().unwrap();
         buf.push_front(1);
     }
 
@@ -221,10 +327,27 @@ mod tests {
     /// long, whatever the metadata in front of it does to the layout.
     #[test]
     fn storage_is_dma_shaped() {
-        let mut buf = PacketBuf::new();
+        let mut buf = PacketBuf::try_new().unwrap();
         assert_eq!(buf.storage_mut().as_ptr() as usize % 4, 0);
         assert_eq!(buf.storage_mut().len() % 4, 0);
         assert!(buf.storage_mut().len() >= PACKET_BUF_SIZE);
+    }
+
+    /// A fresh buffer starts out empty with default metadata, whatever its previous
+    /// owner left behind. (Pool exhaustion and reuse are covered by the
+    /// `packet_pool` integration test, which has a process's pool to itself.)
+    #[test]
+    fn fresh_buffer_is_reset() {
+        let mut buf = PacketBuf::try_new().unwrap();
+        buf.reserve(100);
+        buf.set_len(200);
+        buf.fill(0xff);
+        drop(buf);
+
+        let buf = PacketBuf::try_new().unwrap();
+        assert_eq!(buf.len(), 0);
+        assert_eq!(buf.headroom(), 0);
+        assert_eq!(buf.meta(), PacketMeta::default());
     }
 
     /// Metadata rides along with the buffer, untouched by the header pushes and pulls
@@ -232,7 +355,7 @@ mod tests {
     #[cfg(feature = "packetmeta-id")]
     #[test]
     fn meta_travels_with_the_buffer() {
-        let mut buf = PacketBuf::new();
+        let mut buf = PacketBuf::try_new().unwrap();
         assert_eq!(buf.meta(), PacketMeta::default());
 
         buf.meta_mut().id = 0xdead_beef;

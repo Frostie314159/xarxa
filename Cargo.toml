@@ -30,8 +30,11 @@ default = [
     "packetmeta-timestamp",
 ]
 
-## Use the heap for the stack's tables and socket slabs. Without it they are
-## bounded by the size knobs below.
+## Use the heap. Used for:
+## - Address, route tables.
+## - Socket slabs
+## - Owned interfaces
+## - Owned TCP socket buffers
 alloc = []
 ## Enable functionality that requires the Rust standard library: the
 ## `TunTapInterface` device, `iface::wait`, and `Instant::now()`.
@@ -358,6 +361,7 @@ document-features = "0.2.11"
 bitflags = { version = "2", default-features = false }
 byteorder = { version = "1", default-features = false }
 heapless = { version = "0.9", default-features = false }
+portable-atomic = { version = "1", default-features = false }
 libc = { version = "0.2", optional = true }
 defmt = { version = "1", optional = true, features = ["ip_in_core"] }
 log = { version = "0.4", optional = true }
@@ -365,6 +369,10 @@ log = { version = "0.4", optional = true }
 [dev-dependencies]
 env_logger = "0.11"
 rand = "0.8"
+
+[[test]]
+name = "packet_pool"
+required-features = ["std", "udp", "medium-ip", "ipv4"]
 
 [[example]]
 name = "tuntap"

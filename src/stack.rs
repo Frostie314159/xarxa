@@ -441,7 +441,7 @@ pub(crate) struct TxContext<'a, 'd> {
 ///
 /// Made once per packet: callers that need routing information before building
 /// the packet (TCP sizes segments by the egress MTU) route first and then
-/// transmit via [`TxContext::transmit_ip_routed`], so the packet is never routed
+/// transmit via [`TxContext::transmit_ip`], so the packet is never routed
 /// twice.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy)]
@@ -1139,9 +1139,8 @@ impl<'d> Stack<'d> {
                 ifaces: &mut self.ifaces,
             };
             for (_, socket) in self.sockets.tcp.iter_mut() {
-                // A socket held back by a full device is not due again until the
-                // device has room, which wakes this task on its own. Only its
-                // connection timeout counts.
+                // If egress failed due to device busy or full packet pool,
+                // avoid endless poll loops.
                 let socket_deadline = match crate::tcp::flush(socket, &mut cx) {
                     Ok(()) => socket.poll_at(),
                     Err(crate::tcp::Blocked) => socket.poll_at_blocked(),
@@ -1594,7 +1593,7 @@ impl<'d> Stack<'d> {
                 matched = true;
                 reply_buf = socket
                     .process(self.inner.now, &src_addr, &dst_addr, &tcp_repr)
-                    .map(|reply| crate::tcp::build_tcp_packet(&reply, &dst_addr, &src_addr));
+                    .and_then(|reply| crate::tcp::build_tcp_packet(&reply, &dst_addr, &src_addr));
                 break;
             }
         }
@@ -1619,8 +1618,9 @@ impl<'d> Stack<'d> {
         // Never reply to a TCP RST packet with another TCP RST packet.
         if tcp_repr.control != TcpControl::Rst {
             let reply = TcpSocketState::rst_reply(&tcp_repr);
-            let reply = crate::tcp::build_tcp_packet(&reply, &dst_addr, &src_addr);
-            self.transmit_reply(iface, reply, dst_addr, src_addr, IpProtocol::Tcp, 64);
+            if let Some(reply) = crate::tcp::build_tcp_packet(&reply, &dst_addr, &src_addr) {
+                self.transmit_reply(iface, reply, dst_addr, src_addr, IpProtocol::Tcp, 64);
+            }
         }
     }
 
@@ -1661,7 +1661,10 @@ impl<'d> Stack<'d> {
                     }
                 };
 
-                let mut reply = PacketBuf::new();
+                let Some(mut reply) = PacketBuf::try_new() else {
+                    trace!("icmpv4: no packet buffer for echo reply");
+                    return;
+                };
                 reply.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
                 reply.set_len(icmp_packet.header_len() + icmp_packet.data().len());
                 {
@@ -1880,7 +1883,10 @@ impl<'d> Stack<'d> {
                     self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
                 };
 
-                let mut reply = PacketBuf::new();
+                let Some(mut reply) = PacketBuf::try_new() else {
+                    trace!("icmpv6: no packet buffer for echo reply");
+                    return;
+                };
                 reply.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
                 reply.set_len(icmp_packet.header_len() + icmp_packet.payload().len());
                 {
@@ -2017,11 +2023,13 @@ impl<'d> Stack<'d> {
                         None => return,
                     }
                 };
-                let mut reply = build_icmpv4_error(
+                let Some(mut reply) = build_icmpv4_error(
                     &orig,
                     Icmpv4Message::DstUnreachable,
                     Icmpv4DstUnreachable::HostUnreachable.into(),
-                );
+                ) else {
+                    return;
+                };
                 push_ipv4_header(&mut reply, reply_src, src_addr, IpProtocol::Icmp, 64);
                 self.process_ipv4(iface, None, reply);
             }
@@ -2043,14 +2051,16 @@ impl<'d> Stack<'d> {
                     return;
                 }
                 let reply_src = self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr);
-                let mut reply = build_icmpv6_error(
+                let Some(mut reply) = build_icmpv6_error(
                     &orig,
                     &reply_src,
                     &src_addr,
                     Icmpv6Message::DstUnreachable,
                     Icmpv6DstUnreachable::AddrUnreachable.into(),
                     0,
-                );
+                ) else {
+                    return;
+                };
                 push_ipv6_header(&mut reply, reply_src, src_addr, IpProtocol::Icmpv6, 64);
                 self.process_ipv6(iface, None, reply);
             }
@@ -2082,7 +2092,9 @@ impl<'d> Stack<'d> {
                 return;
             }
         }
-        let reply = build_icmpv4_error(orig, msg_type, msg_code);
+        let Some(reply) = build_icmpv4_error(orig, msg_type, msg_code) else {
+            return;
+        };
         self.transmit_reply(
             iface,
             reply,
@@ -2124,7 +2136,9 @@ impl<'d> Stack<'d> {
         } else {
             self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
         };
-        let reply = build_icmpv6_error(orig, &reply_src, &src_addr, msg_type, msg_code, pointer);
+        let Some(reply) = build_icmpv6_error(orig, &reply_src, &src_addr, msg_type, msg_code, pointer) else {
+            return;
+        };
         self.transmit_reply(
             iface,
             reply,
@@ -2209,7 +2223,10 @@ impl StackInner {
         self.fill_neighbor(iface, IpAddress::Ipv4(source_protocol_addr), source_hardware_addr);
 
         if operation == ArpOperation::Request {
-            let mut reply = PacketBuf::new();
+            let Some(mut reply) = PacketBuf::try_new() else {
+                trace!("arp: no packet buffer for reply");
+                return;
+            };
             reply.reserve(ETHERNET_HEADER_LEN);
             reply.set_len(ARP_BUFFER_LEN);
             {
@@ -2254,7 +2271,10 @@ impl StackInner {
         if iface.has_solicited_node(dst_addr) && iface.has_ip_addr(target_addr) {
             // Neighbor advert: NA header (24 bytes) plus the target link-layer
             // address option (8 bytes).
-            let mut reply = PacketBuf::new();
+            let Some(mut reply) = PacketBuf::try_new() else {
+                trace!("ndisc: no packet buffer for neighbor advert");
+                return;
+            };
             reply.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
             reply.set_len(24 + 8);
             {
@@ -2432,7 +2452,11 @@ impl StackInner {
             return;
         };
 
-        let mut buf = PacketBuf::new();
+        let Some(mut buf) = PacketBuf::try_new() else {
+            // The retransmission timer sends the next one.
+            trace!("arp: no packet buffer for request");
+            return;
+        };
         buf.reserve(ETHERNET_HEADER_LEN);
         buf.set_len(ARP_BUFFER_LEN);
         {
@@ -2457,7 +2481,11 @@ impl StackInner {
 
         // Neighbor solicit: NS header (24 bytes) plus the source link-layer
         // address option (8 bytes).
-        let mut buf = PacketBuf::new();
+        let Some(mut buf) = PacketBuf::try_new() else {
+            // The retransmission timer sends the next one.
+            trace!("ndisc: no packet buffer for neighbor solicit");
+            return;
+        };
         buf.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
         buf.set_len(24 + 8);
         {
@@ -2659,9 +2687,9 @@ const ICMP_ERROR_HEADER_LEN: usize = 8;
 /// Build an ICMPv4 error message, quoting as much of `orig` (a whole IP packet)
 /// as fits within the minimum MTU (RFC 1812 §4.3.2.3).
 #[cfg(feature = "ipv4")]
-fn build_icmpv4_error(orig: &[u8], msg_type: Icmpv4Message, msg_code: u8) -> PacketBuf {
+fn build_icmpv4_error(orig: &[u8], msg_type: Icmpv4Message, msg_code: u8) -> Option<PacketBuf> {
     let quote_len = orig.len().min(IPV4_MIN_MTU - IPV4_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
-    let mut reply = PacketBuf::new();
+    let mut reply = PacketBuf::try_new()?;
     reply.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
     reply.set_len(ICMP_ERROR_HEADER_LEN + quote_len);
     {
@@ -2672,7 +2700,7 @@ fn build_icmpv4_error(orig: &[u8], msg_type: Icmpv4Message, msg_code: u8) -> Pac
         icmp.data_mut().copy_from_slice(&orig[..quote_len]);
         icmp.fill_checksum();
     }
-    reply
+    Some(reply)
 }
 
 /// Build an ICMPv6 error message, quoting as much of `orig` (a whole IP packet)
@@ -2687,9 +2715,9 @@ fn build_icmpv6_error(
     msg_type: Icmpv6Message,
     msg_code: u8,
     pointer: u32,
-) -> PacketBuf {
+) -> Option<PacketBuf> {
     let quote_len = orig.len().min(IPV6_MIN_MTU - IPV6_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
-    let mut reply = PacketBuf::new();
+    let mut reply = PacketBuf::try_new()?;
     reply.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
     reply.set_len(ICMP_ERROR_HEADER_LEN + quote_len);
     {
@@ -2704,7 +2732,7 @@ fn build_icmpv6_error(
         icmp.payload_mut().copy_from_slice(&orig[..quote_len]);
         icmp.fill_checksum(src_addr, dst_addr);
     }
-    reply
+    Some(reply)
 }
 
 /// The outcome of processing a hop-by-hop options header.
@@ -3144,7 +3172,7 @@ mod test {
         }
         fn receive(&mut self) -> Option<PacketBuf> {
             let bytes = self.rx.borrow_mut().pop_front()?;
-            let mut buf = PacketBuf::new();
+            let mut buf = PacketBuf::try_new().unwrap();
             buf.set_len(bytes.len());
             buf.copy_from_slice(&bytes);
             Some(buf)
@@ -4030,7 +4058,7 @@ mod test {
             }
             fn receive(&mut self) -> Option<PacketBuf> {
                 let bytes = self.rx.borrow_mut().pop_front()?;
-                let mut buf = PacketBuf::new();
+                let mut buf = PacketBuf::try_new().unwrap();
                 buf.set_len(bytes.len());
                 buf.copy_from_slice(&bytes);
                 buf.meta_mut().id = 0x1111;

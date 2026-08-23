@@ -329,7 +329,8 @@ impl Client {
     }
 
     /// Build one client message, UDP header included, ready for
-    /// `transmit_ipv4_on`.
+    /// `transmit_ipv4_on`. `None` if the pool is empty: the retry timer sends
+    /// the next one.
     ///
     /// Panics if the message doesn't fit in a packet. The options the client
     /// emits are tiny, so only an absurd `outgoing_options` can cause that.
@@ -345,13 +346,13 @@ impl Client {
         ip_mtu: usize,
         src_addr: Ipv4Address,
         dst_addr: Ipv4Address,
-    ) -> PacketBuf {
+    ) -> Option<PacketBuf> {
         // Worst case biggest IPv4 header length.
         // 0x0f * 4 = 60 bytes.
         const MAX_IPV4_HEADER_LEN: usize = 60;
         let max_size = (ip_mtu - MAX_IPV4_HEADER_LEN - UDP_HEADER_LEN) as u16;
 
-        let mut buf = PacketBuf::new();
+        let mut buf = PacketBuf::try_new()?;
         buf.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
         let max_payload = buf.tailroom().min(ip_mtu - IPV4_HEADER_LEN - UDP_HEADER_LEN);
         buf.set_len(max_payload);
@@ -418,7 +419,7 @@ impl Client {
         udp.set_len((UDP_HEADER_LEN + len) as u16);
         udp.fill_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr));
 
-        buf
+        Some(buf)
     }
 }
 
@@ -562,7 +563,9 @@ impl IfaceState<'_> {
                     Ipv4Address::UNSPECIFIED,
                     Ipv4Address::BROADCAST,
                 );
-                inner.transmit_ipv4_on(self, Ipv4Address::UNSPECIFIED, Ipv4Address::BROADCAST, buf);
+                if let Some(buf) = buf {
+                    inner.transmit_ipv4_on(self, Ipv4Address::UNSPECIFIED, Ipv4Address::BROADCAST, buf);
+                }
             }
             ClientState::Requesting(state) => {
                 if now < state.retry_at {
@@ -591,7 +594,9 @@ impl IfaceState<'_> {
                     Ipv4Address::UNSPECIFIED,
                     Ipv4Address::BROADCAST,
                 );
-                inner.transmit_ipv4_on(self, Ipv4Address::UNSPECIFIED, Ipv4Address::BROADCAST, buf);
+                if let Some(buf) = buf {
+                    inner.transmit_ipv4_on(self, Ipv4Address::UNSPECIFIED, Ipv4Address::BROADCAST, buf);
+                }
             }
             ClientState::Renewing(state) => {
                 if state.expires_at <= now {
@@ -642,7 +647,9 @@ impl IfaceState<'_> {
                     src_addr,
                     dst_addr,
                 );
-                inner.transmit_ipv4_on(self, src_addr, dst_addr, buf);
+                if let Some(buf) = buf {
+                    inner.transmit_ipv4_on(self, src_addr, dst_addr, buf);
+                }
             }
         }
     }
@@ -747,7 +754,7 @@ mod test {
         }
         fn receive(&mut self) -> Option<PacketBuf> {
             let bytes = self.rx.borrow_mut().pop_front()?;
-            let mut buf = PacketBuf::new();
+            let mut buf = PacketBuf::try_new().unwrap();
             buf.set_len(bytes.len());
             buf.copy_from_slice(&bytes);
             Some(buf)

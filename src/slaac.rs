@@ -525,7 +525,11 @@ impl IfaceState<'_> {
 
         // Router solicit: RS header (8 bytes) plus the source link-layer address
         // option (8 bytes).
-        let mut buf = PacketBuf::new();
+        let Some(mut buf) = PacketBuf::try_new() else {
+            // The retry timer sends the next one.
+            trace!("ndisc: no packet buffer for router solicit");
+            return;
+        };
         buf.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
         buf.set_len(8 + 8);
         {

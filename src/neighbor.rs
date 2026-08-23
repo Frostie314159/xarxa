@@ -566,11 +566,15 @@ mod test {
     fn test_pending_queue() {
         let mut queue = PendingQueue::new();
 
-        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::new(), Instant::ZERO);
-        queue.push(key(MOCK_IP_ADDR_2), PacketBuf::new(), Instant::ZERO);
-        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::new(), Instant::ZERO);
+        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap(), Instant::ZERO);
+        queue.push(key(MOCK_IP_ADDR_2), PacketBuf::try_new().unwrap(), Instant::ZERO);
+        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap(), Instant::ZERO);
         // Same address, different interface: distinct key.
-        queue.push((IF_1, MOCK_IP_ADDR_1.into()), PacketBuf::new(), Instant::ZERO);
+        queue.push(
+            (IF_1, MOCK_IP_ADDR_1.into()),
+            PacketBuf::try_new().unwrap(),
+            Instant::ZERO,
+        );
 
         let taken = take_matching(&mut queue, &key(MOCK_IP_ADDR_1));
         assert_eq!(taken.len(), 2);
@@ -584,10 +588,10 @@ mod test {
         let mut queue = PendingQueue::new();
 
         for _ in 0..PENDING_QUEUE_COUNT {
-            queue.push(key(MOCK_IP_ADDR_1), PacketBuf::new(), Instant::ZERO);
+            queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap(), Instant::ZERO);
         }
         // This push drops the oldest packet to make room.
-        queue.push(key(MOCK_IP_ADDR_2), PacketBuf::new(), Instant::ZERO);
+        queue.push(key(MOCK_IP_ADDR_2), PacketBuf::try_new().unwrap(), Instant::ZERO);
 
         assert_eq!(
             take_matching(&mut queue, &key(MOCK_IP_ADDR_1)).len(),
@@ -600,7 +604,7 @@ mod test {
     fn test_pending_queue_expire() {
         let mut queue = PendingQueue::new();
 
-        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::new(), Instant::ZERO);
+        queue.push(key(MOCK_IP_ADDR_1), PacketBuf::try_new().unwrap(), Instant::ZERO);
         assert_eq!(queue.poll_at(), Instant::ZERO + PENDING_QUEUE_LIFETIME);
         queue.purge_expired(Instant::ZERO + PENDING_QUEUE_LIFETIME);
         assert!(take_matching(&mut queue, &key(MOCK_IP_ADDR_1)).is_empty());
@@ -611,8 +615,16 @@ mod test {
     fn test_pending_queue_purge_iface() {
         let mut queue = PendingQueue::new();
 
-        queue.push((IF_0, MOCK_IP_ADDR_1.into()), PacketBuf::new(), Instant::ZERO);
-        queue.push((IF_1, MOCK_IP_ADDR_1.into()), PacketBuf::new(), Instant::ZERO);
+        queue.push(
+            (IF_0, MOCK_IP_ADDR_1.into()),
+            PacketBuf::try_new().unwrap(),
+            Instant::ZERO,
+        );
+        queue.push(
+            (IF_1, MOCK_IP_ADDR_1.into()),
+            PacketBuf::try_new().unwrap(),
+            Instant::ZERO,
+        );
 
         queue.purge_iface(IF_0);
         assert!(take_matching(&mut queue, &(IF_0, MOCK_IP_ADDR_1.into())).is_empty());

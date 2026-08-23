@@ -122,8 +122,10 @@ pub enum SendError {
     /// The destination address or port is unspecified, or no matching source
     /// address is available.
     Unaddressable,
-    /// The payload does not fit in a packet buffer, or no buffer is available.
+    /// The payload does not fit in a packet buffer.
     BufferFull,
+    /// No packet buffer is free. Wait for one to be freed, then retry.
+    NoBuffer,
     /// The interface the packet would go out of has no room for it right now.
     DeviceBusy,
 }
@@ -134,6 +136,7 @@ impl fmt::Display for SendError {
             SendError::InvalidState => write!(f, "invalid state"),
             SendError::Unaddressable => write!(f, "unaddressable"),
             SendError::BufferFull => write!(f, "buffer full"),
+            SendError::NoBuffer => write!(f, "no buffer"),
             SendError::DeviceBusy => write!(f, "device busy"),
         }
     }
@@ -714,6 +717,7 @@ impl UdpSocket<'_, '_> {
     /// address is not assigned to any interface.
     /// Returns `Err(SendError::BufferFull)` if the payload cannot fit in a packet
     /// buffer.
+    /// Returns `Err(SendError::NoBuffer)` if every packet buffer is in use.
     pub fn send_with(
         &mut self,
         max_size: usize,
@@ -791,7 +795,9 @@ impl UdpSocket<'_, '_> {
         if !self.tx.can_transmit(route.iface) {
             return Err(SendError::DeviceBusy);
         }
-        let mut buf = PacketBuf::new();
+        let Some(mut buf) = PacketBuf::try_new() else {
+            return Err(SendError::NoBuffer);
+        };
         if max_size > buf.capacity() - headroom {
             return Err(SendError::BufferFull);
         }
@@ -1008,7 +1014,7 @@ mod test {
     /// Build a queued-datagram buffer the way ingress does, as a full IPv4 + UDP packet.
     fn queued_packet_from(src_addr: Ipv4Address, src_port: u16, dst_addr: Ipv4Address, payload: &[u8]) -> PacketBuf {
         let udp_len = UDP_HEADER_LEN + payload.len();
-        let mut buf = PacketBuf::new();
+        let mut buf = PacketBuf::try_new().unwrap();
         buf.set_len(IPV4_HEADER_LEN + udp_len);
         {
             let mut ip = Ipv4Packet::new_unchecked(&mut buf);
