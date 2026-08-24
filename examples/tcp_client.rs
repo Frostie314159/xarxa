@@ -25,7 +25,7 @@
 use std::io::Write as _;
 use std::os::unix::io::AsRawFd;
 
-use xarxa::iface::{Medium, TunTapInterface, wait};
+use xarxa::iface::{TunTapInterface, wait};
 use xarxa::stack::Stack;
 use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
@@ -34,11 +34,11 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
 
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    let medium = if let Some(pos) = args.iter().position(|a| a == "--tun") {
+    let hardware_addr = if let Some(pos) = args.iter().position(|a| a == "--tun") {
         args.remove(pos);
-        Medium::Ip
+        HardwareAddress::Ip
     } else {
-        Medium::Ethernet
+        HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]))
     };
     let name = args.first().map(String::as_str).unwrap_or("tap0");
     let remote: IpEndpoint = args
@@ -52,23 +52,13 @@ fn main() {
     // The device and the socket buffers are lent to the stack by reference
     // rather than boxed, as a no-alloc program would. They must be declared
     // before the stack, which holds them until it is dropped.
-    let mut device = TunTapInterface::new(name, medium).unwrap();
+    let mut device = TunTapInterface::new(name, hardware_addr).unwrap();
     let fd = device.as_raw_fd();
     let mut rx_buffer = [0u8; 4096];
     let mut tx_buffer = [0u8; 4096];
 
     let mut stack = Stack::new(random_seed());
-    let iface = stack
-        .add_iface_borrowed(
-            &mut device,
-            match medium {
-                Medium::Ip => HardwareAddress::Ip,
-                Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])),
-                #[allow(unreachable_patterns)]
-                _ => unreachable!(),
-            },
-        )
-        .unwrap();
+    let iface = stack.add_iface_borrowed(&mut device).unwrap();
     stack
         .iface(iface)
         .set_ip_addrs([

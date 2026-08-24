@@ -6,6 +6,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::buf::PacketBuf;
 use crate::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, Medium};
+use crate::wire::HardwareAddress;
 
 const SIOCGIFMTU: libc::c_ulong = 0x8921;
 const SIOCGIFINDEX: libc::c_ulong = 0x8933;
@@ -53,7 +54,7 @@ fn ifreq_ioctl(lower: libc::c_int, ifreq: &mut ifreq, cmd: libc::c_ulong) -> io:
 pub struct RawSocketInterface {
     lower: libc::c_int,
     mtu: usize,
-    medium: Medium,
+    hardware_addr: HardwareAddress,
 }
 
 impl AsRawFd for RawSocketInterface {
@@ -65,14 +66,20 @@ impl AsRawFd for RawSocketInterface {
 impl RawSocketInterface {
     /// Open a packet socket bound to the interface called `name`.
     ///
+    /// `hardware_addr` is the address the interface reports to the stack, and picks the
+    /// medium: an Ethernet address for an Ethernet interface, an IEEE 802.15.4 one for a
+    /// `wpan` interface. It must match the address the host interface is configured with.
+    ///
     /// This requires superuser privileges or a corresponding capability bit
     /// set on the executable.
     ///
     /// Errors:
     /// - the OS error if the socket cannot be opened or bound, or the
     ///   interface does not exist.
-    /// - `Unsupported` for [`Medium::Ip`].
-    pub fn new(name: &str, medium: Medium) -> io::Result<RawSocketInterface> {
+    /// - `Unsupported` for [`HardwareAddress::Ip`].
+    pub fn new(name: &str, hardware_addr: HardwareAddress) -> io::Result<RawSocketInterface> {
+        let medium = hardware_addr.medium();
+
         let protocol = match medium {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => ETH_P_ALL,
@@ -99,7 +106,11 @@ impl RawSocketInterface {
             lower
         };
 
-        let mut iface = RawSocketInterface { lower, mtu: 0, medium };
+        let mut iface = RawSocketInterface {
+            lower,
+            mtu: 0,
+            hardware_addr,
+        };
         let mut ifreq = ifreq_for(name);
 
         let sockaddr = libc::sockaddr_ll {
@@ -175,10 +186,14 @@ impl Drop for RawSocketInterface {
 impl Interface for RawSocketInterface {
     fn capabilities(&self) -> IfaceCapabilities {
         IfaceCapabilities {
-            medium: self.medium,
+            medium: self.hardware_addr.medium(),
             max_transmission_unit: self.mtu,
             checksum: ChecksumCapabilities::default(),
         }
+    }
+
+    fn hardware_address(&self) -> HardwareAddress {
+        self.hardware_addr
     }
 
     fn receive(&mut self) -> Option<PacketBuf> {

@@ -78,6 +78,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Each interface has its own configuration (like IP addresses)
   - A route table chooses which interface to use on egress.
   - Mixing mediums in is supported.
+  - The driver reports its hardware address and link state to the stack.
 - Ethernet interface medium (feature `medium-ethernet`)
   - Does IPv4 ARP, IPv6 NDISC.
   - Neighbor cache with expiry, renewal on use.
@@ -136,6 +137,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 All of the below is planned. Please open an issue or reach out on [the Matrix chat](https://matrix.to/#/#xarxa:matrix.org) if you want to work on one of these so we don't duplicate work.
 
 - DHCP server
+- Acting on link state: skipping down interfaces on egress routing, restarting DHCP/SLAAC on link-up.
 - IPv6 DAD (duplicate address detection)
 - IPv6 RDNSS (DNS servers from router advertisements)
 - an equivalent to smoltcp's `any_ip`

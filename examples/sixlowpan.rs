@@ -48,7 +48,7 @@
 
 use std::os::unix::io::AsRawFd;
 
-use xarxa::iface::{Medium, RawSocketInterface, wait};
+use xarxa::iface::{RawSocketInterface, wait};
 use xarxa::stack::Stack;
 use xarxa::time::Instant;
 use xarxa::wire::{HardwareAddress, Ieee802154Address, Ieee802154Pan, IpListenEndpoint};
@@ -61,18 +61,14 @@ fn main() {
 
     let name = std::env::args().nth(1).unwrap_or_else(|| "wpan1".to_string());
 
-    let device = RawSocketInterface::new(&name, Medium::Ieee802154).unwrap();
+    let hardware_addr = HardwareAddress::Ieee802154(Ieee802154Address::Extended([
+        0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+    ]));
+    let device = RawSocketInterface::new(&name, hardware_addr).unwrap();
     let fd = device.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());
-    let iface = stack
-        .add_iface(
-            Box::new(device),
-            HardwareAddress::Ieee802154(Ieee802154Address::Extended([
-                0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
-            ])),
-        )
-        .unwrap();
+    let iface = stack.add_iface(Box::new(device)).unwrap();
     // The link-local address is derived from the extended address:
     // fe80::180b:4242:4242:4242.
     stack.iface(iface).set_pan_id(Some(Ieee802154Pan(0xbeef)));

@@ -13,6 +13,7 @@ packet socket bound to an existing interface (Ethernet or IEEE 802.15.4).
 */
 
 use crate::buf::PacketBuf;
+use crate::wire::HardwareAddress;
 
 #[cfg(all(feature = "std", any(feature = "medium-ethernet", feature = "medium-ip")))]
 mod tuntap;
@@ -33,6 +34,16 @@ mod raw_socket;
     any(feature = "medium-ethernet", feature = "medium-ieee802154")
 ))]
 pub use self::raw_socket::RawSocketInterface;
+
+/// Link state of an interface.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+pub enum LinkState {
+    /// The link is down. No frames can pass.
+    Down,
+    /// The link is up.
+    Up,
+}
 
 /// Type of medium of an interface.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -184,6 +195,25 @@ pub trait Interface {
     /// Get a description of iface capabilities.
     fn capabilities(&self) -> IfaceCapabilities;
 
+    /// Get the device's hardware address.
+    ///
+    /// The address kind must match the medium in [`capabilities`](Self::capabilities):
+    /// an Ethernet address for [`Medium::Ethernet`], [`HardwareAddress::Ip`] for
+    /// [`Medium::Ip`], an IEEE 802.15.4 address for [`Medium::Ieee802154`].
+    ///
+    /// The stack reads it once, when the interface is added. Use
+    /// [`Iface::set_hardware_addr`](crate::Iface::set_hardware_addr) to change the
+    /// address of an already-added interface.
+    fn hardware_address(&self) -> HardwareAddress;
+
+    /// Get the link state.
+    ///
+    /// Devices that cannot tell, or whose link is always up, return
+    /// [`LinkState::Up`], which is the default implementation.
+    fn link_state(&mut self) -> LinkState {
+        LinkState::Up
+    }
+
     /// Poll for a received frame.
     ///
     /// Returns a buffer holding the received frame if one is available, transferring
@@ -251,6 +281,12 @@ pub trait Interface {
 impl<T: Interface + ?Sized> Interface for &mut T {
     fn capabilities(&self) -> IfaceCapabilities {
         T::capabilities(self)
+    }
+    fn hardware_address(&self) -> HardwareAddress {
+        T::hardware_address(self)
+    }
+    fn link_state(&mut self) -> LinkState {
+        T::link_state(self)
     }
     fn receive(&mut self) -> Option<PacketBuf> {
         T::receive(self)

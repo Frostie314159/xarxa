@@ -14,7 +14,7 @@ use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
 use crate::fragmentation::Fragmenter;
 #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
 use crate::icmp_error::{IcmpError, parse_quoted_packet};
-use crate::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, Medium};
+use crate::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, LinkState, Medium};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, Key as NeighborKey, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
@@ -164,6 +164,11 @@ impl<'d> Iface<'_, 'd> {
         self.state().dev.capabilities()
     }
 
+    /// The link state reported by the device.
+    pub fn link_state(&mut self) -> LinkState {
+        self.state_mut().dev.link_state()
+    }
+
     /// The interface's IP-layer MTU: the device MTU minus the link-layer header,
     /// clamped to what a [`PacketBuf`] can carry.
     pub fn ip_mtu(&self) -> usize {
@@ -184,6 +189,9 @@ impl<'d> Iface<'_, 'd> {
     }
 
     /// The hardware address of the interface.
+    ///
+    /// Initially the address the device reported when the interface was added.
+    /// [`set_hardware_addr`](Self::set_hardware_addr) overrides it.
     pub fn hardware_addr(&self) -> HardwareAddress {
         self.state().hardware_addr
     }
@@ -752,12 +760,9 @@ impl<'d> Stack<'d> {
     /// add an IP address to it.
     ///
     /// ```no_run
-    /// # use xarxa::{Stack, iface::Interface, wire::{EthernetAddress, HardwareAddress, IpCidr, Ipv4Address}};
+    /// # use xarxa::{Stack, iface::Interface, wire::{IpCidr, Ipv4Address}};
     /// # fn configure(stack: &mut Stack, dev: Box<dyn Interface>) {
-    /// let handle = stack.add_iface(
-    ///     dev,
-    ///     HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
-    /// ).unwrap();
+    /// let handle = stack.add_iface(dev).unwrap();
     /// stack
     ///     .iface(handle)
     ///     .add_ip_addr(IpCidr::new(Ipv4Address::new(192, 168, 1, 1).into(), 24))
@@ -766,18 +771,15 @@ impl<'d> Stack<'d> {
     /// ```
     ///
     /// # Panics
-    /// Panics if the hardware address is not of the kind the device's medium uses.
+    /// Panics if the hardware address the device reports is not of the kind its
+    /// medium uses.
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another interface. Only possible
     ///   without the `alloc` feature, where the `iface-count-N` feature sets the limit.
     #[cfg(feature = "alloc")]
-    pub fn add_iface(
-        &mut self,
-        dev: alloc::boxed::Box<dyn Interface + 'd>,
-        hardware_addr: HardwareAddress,
-    ) -> core::result::Result<IfaceHandle, Full> {
-        self.add_iface_inner(dev.into(), hardware_addr)
+    pub fn add_iface(&mut self, dev: alloc::boxed::Box<dyn Interface + 'd>) -> core::result::Result<IfaceHandle, Full> {
+        self.add_iface_inner(dev.into())
     }
 
     /// Add an interface to the stack, lending it the device, and returning a
@@ -788,28 +790,22 @@ impl<'d> Stack<'d> {
     /// Otherwise this is [`add_iface`](Self::add_iface).
     ///
     /// # Panics
-    /// Panics if the hardware address is not of the kind the device's medium uses.
+    /// Panics if the hardware address the device reports is not of the kind its
+    /// medium uses.
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another interface. Only possible
     ///   without the `alloc` feature, where the `iface-count-N` feature sets the limit.
-    pub fn add_iface_borrowed(
-        &mut self,
-        dev: &'d mut dyn Interface,
-        hardware_addr: HardwareAddress,
-    ) -> core::result::Result<IfaceHandle, Full> {
-        self.add_iface_inner(dev.into(), hardware_addr)
+    pub fn add_iface_borrowed(&mut self, dev: &'d mut dyn Interface) -> core::result::Result<IfaceHandle, Full> {
+        self.add_iface_inner(dev.into())
     }
 
-    fn add_iface_inner(
-        &mut self,
-        dev: MaybeBox<'d, dyn Interface + 'd>,
-        hardware_addr: HardwareAddress,
-    ) -> core::result::Result<IfaceHandle, Full> {
+    fn add_iface_inner(&mut self, dev: MaybeBox<'d, dyn Interface + 'd>) -> core::result::Result<IfaceHandle, Full> {
+        let hardware_addr = dev.hardware_address();
         assert_eq!(
             hardware_addr.medium(),
             dev.capabilities().medium,
-            "hardware address does not match the interface's medium"
+            "the device's hardware address does not match its medium"
         );
         #[cfg(feature = "medium-ieee802154")]
         let sixlowpan = crate::sixlowpan::State::new(&mut self.inner.rand);
@@ -3628,6 +3624,23 @@ pub(crate) mod test {
     /// OUR_HW 02:00:00:00:00:01 -> fe80::ff:fe00:1 (modified EUI-64 flips the U/L bit back).
     #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
     const OUR_LINK_LOCAL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x1);
+
+    #[test]
+    #[cfg(feature = "medium-ethernet")]
+    fn test_iface_reports_device_state() {
+        let dev = TestDevice::new(Medium::Ethernet);
+        let link = dev.link.clone();
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let handle = dev.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
+
+        // The hardware address is read from the device at add time.
+        assert_eq!(stack.iface(handle).hardware_addr(), HardwareAddress::Ethernet(OUR_HW));
+
+        // The link state is read from the device live.
+        assert_eq!(stack.iface(handle).link_state(), crate::iface::LinkState::Up);
+        link.set(crate::iface::LinkState::Down);
+        assert_eq!(stack.iface(handle).link_state(), crate::iface::LinkState::Down);
+    }
 
     #[test]
     #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]

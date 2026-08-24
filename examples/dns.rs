@@ -23,7 +23,7 @@
 use std::os::unix::io::AsRawFd;
 
 use xarxa::dns::{DnsClient, GetQueryResultError};
-use xarxa::iface::{Medium, TunTapInterface, wait};
+use xarxa::iface::{TunTapInterface, wait};
 use xarxa::stack::Stack;
 use xarxa::time::Instant;
 use xarxa::wire::dns::Type;
@@ -33,11 +33,11 @@ fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
 
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
-    let medium = if let Some(pos) = args.iter().position(|a| a == "--tun") {
+    let hardware_addr = if let Some(pos) = args.iter().position(|a| a == "--tun") {
         args.remove(pos);
-        Medium::Ip
+        HardwareAddress::Ip
     } else {
-        Medium::Ethernet
+        HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]))
     };
     let name = args.first().map(String::as_str).unwrap_or("tap0");
     let host = args.get(1).map(String::as_str).unwrap_or("rust-lang.org");
@@ -50,21 +50,11 @@ fn main() {
         })
         .unwrap_or(IpAddress::v4(8, 8, 8, 8));
 
-    let device = TunTapInterface::new(name, medium).unwrap();
+    let device = TunTapInterface::new(name, hardware_addr).unwrap();
     let fd = device.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());
-    let iface = stack
-        .add_iface(
-            Box::new(device),
-            match medium {
-                Medium::Ip => HardwareAddress::Ip,
-                Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])),
-                #[allow(unreachable_patterns)]
-                _ => unreachable!(),
-            },
-        )
-        .unwrap();
+    let iface = stack.add_iface(Box::new(device)).unwrap();
     stack
         .iface(iface)
         .set_ip_addrs([

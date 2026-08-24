@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::vec::Vec;
 
 use xarxa::PacketBuf;
-use xarxa::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, Medium};
+use xarxa::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, LinkState, Medium};
 #[cfg(feature = "packetmeta-id")]
 use xarxa::meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]
@@ -62,6 +62,10 @@ pub struct TestDevice {
     pub tx_meta: SentMeta,
     /// How many more frames it accepts.
     pub room: Room,
+    /// The hardware address it reports. Set by [`TestDevice::install`].
+    pub hardware_addr: HardwareAddress,
+    /// The link state it reports.
+    pub link: Rc<Cell<LinkState>>,
     /// Metadata stamped onto every received packet.
     #[cfg(feature = "packetmeta-id")]
     pub rx_meta: PacketMeta,
@@ -86,6 +90,19 @@ impl TestDevice {
             #[cfg(feature = "packetmeta-id")]
             tx_meta: Rc::new(RefCell::new(Vec::new())),
             room: Rc::new(Cell::new(None)),
+            hardware_addr: match medium {
+                #[cfg(feature = "medium-ethernet")]
+                Medium::Ethernet => {
+                    HardwareAddress::Ethernet(xarxa::wire::EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]))
+                }
+                #[cfg(feature = "medium-ip")]
+                Medium::Ip => HardwareAddress::Ip,
+                #[cfg(feature = "medium-ieee802154")]
+                Medium::Ieee802154 => HardwareAddress::Ieee802154(xarxa::wire::Ieee802154Address::Extended([
+                    0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                ])),
+            },
+            link: Rc::new(Cell::new(LinkState::Up)),
             #[cfg(feature = "packetmeta-id")]
             rx_meta: PacketMeta::default(),
             #[cfg(feature = "packetmeta-timestamp")]
@@ -126,7 +143,9 @@ impl TestDevice {
     /// The stack gets its own copy, sharing this one's queues. It is leaked, so
     /// the interface lives as long as the test wants it to.
     pub fn install(&self, stack: &mut Stack<'_>, hw: HardwareAddress) -> IfaceHandle {
-        stack.add_iface_borrowed(Box::leak(Box::new(self.clone())), hw).unwrap()
+        let mut dev = self.clone();
+        dev.hardware_addr = hw;
+        stack.add_iface_borrowed(Box::leak(Box::new(dev))).unwrap()
     }
 }
 
@@ -137,6 +156,14 @@ impl Interface for TestDevice {
         caps.max_transmission_unit = self.mtu;
         caps.checksum = self.checksum;
         caps
+    }
+
+    fn hardware_address(&self) -> HardwareAddress {
+        self.hardware_addr
+    }
+
+    fn link_state(&mut self) -> LinkState {
+        self.link.get()
     }
 
     fn receive(&mut self) -> Option<PacketBuf> {
