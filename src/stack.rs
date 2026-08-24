@@ -2363,7 +2363,10 @@ impl StackInner {
             self.fill_neighbor(iface, IpAddress::Ipv6(src_addr), lladdr);
         }
 
-        if iface.has_solicited_node(dst_addr) && iface.has_ip_addr(target_addr) {
+        // RFC 4861 §7.2.3: the destination is either the target's solicited-node
+        // multicast (address resolution) or one of our unicast addresses (a
+        // unicast NUD probe). Answer both.
+        if (iface.has_solicited_node(dst_addr) || iface.has_ip_addr(dst_addr)) && iface.has_ip_addr(target_addr) {
             // Neighbor advert: NA header (24 bytes) plus the target link-layer
             // address option.
             let Some(mut reply) = PacketBuf::try_new() else {
@@ -5050,6 +5053,86 @@ pub(crate) mod test {
         stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
         assert_eq!(tx.borrow().len(), 4);
         assert_eq!(ethertype_of(&tx.borrow()[3]), EthernetProtocol::Arp);
+    }
+
+    /// An Ethernet frame carrying a neighbor solicitation from `remote_hw`/`remote_ll`
+    /// for `target`, sent to `dst_addr`, with a source link-layer address option.
+    #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+    fn neighbor_solicit(
+        remote_hw: EthernetAddress,
+        remote_ll: Ipv6Address,
+        dst_addr: Ipv6Address,
+        target: Ipv6Address,
+    ) -> Vec<u8> {
+        let mut icmp = vec![0; 24 + 8];
+        {
+            let mut ns = Icmpv6Packet::new_unchecked(&mut icmp[..]);
+            ns.set_msg_type(Icmpv6Message::NeighborSolicit);
+            ns.set_msg_code(0);
+            ns.clear_reserved();
+            ns.set_target_addr(target);
+            {
+                let mut opt = NdiscOption::new_unchecked(ns.payload_mut());
+                opt.set_option_type(NdiscOptionType::SourceLinkLayerAddr);
+                opt.set_data_len(1);
+                opt.set_link_layer_addr(RawHardwareAddress::from(remote_hw));
+            }
+            ns.fill_checksum(&remote_ll, &dst_addr);
+        }
+        let mut ip = ipv6_packet(remote_ll, dst_addr, IpProtocol::Icmpv6, &icmp);
+        Ipv6Packet::new_unchecked(&mut ip[..]).set_hop_limit(255);
+
+        let mut frame = vec![0; ETHERNET_HEADER_LEN];
+        {
+            let mut eth = EthernetFrame::new_unchecked(&mut frame[..]);
+            eth.set_dst_addr(OUR_HW);
+            eth.set_src_addr(remote_hw);
+            eth.set_ethertype(EthernetProtocol::Ipv6);
+        }
+        frame.extend_from_slice(&ip);
+        frame
+    }
+
+    /// A neighbor solicitation is answered whether its destination is the target's
+    /// solicited-node multicast address (address resolution) or one of our unicast
+    /// addresses (a NUD probe), RFC 4861 §7.2.3.
+    #[test]
+    #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+    fn test_ndisc_solicit_multicast_and_unicast() {
+        let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let remote_ll = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+
+        for dst_addr in [OUR_LINK_LOCAL.solicited_node(), OUR_LINK_LOCAL] {
+            let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
+            inject(
+                &mut stack,
+                &rx,
+                neighbor_solicit(remote_hw, remote_ll, dst_addr, OUR_LINK_LOCAL),
+            );
+
+            let tx = tx.borrow();
+            assert_eq!(tx.len(), 1, "no advert for a solicitation to {dst_addr}");
+            let mut bytes = tx[0][ETHERNET_HEADER_LEN..].to_vec();
+            let ip = Ipv6Packet::new_checked(&mut bytes[..]).unwrap();
+            assert_eq!(ip.src_addr(), OUR_LINK_LOCAL);
+            assert_eq!(ip.dst_addr(), remote_ll);
+            let mut icmp_bytes = bytes[IPV6_HEADER_LEN..].to_vec();
+            let na = Icmpv6Packet::new_checked(&mut icmp_bytes[..]).unwrap();
+            assert!(na.verify_checksum(&OUR_LINK_LOCAL, &remote_ll));
+            assert_eq!(na.msg_type(), Icmpv6Message::NeighborAdvert);
+            assert_eq!(na.target_addr(), OUR_LINK_LOCAL);
+            assert!(na.neighbor_flags().contains(NdiscNeighborFlags::SOLICITED));
+        }
+
+        // A solicitation whose target is not our address is not answered, even
+        // when addressed to our unicast address.
+        let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
+        inject(
+            &mut stack,
+            &rx,
+            neighbor_solicit(remote_hw, remote_ll, OUR_LINK_LOCAL, remote_ll),
+        );
+        assert!(tx.borrow().is_empty());
     }
 
     // ===== IPv4 fragmentation and reassembly =====
