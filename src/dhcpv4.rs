@@ -17,6 +17,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
 
 use crate::buf::PacketBuf;
+use crate::iface::ChecksumCapabilities;
 use crate::route::{Route, RouteOrigin};
 use crate::stack::{AddrOrigin, IfaceAddr, IfaceState, StackInner};
 use crate::time::{Duration, Instant};
@@ -458,6 +459,7 @@ impl Client {
         ip_mtu: usize,
         src_addr: Ipv4Address,
         dst_addr: Ipv4Address,
+        checksum_caps: &ChecksumCapabilities,
     ) -> Option<PacketBuf> {
         // Worst case biggest IPv4 header length.
         // 0x0f * 4 = 60 bytes.
@@ -529,7 +531,13 @@ impl Client {
         udp.set_src_port(DHCP_CLIENT_PORT);
         udp.set_dst_port(DHCP_SERVER_PORT);
         udp.set_len((UDP_HEADER_LEN + len) as u16);
-        udp.fill_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr));
+        if checksum_caps.udp.tx() {
+            udp.fill_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr));
+        } else {
+            // A zero checksum means "no checksum" on UDP-over-IPv4, and is what a
+            // device that computes it itself expects to find in the field.
+            udp.set_checksum(0);
+        }
 
         Some(buf)
     }
@@ -650,6 +658,7 @@ impl IfaceState<'_> {
     pub(crate) fn dhcpv4_dispatch(&mut self, inner: &mut StackInner) {
         let ethernet_addr = self.hardware_addr;
         let ip_mtu = self.ip_mtu();
+        let checksum_caps = self.checksum_caps();
         let Some(client) = &mut self.dhcpv4 else { return };
         let ethernet_addr = ethernet_addr.ethernet_or_panic();
         let now = inner.now;
@@ -674,6 +683,7 @@ impl IfaceState<'_> {
                     ip_mtu,
                     Ipv4Address::UNSPECIFIED,
                     Ipv4Address::BROADCAST,
+                    &checksum_caps,
                 );
                 if let Some(buf) = buf {
                     inner.transmit_ipv4_on(self, Ipv4Address::UNSPECIFIED, Ipv4Address::BROADCAST, buf);
@@ -705,6 +715,7 @@ impl IfaceState<'_> {
                     ip_mtu,
                     Ipv4Address::UNSPECIFIED,
                     Ipv4Address::BROADCAST,
+                    &checksum_caps,
                 );
                 if let Some(buf) = buf {
                     inner.transmit_ipv4_on(self, Ipv4Address::UNSPECIFIED, Ipv4Address::BROADCAST, buf);
@@ -758,6 +769,7 @@ impl IfaceState<'_> {
                     ip_mtu,
                     src_addr,
                     dst_addr,
+                    &checksum_caps,
                 );
                 if let Some(buf) = buf {
                     inner.transmit_ipv4_on(self, src_addr, dst_addr, buf);
@@ -839,7 +851,7 @@ mod test {
     use std::vec::Vec;
 
     use super::*;
-    use crate::iface::Medium;
+    use crate::iface::{Checksum, Medium};
     use crate::stack::{IfaceHandle, Stack};
     use crate::test_device::{Queue, Sent, TestDevice};
     use crate::wire::{
@@ -857,7 +869,12 @@ mod test {
 
     /// A stack with one Ethernet interface, no addresses, DHCP on.
     fn test_stack() -> (Stack<'static>, Queue, Sent) {
-        let dev = TestDevice::new(Medium::Ethernet);
+        test_stack_with_checksum(ChecksumCapabilities::default())
+    }
+
+    /// [`test_stack`], with a device that claims to handle the given checksums itself.
+    fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
+        let dev = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
         let (rx, tx) = (dev.rx.clone(), dev.tx.clone());
         let mut stack = Stack::new(1);
         let handle = dev.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
@@ -1333,5 +1350,26 @@ mod test {
         assert!(options.push(DhcpOption { kind: 1, data: &[7] }).is_ok());
         assert_eq!(options.get(1), Some(&[7][..]));
         assert_eq!(options.get(42), None);
+    }
+
+    /// A device that computes the IPv4 and UDP checksums itself gets both fields
+    /// zeroed in the messages the client sends.
+    #[test]
+    fn test_checksum_offload() {
+        let caps = ChecksumCapabilities {
+            ipv4: Checksum::None,
+            udp: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, _rx, tx) = test_stack_with_checksum(caps);
+        stack.poll(at(0));
+
+        let mut frame = tx.borrow()[0].clone();
+        let ip = Ipv4Packet::new_checked(&mut frame[ETHERNET_HEADER_LEN..]).unwrap();
+        assert_eq!(ip.checksum(), 0);
+        assert_eq!(ip.next_header(), IpProtocol::Udp);
+        let udp = UdpPacket::new_checked(&mut frame[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..]).unwrap();
+        assert_eq!(udp.dst_port(), DHCP_SERVER_PORT);
+        assert_eq!(udp.checksum(), 0);
     }
 }

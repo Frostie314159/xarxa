@@ -823,7 +823,13 @@ impl UdpSocket<'_, '_> {
             udp.set_src_port(local.port);
             udp.set_dst_port(meta.endpoint.port);
             udp.set_len(udp_len as u16);
-            udp.fill_checksum(&src_addr, &meta.endpoint.addr);
+            if self.tx.checksum_caps(route.iface).udp.tx() {
+                udp.fill_checksum(&src_addr, &meta.endpoint.addr);
+            } else {
+                // A zero checksum means "no checksum" on UDP-over-IPv4, and is what a
+                // device that computes it itself expects to find in the field.
+                udp.set_checksum(0);
+            }
         }
 
         trace!("udp:{}:{}: sending {} octets", local, meta.endpoint, size);
@@ -854,7 +860,8 @@ impl Stack<'_> {
             trace!("udp: malformed packet");
             return;
         };
-        if !udp_packet.verify_checksum(&src_addr, &dst_addr) {
+        if self.ifaces.get(iface.index()).checksum_caps().udp.rx() && !udp_packet.verify_checksum(&src_addr, &dst_addr)
+        {
             trace!("udp: checksum incorrect");
             return;
         }

@@ -543,7 +543,11 @@ impl IfaceState<'_> {
                 NdiscOptionType::SourceLinkLayerAddr,
                 self.hardware_addr,
             );
-            rs.fill_checksum(&src_addr, &dst_addr);
+            if self.checksum_caps().icmpv6.tx() {
+                rs.fill_checksum(&src_addr, &dst_addr);
+            } else {
+                rs.set_checksum(0);
+            }
         }
         // The all-routers destination is multicast, so this never waits on neighbor
         // resolution.

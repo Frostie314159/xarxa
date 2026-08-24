@@ -4,7 +4,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::buf::PacketBuf;
-use crate::iface::{IfaceCapabilities, Interface, Medium};
+use crate::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, Medium};
 #[cfg(feature = "medium-ethernet")]
 use crate::wire::ETHERNET_HEADER_LEN;
 
@@ -191,6 +191,7 @@ impl Interface for TunTapInterface {
         IfaceCapabilities {
             medium: self.medium,
             max_transmission_unit: self.mtu,
+            checksum: ChecksumCapabilities::default(),
         }
     }
 

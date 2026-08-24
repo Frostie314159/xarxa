@@ -5,7 +5,7 @@ use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::buf::PacketBuf;
-use crate::iface::{IfaceCapabilities, Interface, Medium};
+use crate::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, Medium};
 
 const SIOCGIFMTU: libc::c_ulong = 0x8921;
 const SIOCGIFINDEX: libc::c_ulong = 0x8933;
@@ -177,6 +177,7 @@ impl Interface for RawSocketInterface {
         IfaceCapabilities {
             medium: self.medium,
             max_transmission_unit: self.mtu,
+            checksum: ChecksumCapabilities::default(),
         }
     }
 

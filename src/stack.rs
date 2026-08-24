@@ -14,7 +14,7 @@ use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
 use crate::fragmentation::Fragmenter;
 #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
 use crate::icmp_error::{IcmpError, parse_quoted_packet};
-use crate::iface::{IfaceCapabilities, Interface, Medium};
+use crate::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, Medium};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, Key as NeighborKey, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
@@ -529,6 +529,16 @@ impl TxContext<'_, '_> {
         self.ifaces.get_mut(iface.index()).can_transmit_new_packet()
     }
 
+    /// Which checksums the egress interface computes itself, so the stack
+    /// doesn't do it in software.
+    ///
+    /// # Panics
+    /// Panics if the handle is stale (the interface was removed).
+    #[cfg(any(feature = "udp", feature = "tcp"))]
+    pub(crate) fn checksum_caps(&self, iface: IfaceHandle) -> ChecksumCapabilities {
+        self.ifaces.get(iface.index()).checksum_caps()
+    }
+
     /// Make the egress routing decision for a destination: the interface the
     /// destination is on-link for (next hop: the destination itself), else the
     /// interface and gateway named by the matching route.
@@ -601,10 +611,12 @@ impl TxContext<'_, '_> {
         hop_limit: u8,
     ) {
         let iface = self.ifaces.get_mut(route.iface.index());
+        #[cfg(feature = "ipv4")]
+        let checksum_caps = iface.checksum_caps();
         let ethertype = match (src_addr, dst_addr) {
             #[cfg(feature = "ipv4")]
             (IpAddress::Ipv4(src), IpAddress::Ipv4(dst)) => {
-                push_ipv4_header(&mut buf, src, dst, next_header, hop_limit);
+                push_ipv4_header(&mut buf, src, dst, next_header, hop_limit, &checksum_caps);
                 EthernetProtocol::Ipv4
             }
             #[cfg(feature = "ipv6")]
@@ -1507,7 +1519,8 @@ impl<'d> Stack<'d> {
         if ipv4_packet.version() != 4 {
             return;
         }
-        if !ipv4_packet.verify_checksum() {
+        let checksum_caps = self.ifaces.get(iface.index()).checksum_caps();
+        if checksum_caps.ipv4.rx() && !ipv4_packet.verify_checksum() {
             trace!("ipv4: header checksum incorrect");
             return;
         }
@@ -1540,7 +1553,9 @@ impl<'d> Stack<'d> {
         if next_header == IpProtocol::Udp && self.ifaces.get(iface.index()).dhcpv4.is_some() {
             let udp_len = match buf.get_mut(header_len..total_len).map(UdpPacket::new_checked) {
                 Some(Ok(udp)) if udp.src_port() == DHCP_SERVER_PORT && udp.dst_port() == DHCP_CLIENT_PORT => {
-                    if !udp.verify_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr)) {
+                    if checksum_caps.udp.rx()
+                        && !udp.verify_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr))
+                    {
                         trace!("dhcp: udp checksum incorrect");
                         return;
                     }
@@ -1664,7 +1679,8 @@ impl<'d> Stack<'d> {
             trace!("tcp: malformed packet");
             return;
         };
-        if !tcp_packet.verify_checksum(&src_addr, &dst_addr) {
+        if self.ifaces.get(iface.index()).checksum_caps().tcp.rx() && !tcp_packet.verify_checksum(&src_addr, &dst_addr)
+        {
             trace!("tcp: checksum incorrect");
             return;
         }
@@ -1674,22 +1690,20 @@ impl<'d> Stack<'d> {
         };
 
         // Connected sockets: exact 4-tuple match. Immediate replies the socket
-        // state machine produces (RST, challenge ACK) are serialized in the loop,
-        // so the socket borrow ends, and transmitted after.
+        // state machine produces (RST, challenge ACK) are transmitted after the
+        // loop, once the socket borrow has ended.
         let mut matched = false;
-        let mut reply_buf = None;
+        let mut reply_repr = None;
         for (_, socket) in self.sockets.tcp.iter_mut() {
             if socket.accepts(&src_addr, &dst_addr, &tcp_repr) {
                 matched = true;
-                reply_buf = socket
-                    .process(self.inner.now, &src_addr, &dst_addr, &tcp_repr)
-                    .and_then(|reply| crate::tcp::build_tcp_packet(&reply, &dst_addr, &src_addr));
+                reply_repr = socket.process(self.inner.now, &src_addr, &dst_addr, &tcp_repr);
                 break;
             }
         }
         if matched {
-            if let Some(reply) = reply_buf {
-                self.transmit_reply(iface, reply, dst_addr, src_addr, IpProtocol::Tcp, 64);
+            if let Some(reply) = reply_repr {
+                self.transmit_tcp_reply(iface, &reply, dst_addr, src_addr);
             }
             return;
         }
@@ -1708,16 +1722,37 @@ impl<'d> Stack<'d> {
         // Never reply to a TCP RST packet with another TCP RST packet.
         if tcp_repr.control != TcpControl::Rst {
             let reply = TcpSocketState::rst_reply(&tcp_repr);
-            if let Some(reply) = crate::tcp::build_tcp_packet(&reply, &dst_addr, &src_addr) {
-                self.transmit_reply(iface, reply, dst_addr, src_addr, IpProtocol::Tcp, 64);
-            }
+            self.transmit_tcp_reply(iface, &reply, dst_addr, src_addr);
         }
+    }
+
+    /// Build and transmit an immediate reply to an ingress TCP segment: an RST, or
+    /// a challenge ACK from a socket's state machine.
+    ///
+    /// The reply is routed before it is built, since its checksum is the egress
+    /// interface's to compute and that is not necessarily the arrival one. It is
+    /// dropped if there is no route, or if the pool is empty.
+    #[cfg(feature = "tcp")]
+    fn transmit_tcp_reply(
+        &mut self,
+        arrival: IfaceHandle,
+        repr: &TcpRepr<'_>,
+        src_addr: IpAddress,
+        dst_addr: IpAddress,
+    ) {
+        let Some((route, checksum_caps)) = self.route_reply(arrival, &dst_addr) else {
+            return;
+        };
+        let Some(buf) = crate::tcp::build_tcp_packet(repr, &src_addr, &dst_addr, &checksum_caps) else {
+            return;
+        };
+        self.transmit_reply(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, 64);
     }
 
     #[cfg(feature = "ipv4")]
     fn process_icmpv4(&mut self, iface: IfaceHandle, src_addr: Ipv4Address, dst_addr: Ipv4Address, mut buf: PacketBuf) {
         let mut icmp_packet = check!(Icmpv4Packet::new_checked(&mut buf));
-        if !icmp_packet.verify_checksum() {
+        if self.ifaces.get(iface.index()).checksum_caps().icmpv4.rx() && !icmp_packet.verify_checksum() {
             trace!("icmpv4: checksum incorrect");
             return;
         }
@@ -1751,6 +1786,12 @@ impl<'d> Stack<'d> {
                     }
                 };
 
+                // Route first: the reply's checksum is the egress interface's to
+                // compute, and that interface is not necessarily the arrival one.
+                let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddress::Ipv4(src_addr)) else {
+                    return;
+                };
+
                 // The reply is the request with the message type changed: ident, seq
                 // and payload stay put. Reuse the incoming buffer instead of
                 // allocating one and copying the payload over.
@@ -1762,10 +1803,14 @@ impl<'d> Stack<'d> {
                 {
                     let mut reply_icmp = Icmpv4Packet::new_unchecked(&mut buf);
                     reply_icmp.set_msg_type(Icmpv4Message::EchoReply);
-                    reply_icmp.fill_checksum();
+                    if checksum_caps.icmpv4.tx() {
+                        reply_icmp.fill_checksum();
+                    } else {
+                        reply_icmp.set_checksum(0);
+                    }
                 }
                 self.transmit_reply(
-                    iface,
+                    &route,
                     buf,
                     IpAddress::Ipv4(reply_src),
                     IpAddress::Ipv4(src_addr),
@@ -1955,7 +2000,9 @@ impl<'d> Stack<'d> {
         let _ = iface;
 
         let mut icmp_packet = check!(Icmpv6Packet::new_checked(&mut buf));
-        if !icmp_packet.verify_checksum(&src_addr, &dst_addr) {
+        if self.ifaces.get(iface.index()).checksum_caps().icmpv6.rx()
+            && !icmp_packet.verify_checksum(&src_addr, &dst_addr)
+        {
             trace!("icmpv6: checksum incorrect");
             return;
         }
@@ -1973,6 +2020,12 @@ impl<'d> Stack<'d> {
                     self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
                 };
 
+                // Route first: the reply's checksum is the egress interface's to
+                // compute, and that interface is not necessarily the arrival one.
+                let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddress::Ipv6(src_addr)) else {
+                    return;
+                };
+
                 // The reply is the request with the message type changed: ident, seq
                 // and payload stay put. Reuse the incoming buffer instead of
                 // allocating one and copying the payload over.
@@ -1984,10 +2037,14 @@ impl<'d> Stack<'d> {
                 {
                     let mut reply_icmp = Icmpv6Packet::new_unchecked(&mut buf);
                     reply_icmp.set_msg_type(Icmpv6Message::EchoReply);
-                    reply_icmp.fill_checksum(&reply_src, &src_addr);
+                    if checksum_caps.icmpv6.tx() {
+                        reply_icmp.fill_checksum(&reply_src, &src_addr);
+                    } else {
+                        reply_icmp.set_checksum(0);
+                    }
                 }
                 self.transmit_reply(
-                    iface,
+                    &route,
                     buf,
                     IpAddress::Ipv6(reply_src),
                     IpAddress::Ipv6(src_addr),
@@ -2114,14 +2171,18 @@ impl<'d> Stack<'d> {
                         None => return,
                     }
                 };
+                // The error is fed back through local ingress processing rather
+                // than transmitted, so no device is going to fill its checksums in.
+                let checksum_caps = ChecksumCapabilities::default();
                 let Some(mut reply) = build_icmpv4_error(
                     &orig,
                     Icmpv4Message::DstUnreachable,
                     Icmpv4DstUnreachable::HostUnreachable.into(),
+                    &checksum_caps,
                 ) else {
                     return;
                 };
-                push_ipv4_header(&mut reply, reply_src, src_addr, IpProtocol::Icmp, 64);
+                push_ipv4_header(&mut reply, reply_src, src_addr, IpProtocol::Icmp, 64, &checksum_caps);
                 self.process_ipv4(iface, None, reply);
             }
             #[cfg(feature = "ipv6")]
@@ -2142,6 +2203,8 @@ impl<'d> Stack<'d> {
                     return;
                 }
                 let reply_src = self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr);
+                // The error is fed back through local ingress processing rather
+                // than transmitted, so no device is going to fill its checksums in.
                 let Some(mut reply) = build_icmpv6_error(
                     &orig,
                     &reply_src,
@@ -2149,6 +2212,7 @@ impl<'d> Stack<'d> {
                     Icmpv6Message::DstUnreachable,
                     Icmpv6DstUnreachable::AddrUnreachable.into(),
                     0,
+                    &ChecksumCapabilities::default(),
                 ) else {
                     return;
                 };
@@ -2183,11 +2247,14 @@ impl<'d> Stack<'d> {
                 return;
             }
         }
-        let Some(reply) = build_icmpv4_error(orig, msg_type, msg_code) else {
+        let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddress::Ipv4(src_addr)) else {
+            return;
+        };
+        let Some(reply) = build_icmpv4_error(orig, msg_type, msg_code, &checksum_caps) else {
             return;
         };
         self.transmit_reply(
-            iface,
+            &route,
             reply,
             IpAddress::Ipv4(dst_addr),
             IpAddress::Ipv4(src_addr),
@@ -2227,11 +2294,15 @@ impl<'d> Stack<'d> {
         } else {
             self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
         };
-        let Some(reply) = build_icmpv6_error(orig, &reply_src, &src_addr, msg_type, msg_code, pointer) else {
+        let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddress::Ipv6(src_addr)) else {
+            return;
+        };
+        let Some(reply) = build_icmpv6_error(orig, &reply_src, &src_addr, msg_type, msg_code, pointer, &checksum_caps)
+        else {
             return;
         };
         self.transmit_reply(
-            iface,
+            &route,
             reply,
             IpAddress::Ipv6(reply_src),
             IpAddress::Ipv6(src_addr),
@@ -2240,27 +2311,42 @@ impl<'d> Stack<'d> {
         );
     }
 
-    /// Route and transmit a locally-generated reply to an ingress packet that
-    /// arrived on `arrival`.
+    /// Route a locally-generated reply to an ingress packet that arrived on
+    /// `arrival`, and report which checksums its egress interface computes.
     ///
     /// Replies are routed like any other egress ([`TxContext::route_reply`]), so
-    /// they may leave a different interface than the packet came in on. With no
-    /// route to the destination the reply is dropped.
-    fn transmit_reply(
+    /// they may leave a different interface than the packet came in on, and it is
+    /// that interface, not the arrival one, whose checksum capabilities the reply
+    /// is built with. Routing therefore comes before building. `None` if there is
+    /// no route to the destination, in which case the reply is dropped.
+    fn route_reply(
         &mut self,
         arrival: IfaceHandle,
+        dst_addr: &IpAddress,
+    ) -> Option<(EgressRoute, ChecksumCapabilities)> {
+        let route = match self.tx_context().route_reply(arrival, dst_addr) {
+            Some(route) => route,
+            None => {
+                debug!("no route to {}, dropping reply", dst_addr);
+                return None;
+            }
+        };
+        let checksum_caps = self.ifaces.get(route.iface.index()).checksum_caps();
+        Some((route, checksum_caps))
+    }
+
+    /// Transmit a locally-generated reply, routed by [`route_reply`](Self::route_reply).
+    fn transmit_reply(
+        &mut self,
+        route: &EgressRoute,
         buf: PacketBuf,
         src_addr: IpAddress,
         dst_addr: IpAddress,
         next_header: IpProtocol,
         hop_limit: u8,
     ) {
-        let mut tx = self.tx_context();
-        let Some(route) = tx.route_reply(arrival, &dst_addr) else {
-            debug!("no route to {}, dropping reply", dst_addr);
-            return;
-        };
-        tx.transmit_ip(&route, buf, src_addr, dst_addr, next_header, hop_limit);
+        self.tx_context()
+            .transmit_ip(route, buf, src_addr, dst_addr, next_header, hop_limit);
     }
 }
 
@@ -2388,7 +2474,11 @@ impl StackInner {
                     NdiscOptionType::TargetLinkLayerAddr,
                     iface.hardware_addr,
                 );
-                na.fill_checksum(&target_addr, &src_addr);
+                if iface.checksum_caps().icmpv6.tx() {
+                    na.fill_checksum(&target_addr, &src_addr);
+                } else {
+                    na.set_checksum(0);
+                }
             }
             self.transmit_ndisc(iface, reply, target_addr, src_addr);
         }
@@ -2642,7 +2732,11 @@ impl StackInner {
                 NdiscOptionType::SourceLinkLayerAddr,
                 iface.hardware_addr,
             );
-            ns.fill_checksum(&src_addr, &dst_addr);
+            if iface.checksum_caps().icmpv6.tx() {
+                ns.fill_checksum(&src_addr, &dst_addr);
+            } else {
+                ns.set_checksum(0);
+            }
         }
         // The solicited-node destination is multicast, so this never recurses back
         // into neighbor resolution.
@@ -2693,7 +2787,14 @@ impl StackInner {
         dst_addr: Ipv4Address,
         mut buf: PacketBuf,
     ) {
-        push_ipv4_header(&mut buf, src_addr, dst_addr, IpProtocol::Udp, 64);
+        push_ipv4_header(
+            &mut buf,
+            src_addr,
+            dst_addr,
+            IpProtocol::Udp,
+            64,
+            &iface.checksum_caps(),
+        );
         let dst = IpAddress::Ipv4(dst_addr);
         let next_hop = if !dst.is_unicast() || iface.in_same_network(&dst) {
             dst
@@ -2829,6 +2930,9 @@ fn packet_log_layer(medium: Medium) -> crate::packet_log::Layer {
 }
 
 /// Prepend an IPv4 header to a fully-built L4 payload.
+///
+/// The header checksum is only computed if the egress device doesn't do it
+/// itself; it is written as zero otherwise, since devices might rely on it.
 #[cfg(feature = "ipv4")]
 pub(crate) fn push_ipv4_header(
     buf: &mut PacketBuf,
@@ -2836,6 +2940,7 @@ pub(crate) fn push_ipv4_header(
     dst_addr: Ipv4Address,
     next_header: IpProtocol,
     hop_limit: u8,
+    checksum_caps: &ChecksumCapabilities,
 ) {
     let payload_len = buf.len();
     buf.push_front(IPV4_HEADER_LEN);
@@ -2854,7 +2959,11 @@ pub(crate) fn push_ipv4_header(
     packet.set_next_header(next_header);
     packet.set_src_addr(src_addr);
     packet.set_dst_addr(dst_addr);
-    packet.fill_checksum();
+    if checksum_caps.ipv4.tx() {
+        packet.fill_checksum();
+    } else {
+        packet.set_checksum(0);
+    }
 }
 
 /// Prepend an IPv6 header to a fully-built L4 payload.
@@ -2886,7 +2995,12 @@ const ICMP_ERROR_HEADER_LEN: usize = 8;
 /// Build an ICMPv4 error message, quoting as much of `orig` (a whole IP packet)
 /// as fits within the minimum MTU (RFC 1812 §4.3.2.3).
 #[cfg(feature = "ipv4")]
-fn build_icmpv4_error(orig: &[u8], msg_type: Icmpv4Message, msg_code: u8) -> Option<PacketBuf> {
+fn build_icmpv4_error(
+    orig: &[u8],
+    msg_type: Icmpv4Message,
+    msg_code: u8,
+    checksum_caps: &ChecksumCapabilities,
+) -> Option<PacketBuf> {
     let quote_len = orig.len().min(IPV4_MIN_MTU - IPV4_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
     let mut reply = PacketBuf::try_new()?;
     reply.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
@@ -2897,7 +3011,11 @@ fn build_icmpv4_error(orig: &[u8], msg_type: Icmpv4Message, msg_code: u8) -> Opt
         icmp.set_msg_code(msg_code);
         icmp.clear_unused();
         icmp.data_mut().copy_from_slice(&orig[..quote_len]);
-        icmp.fill_checksum();
+        if checksum_caps.icmpv4.tx() {
+            icmp.fill_checksum();
+        } else {
+            icmp.set_checksum(0);
+        }
     }
     Some(reply)
 }
@@ -2914,6 +3032,7 @@ fn build_icmpv6_error(
     msg_type: Icmpv6Message,
     msg_code: u8,
     pointer: u32,
+    checksum_caps: &ChecksumCapabilities,
 ) -> Option<PacketBuf> {
     let quote_len = orig.len().min(IPV6_MIN_MTU - IPV6_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
     let mut reply = PacketBuf::try_new()?;
@@ -2929,7 +3048,11 @@ fn build_icmpv6_error(
             icmp.clear_reserved();
         }
         icmp.payload_mut().copy_from_slice(&orig[..quote_len]);
-        icmp.fill_checksum(src_addr, dst_addr);
+        if checksum_caps.icmpv6.tx() {
+            icmp.fill_checksum(src_addr, dst_addr);
+        } else {
+            icmp.set_checksum(0);
+        }
     }
     Some(reply)
 }
@@ -2991,6 +3114,13 @@ impl IfaceState<'_> {
     #[allow(dead_code)]
     pub(crate) fn medium(&self) -> Medium {
         self.dev.capabilities().medium
+    }
+
+    /// Which checksums the device computes and verifies itself, so the stack
+    /// doesn't do it in software.
+    #[allow(dead_code)] // unused depending on which protocols are enabled
+    pub(crate) fn checksum_caps(&self) -> ChecksumCapabilities {
+        self.dev.capabilities().checksum
     }
 
     /// Whether the interface's medium has link-layer addresses, and so does
@@ -3408,6 +3538,7 @@ fn ndisc_lladdr_option(
 pub(crate) mod test {
 
     use super::*;
+    use crate::iface::Checksum;
     use crate::neighbor::MAX_MULTICAST_SOLICIT;
     use crate::raw::RawMode;
     #[cfg(feature = "slaac")]
@@ -3455,9 +3586,23 @@ pub(crate) mod test {
         test_stack_with_mtu(medium, 1500)
     }
 
+    /// [`test_stack`], with a device that claims to handle the given checksums itself.
+    fn test_stack_with_checksum(medium: Medium, checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
+        let (stack, rx, tx, _room) = test_stack_inner(medium, 1500, checksum);
+        (stack, rx, tx)
+    }
+
     /// [`test_stack_with_room`], with a device of the given MTU.
     fn test_stack_with_mtu(medium: Medium, mtu: usize) -> (Stack<'static>, Queue, Sent, Room) {
-        let dev = TestDevice::new(medium).with_mtu(mtu);
+        test_stack_inner(medium, mtu, ChecksumCapabilities::default())
+    }
+
+    fn test_stack_inner(
+        medium: Medium,
+        mtu: usize,
+        checksum: ChecksumCapabilities,
+    ) -> (Stack<'static>, Queue, Sent, Room) {
+        let dev = TestDevice::new(medium).with_mtu(mtu).with_checksum(checksum);
         let (rx, tx, room) = (dev.rx.clone(), dev.tx.clone(), dev.room.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = dev.install(
@@ -5442,5 +5587,307 @@ pub(crate) mod test {
                     .is_multiple_of(IPV4_FRAGMENT_PAYLOAD_ALIGNMENT)
             );
         }
+    }
+    // ===== Checksum offload =====
+
+    /// Which direction each `Checksum` variant covers.
+    #[test]
+    fn test_checksum_directions() {
+        assert!(Checksum::Both.rx() && Checksum::Both.tx());
+        assert!(Checksum::Rx.rx() && !Checksum::Rx.tx());
+        assert!(!Checksum::Tx.rx() && Checksum::Tx.tx());
+        assert!(!Checksum::None.rx() && !Checksum::None.tx());
+        // The default is doing everything in software.
+        assert_eq!(Checksum::default(), Checksum::Both);
+        assert_eq!(ChecksumCapabilities::default().udp, Checksum::Both);
+        assert_eq!(ChecksumCapabilities::ignored().udp, Checksum::None);
+    }
+
+    /// Corrupt the checksum field at `offset` of `packet`.
+    fn corrupt_checksum(packet: &mut [u8], offset: usize) {
+        packet[offset] ^= 0xff;
+        packet[offset + 1] ^= 0xff;
+    }
+
+    /// The checksum field at `offset` of `packet`.
+    fn checksum_at(packet: &[u8], offset: usize) -> u16 {
+        u16::from_be_bytes([packet[offset], packet[offset + 1]])
+    }
+
+    /// Offset of the checksum field within an IPv4 header, an ICMP message, and a
+    /// UDP or TCP header.
+    const IPV4_CHECKSUM: usize = 10;
+    const ICMP_CHECKSUM: usize = 2;
+    const UDP_CHECKSUM: usize = 6;
+    const TCP_CHECKSUM: usize = 16;
+
+    /// A device that verifies the IPv4 header checksum itself: a packet with a bad
+    /// one is processed anyway. With the default capabilities it is dropped.
+    #[test]
+    fn test_checksum_offload_rx_ipv4() {
+        let request = icmpv4_echo(Icmpv4Message::EchoRequest, 0x1234, 7, b"ping");
+        let mut packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &request);
+        corrupt_checksum(&mut packet, IPV4_CHECKSUM);
+
+        let caps = ChecksumCapabilities {
+            ipv4: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
+        inject(&mut stack, &rx, packet.clone());
+        assert_eq!(tx.borrow().len(), 1);
+
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        inject(&mut stack, &rx, packet);
+        assert!(tx.borrow().is_empty());
+    }
+
+    /// Same for the ICMPv4 checksum.
+    #[test]
+    fn test_checksum_offload_rx_icmpv4() {
+        let mut request = icmpv4_echo(Icmpv4Message::EchoRequest, 0x1234, 7, b"ping");
+        corrupt_checksum(&mut request, ICMP_CHECKSUM);
+        let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &request);
+
+        let caps = ChecksumCapabilities {
+            icmpv4: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
+        inject(&mut stack, &rx, packet.clone());
+        assert_eq!(tx.borrow().len(), 1);
+
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        inject(&mut stack, &rx, packet);
+        assert!(tx.borrow().is_empty());
+    }
+
+    /// Same for the ICMPv6 checksum.
+    #[test]
+    fn test_checksum_offload_rx_icmpv6() {
+        let mut request = icmpv6_echo(Icmpv6Message::EchoRequest, 0x1234, 7, b"ping", REMOTE_V6, OUR_V6);
+        corrupt_checksum(&mut request, ICMP_CHECKSUM);
+        let packet = ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol::Icmpv6, &request);
+
+        let caps = ChecksumCapabilities {
+            icmpv6: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
+        inject(&mut stack, &rx, packet.clone());
+        assert_eq!(tx.borrow().len(), 1);
+
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        inject(&mut stack, &rx, packet);
+        assert!(tx.borrow().is_empty());
+    }
+
+    /// Same for the UDP checksum: the datagram reaches the socket regardless.
+    #[test]
+    fn test_checksum_offload_rx_udp() {
+        let mut datagram = udp_datagram(REMOTE_V4.into(), 5000, OUR_V4.into(), 5000, b"hello");
+        corrupt_checksum(&mut datagram, UDP_CHECKSUM);
+        let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram);
+
+        let caps = ChecksumCapabilities {
+            udp: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, rx, _tx) = test_stack_with_checksum(Medium::Ip, caps);
+        let handle = stack.add_udp_socket().unwrap();
+        stack
+            .udp_socket(handle)
+            .bind(5000, IpListenEndpoint::UNSPECIFIED)
+            .unwrap();
+        inject(&mut stack, &rx, packet.clone());
+        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"hello");
+
+        let (mut stack, rx, _tx) = test_stack(Medium::Ip);
+        let handle = stack.add_udp_socket().unwrap();
+        stack
+            .udp_socket(handle)
+            .bind(5000, IpListenEndpoint::UNSPECIFIED)
+            .unwrap();
+        inject(&mut stack, &rx, packet);
+        assert!(!stack.udp_socket(handle).can_recv());
+    }
+
+    /// Same for the TCP checksum: a segment to no socket is answered with an RST
+    /// regardless, where the stack would otherwise have dropped it.
+    #[test]
+    fn test_checksum_offload_rx_tcp() {
+        let mut segment = {
+            let repr = TcpRepr {
+                src_port: 1234,
+                dst_port: 80,
+                control: TcpControl::Syn,
+                seq_number: TcpSeqNumber(0),
+                ack_number: None,
+                window_len: 1000,
+                window_scale: None,
+                max_seg_size: None,
+                sack_permitted: false,
+                sack_ranges: [None; 3],
+                #[cfg(feature = "tcp-timestamps")]
+                timestamp: None,
+                payload: &[],
+                payload2: &[],
+            };
+            let mut bytes = vec![0; repr.buffer_len()];
+            let mut packet = TcpPacket::new_unchecked(&mut bytes[..]);
+            repr.emit(
+                &mut packet,
+                &REMOTE_V4.into(),
+                &OUR_V4.into(),
+                &ChecksumCapabilities::default(),
+            );
+            bytes
+        };
+        corrupt_checksum(&mut segment, TCP_CHECKSUM);
+        let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Tcp, &segment);
+
+        let caps = ChecksumCapabilities {
+            tcp: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
+        inject(&mut stack, &rx, packet.clone());
+        assert_eq!(tx.borrow().len(), 1);
+
+        let (mut stack, rx, tx) = test_stack(Medium::Ip);
+        inject(&mut stack, &rx, packet);
+        assert!(tx.borrow().is_empty());
+    }
+
+    /// A device that computes the IPv4 header checksum itself gets the field
+    /// zeroed, not filled in.
+    #[test]
+    fn test_checksum_offload_tx_ipv4() {
+        let caps = ChecksumCapabilities {
+            ipv4: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, _rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
+        let handle = stack.add_udp_socket().unwrap();
+        stack.udp_socket(handle).bind(5000, (REMOTE_V4, 5000)).unwrap();
+        stack
+            .udp_socket(handle)
+            .send_slice(b"hello", (REMOTE_V4, 5000))
+            .unwrap();
+
+        let tx = tx.borrow();
+        assert_eq!(checksum_at(&tx[0], IPV4_CHECKSUM), 0);
+        // The UDP checksum is not offloaded, so it is still computed.
+        assert!(
+            UdpPacket::new_checked(&mut tx[0][IPV4_HEADER_LEN..].to_vec()[..])
+                .unwrap()
+                .verify_checksum(&REMOTE_V4.into(), &OUR_V4.into())
+        );
+    }
+
+    /// Same for the UDP checksum.
+    #[test]
+    fn test_checksum_offload_tx_udp() {
+        let caps = ChecksumCapabilities {
+            udp: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, _rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
+        let handle = stack.add_udp_socket().unwrap();
+        stack.udp_socket(handle).bind(5000, (REMOTE_V4, 5000)).unwrap();
+        stack
+            .udp_socket(handle)
+            .send_slice(b"hello", (REMOTE_V4, 5000))
+            .unwrap();
+
+        let tx = tx.borrow();
+        assert_eq!(checksum_at(&tx[0], IPV4_HEADER_LEN + UDP_CHECKSUM), 0);
+        // The IPv4 header checksum is not offloaded, so it is still computed.
+        assert!(
+            Ipv4Packet::new_checked(&mut tx[0].clone()[..])
+                .unwrap()
+                .verify_checksum()
+        );
+    }
+
+    /// Same for the TCP checksum, on the SYN a connect sends.
+    #[test]
+    fn test_checksum_offload_tx_tcp() {
+        let caps = ChecksumCapabilities {
+            tcp: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, _rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
+        let handle = stack
+            .add_tcp_socket_with_bufs(vec![0; 4096].leak(), vec![0; 4096].leak())
+            .unwrap();
+        stack.tcp_socket(handle).connect((REMOTE_V4, 80), 0).unwrap();
+        stack.poll(Instant::ZERO);
+
+        let tx = tx.borrow();
+        assert_eq!(tx.len(), 1);
+        assert_eq!(checksum_at(&tx[0], IPV4_HEADER_LEN + TCP_CHECKSUM), 0);
+    }
+
+    /// Same for the ICMPv4 checksum, on an echo reply (built in the request's own
+    /// buffer) and on an ICMP error (built from scratch).
+    #[test]
+    fn test_checksum_offload_tx_icmpv4() {
+        let caps = ChecksumCapabilities {
+            icmpv4: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
+
+        let request = icmpv4_echo(Icmpv4Message::EchoRequest, 0x1234, 7, b"ping");
+        inject(
+            &mut stack,
+            &rx,
+            ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &request),
+        );
+        assert_eq!(checksum_at(&tx.borrow()[0], IPV4_HEADER_LEN + ICMP_CHECKSUM), 0);
+        tx.borrow_mut().clear();
+
+        // A protocol unreachable error, quoting a packet of an unknown protocol.
+        inject(
+            &mut stack,
+            &rx,
+            ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol(0xfe), b"payload"),
+        );
+        assert_eq!(checksum_at(&tx.borrow()[0], IPV4_HEADER_LEN + ICMP_CHECKSUM), 0);
+    }
+
+    /// Same for the ICMPv6 checksum, on an echo reply and on a neighbor
+    /// solicitation the stack sends on its own.
+    #[test]
+    fn test_checksum_offload_tx_icmpv6() {
+        let caps = ChecksumCapabilities {
+            icmpv6: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
+        let request = icmpv6_echo(Icmpv6Message::EchoRequest, 0x1234, 7, b"ping", REMOTE_V6, OUR_V6);
+        inject(
+            &mut stack,
+            &rx,
+            ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol::Icmpv6, &request),
+        );
+        assert_eq!(checksum_at(&tx.borrow()[0], IPV6_HEADER_LEN + ICMP_CHECKSUM), 0);
+
+        // The neighbor solicitation an Ethernet interface sends to resolve a peer.
+        let (mut stack, _rx, tx) = test_stack_with_checksum(Medium::Ethernet, caps);
+        let handle = stack.add_udp_socket().unwrap();
+        stack.udp_socket(handle).bind(5000, (REMOTE_V6, 5000)).unwrap();
+        stack
+            .udp_socket(handle)
+            .send_slice(b"hello", (REMOTE_V6, 5000))
+            .unwrap();
+
+        let tx = tx.borrow();
+        assert_eq!(tx.len(), 1);
+        assert_eq!(
+            checksum_at(&tx[0], ETHERNET_HEADER_LEN + IPV6_HEADER_LEN + ICMP_CHECKSUM),
+            0
+        );
     }
 }

@@ -247,6 +247,7 @@ impl StackInner {
         // NOTE(unwrap): the fragmenter is not empty, checked by the caller.
         let ip_header_len = Ipv4Packet::new_unchecked(unwrap!(iface.fragmenter.buffer.as_mut())).header_len() as usize;
         let max_fragment_size = iface.max_ipv4_fragment_size(ip_header_len);
+        let checksum_caps = iface.checksum_caps();
 
         let frag = &mut iface.fragmenter;
         let payload_len = (frag.packet_len - frag.sent_bytes).min(max_fragment_size);
@@ -274,7 +275,11 @@ impl StackInner {
         packet.set_more_frags(more_frags);
         packet.set_dont_frag(false);
         packet.set_frag_offset(frag.ipv4.frag_offset);
-        packet.fill_checksum();
+        if checksum_caps.ipv4.tx() {
+            packet.fill_checksum();
+        } else {
+            packet.set_checksum(0);
+        }
 
         frag.sent_bytes += payload_len;
 

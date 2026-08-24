@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::vec::Vec;
 
 use xarxa::PacketBuf;
-use xarxa::iface::{IfaceCapabilities, Interface, Medium};
+use xarxa::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, Medium};
 #[cfg(feature = "packetmeta-id")]
 use xarxa::meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]
@@ -51,6 +51,8 @@ pub struct TestDevice {
     pub medium: Medium,
     /// The MTU it reports.
     pub mtu: usize,
+    /// The checksums it claims to compute and verify itself.
+    pub checksum: ChecksumCapabilities,
     /// Frames to hand to the stack, oldest first.
     pub rx: Queue,
     /// Frames the stack transmitted, oldest first.
@@ -78,6 +80,7 @@ impl TestDevice {
         Self {
             medium,
             mtu: 1500,
+            checksum: ChecksumCapabilities::default(),
             rx: Rc::new(RefCell::new(VecDeque::new())),
             tx: Rc::new(RefCell::new(Vec::new())),
             #[cfg(feature = "packetmeta-id")]
@@ -95,6 +98,12 @@ impl TestDevice {
     /// Sets the MTU it reports.
     pub fn with_mtu(mut self, mtu: usize) -> Self {
         self.mtu = mtu;
+        self
+    }
+
+    /// Sets the checksums it claims to compute and verify itself.
+    pub fn with_checksum(mut self, checksum: ChecksumCapabilities) -> Self {
+        self.checksum = checksum;
         self
     }
 
@@ -126,6 +135,7 @@ impl Interface for TestDevice {
         let mut caps = IfaceCapabilities::default();
         caps.medium = self.medium;
         caps.max_transmission_unit = self.mtu;
+        caps.checksum = self.checksum;
         caps
     }
 

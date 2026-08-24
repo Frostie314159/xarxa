@@ -7,6 +7,7 @@
 
 use core::fmt;
 
+use crate::iface::ChecksumCapabilities;
 use crate::wire::{Error, IpAddress, Result, TCP_HEADER_LEN, TcpControl, TcpOption, TcpPacket, TcpSeqNumber};
 
 /// A high-level representation of a Transmission Control Protocol packet.
@@ -187,7 +188,13 @@ impl<'a> TcpRepr<'a> {
     ///
     /// The buffer wrapped by `packet` must be exactly [`buffer_len`](Self::buffer_len)
     /// octets long.
-    pub fn emit(&self, packet: &mut TcpPacket<'_>, src_addr: &IpAddress, dst_addr: &IpAddress) {
+    pub fn emit(
+        &self,
+        packet: &mut TcpPacket<'_>,
+        src_addr: &IpAddress,
+        dst_addr: &IpAddress,
+        checksum_caps: &ChecksumCapabilities,
+    ) {
         packet.set_src_port(self.src_port);
         packet.set_dst_port(self.dst_port);
         packet.set_seq_number(self.seq_number);
@@ -238,7 +245,11 @@ impl<'a> TcpRepr<'a> {
         let payload = packet.payload_mut();
         payload[..self.payload.len()].copy_from_slice(self.payload);
         payload[self.payload.len()..].copy_from_slice(self.payload2);
-        packet.fill_checksum(src_addr, dst_addr)
+        if checksum_caps.tcp.tx() {
+            packet.fill_checksum(src_addr, dst_addr)
+        } else {
+            packet.set_checksum(0);
+        }
     }
 
     /// Return the length of the segment, in terms of sequence space.
@@ -327,7 +338,12 @@ mod test {
         let repr = packet_repr();
         let mut bytes = vec![0xa5; repr.buffer_len()];
         let mut packet = TcpPacket::new_unchecked(&mut bytes);
-        repr.emit(&mut packet, &SRC_ADDR.into(), &DST_ADDR.into());
+        repr.emit(
+            &mut packet,
+            &SRC_ADDR.into(),
+            &DST_ADDR.into(),
+            &ChecksumCapabilities::default(),
+        );
         assert_eq!(&bytes[..], &SYN_PACKET_BYTES[..]);
     }
 
@@ -339,7 +355,12 @@ mod test {
         repr.payload2 = &PAYLOAD_BYTES[3..];
         let mut bytes = vec![0xa5; repr.buffer_len()];
         let mut packet = TcpPacket::new_unchecked(&mut bytes);
-        repr.emit(&mut packet, &SRC_ADDR.into(), &DST_ADDR.into());
+        repr.emit(
+            &mut packet,
+            &SRC_ADDR.into(),
+            &DST_ADDR.into(),
+            &ChecksumCapabilities::default(),
+        );
         assert_eq!(&bytes[..], &SYN_PACKET_BYTES[..]);
     }
 

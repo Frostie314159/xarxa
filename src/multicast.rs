@@ -520,7 +520,14 @@ impl IfaceState<'_> {
         }
         // Send to the group being reported
         // [#183](https://github.com/m-labs/smoltcp/issues/183).
-        crate::stack::push_ipv4_header(&mut pkt, iface_addr, group_addr, IpProtocol::Igmp, 1);
+        crate::stack::push_ipv4_header(
+            &mut pkt,
+            iface_addr,
+            group_addr,
+            IpProtocol::Igmp,
+            1,
+            &self.checksum_caps(),
+        );
         Some(pkt)
     }
 
@@ -537,7 +544,14 @@ impl IfaceState<'_> {
             igmp_packet.set_group_address(group_addr);
             igmp_packet.fill_checksum();
         }
-        crate::stack::push_ipv4_header(&mut pkt, iface_addr, IPV4_MULTICAST_ALL_ROUTERS, IpProtocol::Igmp, 1);
+        crate::stack::push_ipv4_header(
+            &mut pkt,
+            iface_addr,
+            IPV4_MULTICAST_ALL_ROUTERS,
+            IpProtocol::Igmp,
+            1,
+            &self.checksum_caps(),
+        );
         Some(pkt)
     }
 
@@ -634,7 +648,11 @@ impl IfaceState<'_> {
                 record.set_mcast_addr(mcast_addr);
                 payload = &mut payload[MLD_ADDRESS_RECORD_LEN..];
             }
-            mld.fill_checksum(&src_addr, &dst_addr);
+            if self.checksum_caps().icmpv6.tx() {
+                mld.fill_checksum(&src_addr, &dst_addr);
+            } else {
+                mld.set_checksum(0);
+            }
         }
         push_mldv2_router_alert(&mut pkt);
 
@@ -677,7 +695,7 @@ mod test {
     use std::vec::Vec;
 
     use super::*;
-    use crate::iface::Medium;
+    use crate::iface::{Checksum, ChecksumCapabilities, Medium};
     use crate::stack::{IfaceHandle, Stack};
     use crate::test_device::{Queue, Sent, TestDevice};
 
@@ -693,7 +711,12 @@ mod test {
     /// [`OUR_LL`]/64 (plus, on Ethernet, the automatic link-local address, whose
     /// solicited-node group is the same as [`OUR_LL`]'s).
     fn test_stack(medium: Medium) -> (Stack<'static>, Queue, Sent) {
-        let dev = TestDevice::new(medium);
+        test_stack_with_checksum(medium, ChecksumCapabilities::default())
+    }
+
+    /// [`test_stack`], with a device that claims to handle the given checksums itself.
+    fn test_stack_with_checksum(medium: Medium, checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
+        let dev = TestDevice::new(medium).with_checksum(checksum);
         let (rx, tx) = (dev.rx.clone(), dev.tx.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let handle = dev.install(
@@ -1242,5 +1265,45 @@ mod test {
         stack.iface(IFACE).leave_multicast_group(group).unwrap();
         inject(&mut stack, &rx, medium, EthernetProtocol::Ipv4, packet, Instant::ZERO);
         assert!(stack.udp_socket(handle).recv().is_err());
+    }
+
+    /// A device that computes the IPv4 and ICMPv6 checksums itself gets those
+    /// fields zeroed. The IGMP checksum is not offloadable, so it is computed
+    /// either way.
+    #[test]
+    fn test_checksum_offload() {
+        let medium = Medium::Ip;
+        let caps = ChecksumCapabilities {
+            ipv4: Checksum::None,
+            icmpv6: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, _rx, tx) = test_stack_with_checksum(medium, caps);
+        stack.poll(Instant::ZERO);
+        tx.borrow_mut().clear();
+
+        stack
+            .iface(IFACE)
+            .join_multicast_group(Ipv4Address::new(224, 0, 0, 22))
+            .unwrap();
+        stack
+            .iface(IFACE)
+            .join_multicast_group(Ipv6Address::new(0xff05, 0, 0, 0, 0, 0, 0, 0x00fb))
+            .unwrap();
+        stack.poll(Instant::ZERO);
+
+        let packets = recv_all(medium, &tx);
+        assert_eq!(packets.len(), 2);
+
+        let mut igmp = packets[0].clone();
+        let mut ip = Ipv4Packet::new_checked(&mut igmp[..]).unwrap();
+        assert_eq!(ip.checksum(), 0);
+        assert!(IgmpPacket::new_checked(ip.payload_mut()).unwrap().verify_checksum());
+
+        let mut mld = packets[1].clone();
+        let ip = Ipv6Packet::new_checked(&mut mld[..]).unwrap();
+        assert_eq!(ip.next_header(), IpProtocol::HopByHop);
+        let icmp = Icmpv6Packet::new_checked(&mut mld[IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN..]).unwrap();
+        assert_eq!(icmp.checksum(), 0);
     }
 }

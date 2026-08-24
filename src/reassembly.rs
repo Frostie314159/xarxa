@@ -334,6 +334,9 @@ impl Stack<'_> {
         packet.set_total_len((header_len + payload_len) as u16);
         packet.set_more_frags(false);
         packet.set_frag_offset(0);
+        // Always computed, whatever the device offloads: the reassembled packet
+        // continues up the ingress path and is handed to raw sockets as-is, so its
+        // header has to describe itself correctly.
         packet.fill_checksum();
         Some(payload)
     }

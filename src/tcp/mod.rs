@@ -13,6 +13,7 @@ use crate::config::TCP_LISTENER_BACKLOG;
 use crate::config::TCP_SOCKET_COUNT;
 #[cfg(feature = "icmp-errors")]
 use crate::icmp_error::IcmpError;
+use crate::iface::ChecksumCapabilities;
 use crate::rand::Rand;
 use crate::stack::{EgressRoute, TxContext, alloc_ephemeral_port};
 use crate::storage::Slab;
@@ -2166,7 +2167,12 @@ impl<'d> TcpSocketState<'d> {
 /// Copy a TCP segment out of the socket state into a fresh packet buffer, with
 /// headroom reserved for the IP and Ethernet headers below it. `None` if the
 /// pool is empty.
-pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_addr: &IpAddress) -> Option<PacketBuf> {
+pub(crate) fn build_tcp_packet(
+    repr: &TcpRepr<'_>,
+    src_addr: &IpAddress,
+    dst_addr: &IpAddress,
+    checksum_caps: &ChecksumCapabilities,
+) -> Option<PacketBuf> {
     let ip_header_len = match dst_addr {
         #[cfg(feature = "ipv4")]
         IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
@@ -2177,7 +2183,7 @@ pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_add
     buf.reserve(LINK_HEADER_LEN + ip_header_len);
     buf.set_len(repr.buffer_len());
     let mut packet = TcpPacket::new_unchecked(&mut buf);
-    repr.emit(&mut packet, src_addr, dst_addr);
+    repr.emit(&mut packet, src_addr, dst_addr, checksum_caps);
     Some(buf)
 }
 
@@ -2239,7 +2245,7 @@ pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) 
                 trace!("device has no room for segment to {}, holding it back", dst_addr);
                 return Err(Blocked);
             }
-            let Some(buf) = build_tcp_packet(&repr, &src_addr, &dst_addr) else {
+            let Some(buf) = build_tcp_packet(&repr, &src_addr, &dst_addr, &cx.checksum_caps(route.iface)) else {
                 trace!("no packet buffer for segment to {}, holding it back", dst_addr);
                 return Err(Blocked);
             };
@@ -9940,8 +9946,21 @@ mod stack_test {
     /// Build a full IPv4+TCP packet from the remote to the local endpoint,
     /// checksums filled, ready for injection into the device RX queue.
     fn tcp_packet(repr: &TcpRepr) -> Vec<u8> {
-        let mut buf = build_tcp_packet(repr, &REMOTE_ADDR.into(), &LOCAL_ADDR.into()).unwrap();
-        crate::stack::push_ipv4_header(&mut buf, REMOTE_ADDR, LOCAL_ADDR, IpProtocol::Tcp, 64);
+        let mut buf = build_tcp_packet(
+            repr,
+            &REMOTE_ADDR.into(),
+            &LOCAL_ADDR.into(),
+            &ChecksumCapabilities::default(),
+        )
+        .unwrap();
+        crate::stack::push_ipv4_header(
+            &mut buf,
+            REMOTE_ADDR,
+            LOCAL_ADDR,
+            IpProtocol::Tcp,
+            64,
+            &ChecksumCapabilities::default(),
+        );
         buf.to_vec()
     }
 

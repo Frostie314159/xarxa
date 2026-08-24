@@ -129,6 +129,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - Packet metadata
   - Support for hardware timestamping on both RX and TX. Allows implementing protocols like PTP, NTP. (feature `packetmeta-timestamp`)
   - Opaque ID for correlating packets through the stack. (feature `packetmeta-id`)
+- Checksum offload: interfaces report which checksums they can validate/calculate and the stack skips them.
 
 ## Not yet implemented
 
@@ -141,7 +142,6 @@ All of the below is planned. Please open an issue or reach out on [the Matrix ch
 - IPv6 fragmentation and reassembly
 - TCP segmentation offload
 - TCP SACK
-- Checksum offload
 - Store sockets on a hashmap so packet dispatch is O(1) instead of O(n). (would be optional with a Cargo feature, it's only worth if you have thousands of sockets, i.e. not on embedded)
 - Maybe multithreading. Would require per-socket mutexes etc. (again, optional, would require std)
 
