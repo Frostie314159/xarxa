@@ -3406,12 +3406,8 @@ fn ndisc_lladdr_option(
     feature = "tcp"
 ))]
 pub(crate) mod test {
-    use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
-    use std::rc::Rc;
 
     use super::*;
-    use crate::iface::IfaceCapabilities;
     use crate::neighbor::MAX_MULTICAST_SOLICIT;
     use crate::raw::RawMode;
     #[cfg(feature = "slaac")]
@@ -3419,6 +3415,7 @@ pub(crate) mod test {
     #[cfg(feature = "slaac")]
     use crate::slaac::{SlaacConfig, SlaacState};
     use crate::tcp::State as TcpState;
+    use crate::test_device::{Queue, Room, Sent, TestDevice};
     use crate::time::Duration;
     use crate::udp::RecvError as UdpRecvError;
     #[allow(unused_imports)]
@@ -3440,55 +3437,11 @@ pub(crate) mod test {
         assert_eq!(alloc_ephemeral_port(&mut rand, |_| true), None);
     }
 
-    /// A mock device: receives injected packets, records transmitted frames.
-    /// `room` limits how many more frames it accepts (`None`: unlimited).
-    pub(crate) struct TestDevice {
-        pub(crate) medium: Medium,
-        pub(crate) mtu: usize,
-        pub(crate) rx: Rc<RefCell<VecDeque<Vec<u8>>>>,
-        pub(crate) tx: Rc<RefCell<Vec<Vec<u8>>>>,
-        pub(crate) room: Room,
-    }
-
-    pub(crate) type Room = Rc<Cell<Option<usize>>>;
-
-    impl Interface for TestDevice {
-        fn capabilities(&self) -> IfaceCapabilities {
-            IfaceCapabilities {
-                medium: self.medium,
-                max_transmission_unit: self.mtu,
-            }
-        }
-        fn receive(&mut self) -> Option<PacketBuf> {
-            let bytes = self.rx.borrow_mut().pop_front()?;
-            let mut buf = PacketBuf::try_new().unwrap();
-            buf.set_len(bytes.len());
-            buf.copy_from_slice(&bytes);
-            Some(buf)
-        }
-        fn can_transmit(&mut self) -> bool {
-            self.room.get().is_none_or(|room| room > 0)
-        }
-        fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
-            if !self.can_transmit() {
-                return Err(buf);
-            }
-            if let Some(room) = self.room.get() {
-                self.room.set(Some(room - 1));
-            }
-            self.tx.borrow_mut().push(buf.to_vec());
-            Ok(())
-        }
-    }
-
     const OUR_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
     const OUR_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
     const REMOTE_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
     const OUR_V6: Ipv6Address = Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 1);
     const REMOTE_V6: Ipv6Address = Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 2);
-
-    pub(crate) type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
-    pub(crate) type Sent = Rc<RefCell<Vec<Vec<u8>>>>;
 
     /// A stack with one interface of the given medium, owning [`OUR_V4`]/24 and
     /// [`OUR_V6`]/64.
@@ -3504,27 +3457,18 @@ pub(crate) mod test {
 
     /// [`test_stack_with_room`], with a device of the given MTU.
     fn test_stack_with_mtu(medium: Medium, mtu: usize) -> (Stack<'static>, Queue, Sent, Room) {
-        let rx = Rc::new(RefCell::new(VecDeque::new()));
-        let tx = Rc::new(RefCell::new(Vec::new()));
-        let room = Rc::new(Cell::new(None));
+        let dev = TestDevice::new(medium).with_mtu(mtu);
+        let (rx, tx, room) = (dev.rx.clone(), dev.tx.clone(), dev.room.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack
-            .add_iface_borrowed(
-                Box::leak(Box::new(TestDevice {
-                    medium,
-                    mtu,
-                    rx: rx.clone(),
-                    tx: tx.clone(),
-                    room: room.clone(),
-                })),
-                match medium {
-                    Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
-                    Medium::Ip => HardwareAddress::Ip,
-                    #[cfg(feature = "medium-ieee802154")]
-                    Medium::Ieee802154 => HardwareAddress::Ieee802154(Ieee802154Address::Extended([0x02; 8])),
-                },
-            )
-            .unwrap();
+        let handle = dev.install(
+            &mut stack,
+            match medium {
+                Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
+                Medium::Ip => HardwareAddress::Ip,
+                #[cfg(feature = "medium-ieee802154")]
+                Medium::Ieee802154 => HardwareAddress::Ieee802154(Ieee802154Address::Extended([0x02; 8])),
+            },
+        );
         stack
             .iface(handle)
             .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)])
@@ -3959,20 +3903,9 @@ pub(crate) mod test {
         let mut rxs = Vec::new();
         let mut txs = Vec::new();
         for addr in [IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V4_B.into(), 24)] {
-            let rx = Rc::new(RefCell::new(VecDeque::new()));
-            let tx = Rc::new(RefCell::new(Vec::new()));
-            let handle = stack
-                .add_iface_borrowed(
-                    Box::leak(Box::new(TestDevice {
-                        medium: Medium::Ip,
-                        mtu: 1500,
-                        rx: rx.clone(),
-                        tx: tx.clone(),
-                        room: Rc::new(Cell::new(None)),
-                    })),
-                    HardwareAddress::Ip,
-                )
-                .unwrap();
+            let dev = TestDevice::new(Medium::Ip);
+            let (rx, tx) = (dev.rx.clone(), dev.tx.clone());
+            let handle = dev.install(&mut stack, HardwareAddress::Ip);
             stack
                 .iface(handle)
                 .set_ip_addrs([addr, IpCidr::new(LINK_LOCAL_V6.into(), 64)])
@@ -4400,62 +4333,17 @@ pub(crate) mod test {
         const RX_STAMP: Timestamp = Timestamp::from_seconds_and_nanos(4, 500);
         const TX_STAMP: Timestamp = Timestamp::from_seconds_and_nanos(9, 250);
 
-        /// A device that timestamps everything it receives and everything it is asked
-        /// to timestamp on transmit.
-        struct PtpDevice {
-            rx: Queue,
-            sent: Rc<RefCell<Vec<PacketMeta>>>,
-            tx_stamps: Rc<RefCell<VecDeque<TxTimestamp>>>,
-        }
-
-        impl Interface for PtpDevice {
-            fn capabilities(&self) -> IfaceCapabilities {
-                IfaceCapabilities {
-                    medium: Medium::Ip,
-                    max_transmission_unit: 1500,
-                }
-            }
-            fn receive(&mut self) -> Option<PacketBuf> {
-                let bytes = self.rx.borrow_mut().pop_front()?;
-                let mut buf = PacketBuf::try_new().unwrap();
-                buf.set_len(bytes.len());
-                buf.copy_from_slice(&bytes);
-                buf.meta_mut().id = 0x1111;
-                buf.meta_mut().timestamp = Some(RX_STAMP);
-                Some(buf)
-            }
-            fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
-                let meta = buf.meta();
-                self.sent.borrow_mut().push(meta);
-                if meta.request_timestamp {
-                    self.tx_stamps.borrow_mut().push_back(TxTimestamp {
-                        id: meta.id,
-                        timestamp: TX_STAMP,
-                    });
-                }
-                Ok(())
-            }
-            fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
-                self.tx_stamps.borrow_mut().pop_front()
-            }
-            fn can_transmit(&mut self) -> bool {
-                true
-            }
-        }
-
-        let rx = Rc::new(RefCell::new(VecDeque::new()));
-        let sent = Rc::new(RefCell::new(Vec::new()));
+        // A device that timestamps everything it receives, and everything it is
+        // asked to timestamp on transmit.
+        let mut rx_meta = PacketMeta::default();
+        rx_meta.id = 0x1111;
+        rx_meta.timestamp = Some(RX_STAMP);
+        let dev = TestDevice::new(Medium::Ip)
+            .with_rx_meta(rx_meta)
+            .with_tx_stamp(TX_STAMP);
+        let (rx, sent) = (dev.rx.clone(), dev.tx_meta.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = stack
-            .add_iface_borrowed(
-                Box::leak(Box::new(PtpDevice {
-                    rx: rx.clone(),
-                    sent: sent.clone(),
-                    tx_stamps: Rc::new(RefCell::new(VecDeque::new())),
-                })),
-                HardwareAddress::Ip,
-            )
-            .unwrap();
+        let iface = dev.install(&mut stack, HardwareAddress::Ip);
         stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
 
         let handle = stack.add_udp_socket().unwrap();

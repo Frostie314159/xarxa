@@ -7,6 +7,11 @@
 #[cfg(any(feature = "alloc", test))]
 extern crate alloc;
 
+// So that `src/test_device.rs` can name this crate as `xarxa` both here and in the
+// integration tests that `#[path]`-include it.
+#[cfg(test)]
+extern crate self as xarxa;
+
 #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ip", feature = "medium-ieee802154")))]
 compile_error!("You must enable at least one of the following features: medium-ethernet, medium-ip, medium-ieee802154");
 
@@ -67,6 +72,8 @@ pub mod stack;
 mod storage;
 #[cfg(feature = "tcp")]
 pub mod tcp;
+#[cfg(test)]
+mod test_device;
 pub mod time;
 #[cfg(feature = "udp")]
 pub mod udp;

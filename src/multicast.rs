@@ -674,47 +674,12 @@ fn push_mldv2_router_alert(buf: &mut PacketBuf) {
     feature = "ipv6"
 ))]
 mod test {
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
-    use std::rc::Rc;
     use std::vec::Vec;
 
     use super::*;
-    use crate::iface::{IfaceCapabilities, Interface, Medium};
+    use crate::iface::Medium;
     use crate::stack::{IfaceHandle, Stack};
-
-    type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
-    type Sent = Rc<RefCell<Vec<Vec<u8>>>>;
-
-    /// A mock device: receives injected packets, records transmitted frames.
-    struct TestDevice {
-        medium: Medium,
-        rx: Queue,
-        tx: Sent,
-    }
-
-    impl Interface for TestDevice {
-        fn capabilities(&self) -> IfaceCapabilities {
-            IfaceCapabilities {
-                medium: self.medium,
-                max_transmission_unit: 1500,
-            }
-        }
-        fn receive(&mut self) -> Option<PacketBuf> {
-            let bytes = self.rx.borrow_mut().pop_front()?;
-            let mut buf = PacketBuf::try_new().unwrap();
-            buf.set_len(bytes.len());
-            buf.copy_from_slice(&bytes);
-            Some(buf)
-        }
-        fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
-            self.tx.borrow_mut().push(buf.to_vec());
-            Ok(())
-        }
-        fn can_transmit(&mut self) -> bool {
-            true
-        }
-    }
+    use crate::test_device::{Queue, Sent, TestDevice};
 
     const OUR_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
     const REMOTE_HW: EthernetAddress = EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]);
@@ -728,24 +693,18 @@ mod test {
     /// [`OUR_LL`]/64 (plus, on Ethernet, the automatic link-local address, whose
     /// solicited-node group is the same as [`OUR_LL`]'s).
     fn test_stack(medium: Medium) -> (Stack<'static>, Queue, Sent) {
-        let rx = Rc::new(RefCell::new(VecDeque::new()));
-        let tx = Rc::new(RefCell::new(Vec::new()));
+        let dev = TestDevice::new(medium);
+        let (rx, tx) = (dev.rx.clone(), dev.tx.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack
-            .add_iface_borrowed(
-                Box::leak(Box::new(TestDevice {
-                    medium,
-                    rx: rx.clone(),
-                    tx: tx.clone(),
-                })),
-                match medium {
-                    Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
-                    Medium::Ip => HardwareAddress::Ip,
-                    #[cfg(feature = "medium-ieee802154")]
-                    Medium::Ieee802154 => unreachable!(),
-                },
-            )
-            .unwrap();
+        let handle = dev.install(
+            &mut stack,
+            match medium {
+                Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
+                Medium::Ip => HardwareAddress::Ip,
+                #[cfg(feature = "medium-ieee802154")]
+                Medium::Ieee802154 => unreachable!(),
+            },
+        );
         assert_eq!(handle, IFACE);
         stack
             .iface(handle)

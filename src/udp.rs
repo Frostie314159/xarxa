@@ -962,8 +962,9 @@ pub(crate) fn process_icmp_error(
 #[cfg(all(test, feature = "medium-ip", feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
-    use crate::iface::{IfaceCapabilities, Interface, Medium};
+    use crate::iface::Medium;
     use crate::stack::Stack;
+    use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
     fn stack_with_socket() -> (Stack<'static>, UdpHandle) {
@@ -981,37 +982,11 @@ mod test {
     /// The fully wildcard remote: an ordinary unconnected bind.
     const ANY: IpListenEndpoint = IpListenEndpoint::UNSPECIFIED;
 
-    /// A device that swallows every frame the stack transmits.
-    struct TestingDevice;
-
-    impl Interface for TestingDevice {
-        fn capabilities(&self) -> IfaceCapabilities {
-            IfaceCapabilities {
-                medium: Medium::Ip,
-                max_transmission_unit: 1500,
-            }
-        }
-
-        fn receive(&mut self) -> Option<PacketBuf> {
-            None
-        }
-
-        fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
-            Ok(())
-        }
-
-        fn can_transmit(&mut self) -> bool {
-            true
-        }
-    }
-
     /// A stack with one interface owning `LOCAL_ADDR`, so that binds with a
     /// specified remote can resolve their local address.
     fn stack_with_iface() -> Stack<'static> {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack
-            .add_iface_borrowed(Box::leak(Box::new(TestingDevice)), HardwareAddress::Ip)
-            .unwrap();
+        let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
             .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
@@ -1403,36 +1378,10 @@ mod test {
     #[cfg(feature = "packetmeta-id")]
     #[test]
     fn test_packet_meta() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        /// A device that records the metadata of every frame it is handed.
-        struct MetaDevice(Rc<RefCell<Vec<PacketMeta>>>);
-
-        impl Interface for MetaDevice {
-            fn capabilities(&self) -> IfaceCapabilities {
-                IfaceCapabilities {
-                    medium: Medium::Ip,
-                    max_transmission_unit: 1500,
-                }
-            }
-            fn receive(&mut self) -> Option<PacketBuf> {
-                None
-            }
-            fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
-                self.0.borrow_mut().push(buf.meta());
-                Ok(())
-            }
-            fn can_transmit(&mut self) -> bool {
-                true
-            }
-        }
-
-        let sent = Rc::new(RefCell::new(Vec::new()));
+        let dev = TestDevice::new(Medium::Ip);
+        let sent = dev.tx_meta.clone();
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = stack
-            .add_iface_borrowed(Box::leak(Box::new(MetaDevice(sent.clone()))), HardwareAddress::Ip)
-            .unwrap();
+        let iface = dev.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
             .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))

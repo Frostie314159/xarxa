@@ -836,49 +836,16 @@ fn parse_u32(data: &[u8]) -> Option<u32> {
 
 #[cfg(test)]
 mod test {
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
-    use std::rc::Rc;
     use std::vec::Vec;
 
     use super::*;
-    use crate::iface::{IfaceCapabilities, Interface, Medium};
+    use crate::iface::Medium;
     use crate::stack::{IfaceHandle, Stack};
+    use crate::test_device::{Queue, Sent, TestDevice};
     use crate::wire::{
         ArpPacket, DhcpOpCode, ETHERNET_HEADER_LEN, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress,
         IpProtocol, Ipv4Packet,
     };
-
-    type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
-    type Sent = Rc<RefCell<Vec<Vec<u8>>>>;
-
-    struct TestDevice {
-        rx: Queue,
-        tx: Sent,
-    }
-
-    impl Interface for TestDevice {
-        fn capabilities(&self) -> IfaceCapabilities {
-            IfaceCapabilities {
-                medium: Medium::Ethernet,
-                max_transmission_unit: 1500,
-            }
-        }
-        fn receive(&mut self) -> Option<PacketBuf> {
-            let bytes = self.rx.borrow_mut().pop_front()?;
-            let mut buf = PacketBuf::try_new().unwrap();
-            buf.set_len(bytes.len());
-            buf.copy_from_slice(&bytes);
-            Some(buf)
-        }
-        fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
-            self.tx.borrow_mut().push(buf.to_vec());
-            Ok(())
-        }
-        fn can_transmit(&mut self) -> bool {
-            true
-        }
-    }
 
     const OUR_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
     const SERVER_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
@@ -890,18 +857,10 @@ mod test {
 
     /// A stack with one Ethernet interface, no addresses, DHCP on.
     fn test_stack() -> (Stack<'static>, Queue, Sent) {
-        let rx = Rc::new(RefCell::new(VecDeque::new()));
-        let tx = Rc::new(RefCell::new(Vec::new()));
+        let dev = TestDevice::new(Medium::Ethernet);
+        let (rx, tx) = (dev.rx.clone(), dev.tx.clone());
         let mut stack = Stack::new(1);
-        let handle = stack
-            .add_iface_borrowed(
-                Box::leak(Box::new(TestDevice {
-                    rx: rx.clone(),
-                    tx: tx.clone(),
-                })),
-                HardwareAddress::Ethernet(OUR_HW),
-            )
-            .unwrap();
+        let handle = dev.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         assert_eq!(handle, IFACE);
         // Drain the solicited-node multicast report the link-local address triggers,
         // so the tests only see the frames DHCP provokes.

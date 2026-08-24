@@ -950,14 +950,11 @@ impl StackInner {
     allow(unused_imports, dead_code)
 )]
 mod test {
-    use std::cell::{Cell, RefCell};
-    use std::collections::VecDeque;
-    use std::rc::Rc;
-
     use super::*;
     use crate::iface::Medium;
-    use crate::stack::test::{Queue, Room, Sent, TestDevice, icmpv6_echo, inject, ipv6_packet, udp_datagram};
+    use crate::stack::test::{icmpv6_echo, inject, ipv6_packet, udp_datagram};
     use crate::stack::{AddrOrigin, IfaceHandle};
+    use crate::test_device::{Queue, Room, Sent, TestDevice};
     use crate::time::{Duration, Instant};
     use crate::udp::{RecvError, SendError};
     use std::vec::Vec;
@@ -989,22 +986,10 @@ mod test {
         hw: Ieee802154Address,
         pan_id: Option<Ieee802154Pan>,
     ) -> (Stack<'static>, IfaceHandle, Queue, Sent, Room) {
-        let rx = Rc::new(RefCell::new(VecDeque::new()));
-        let tx = Rc::new(RefCell::new(Vec::new()));
-        let room = Rc::new(Cell::new(None));
+        let dev = TestDevice::new(Medium::Ieee802154).with_mtu(MTU);
+        let (rx, tx, room) = (dev.rx.clone(), dev.tx.clone(), dev.room.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack
-            .add_iface_borrowed(
-                Box::leak(Box::new(TestDevice {
-                    medium: Medium::Ieee802154,
-                    mtu: MTU,
-                    rx: rx.clone(),
-                    tx: tx.clone(),
-                    room: room.clone(),
-                })),
-                HardwareAddress::Ieee802154(hw),
-            )
-            .unwrap();
+        let handle = dev.install(&mut stack, HardwareAddress::Ieee802154(hw));
         stack.iface(handle).set_pan_id(pan_id);
         // Drain the solicited-node multicast reports the link-local address
         // triggers, so the tests only see the frames they provoke.

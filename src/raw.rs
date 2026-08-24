@@ -632,59 +632,27 @@ impl Stack<'_> {
     feature = "ipv6"
 ))]
 mod test {
-    use std::cell::RefCell;
-    use std::rc::Rc;
 
     use super::*;
-    use crate::iface::{IfaceCapabilities, Interface};
     use crate::stack::Stack;
+    use crate::test_device::{Sent, TestDevice};
     use crate::wire::{
         ETHERNET_HEADER_LEN, EthernetAddress, HardwareAddress, IPV4_HEADER_LEN, IPV6_HEADER_LEN, IpCidr, Ipv4Address,
         Ipv6Address,
     };
 
-    /// A mock device: never receives, records transmitted frames.
-    struct TestDevice {
-        medium: Medium,
-        tx: Rc<RefCell<Vec<Vec<u8>>>>,
-    }
-
-    impl Interface for TestDevice {
-        fn capabilities(&self) -> IfaceCapabilities {
-            IfaceCapabilities {
-                medium: self.medium,
-                max_transmission_unit: 1500,
-            }
-        }
-        fn receive(&mut self) -> Option<PacketBuf> {
-            None
-        }
-        fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
-            self.tx.borrow_mut().push(buf.to_vec());
-            Ok(())
-        }
-        fn can_transmit(&mut self) -> bool {
-            true
-        }
-    }
-
-    fn add_test_iface(
-        stack: &mut Stack,
-        medium: Medium,
-        ip_addrs: Vec<IpCidr>,
-    ) -> (IfaceHandle, Rc<RefCell<Vec<Vec<u8>>>>) {
-        let tx = Rc::new(RefCell::new(Vec::new()));
-        let handle = stack
-            .add_iface_borrowed(
-                Box::leak(Box::new(TestDevice { medium, tx: tx.clone() })),
-                match medium {
-                    Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
-                    Medium::Ip => HardwareAddress::Ip,
-                    #[cfg(feature = "medium-ieee802154")]
-                    Medium::Ieee802154 => unreachable!(),
-                },
-            )
-            .unwrap();
+    fn add_test_iface(stack: &mut Stack, medium: Medium, ip_addrs: Vec<IpCidr>) -> (IfaceHandle, Sent) {
+        let dev = TestDevice::new(medium);
+        let tx = dev.tx.clone();
+        let handle = dev.install(
+            stack,
+            match medium {
+                Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
+                Medium::Ip => HardwareAddress::Ip,
+                #[cfg(feature = "medium-ieee802154")]
+                Medium::Ieee802154 => unreachable!(),
+            },
+        );
         stack.iface(handle).set_ip_addrs(ip_addrs).unwrap();
         (handle, tx)
     }
@@ -941,36 +909,13 @@ mod test {
     #[cfg(feature = "packetmeta-id")]
     #[test]
     fn test_packet_meta() {
-        /// A device that records the metadata of every frame it is handed.
-        struct MetaDevice(Rc<RefCell<Vec<PacketMeta>>>);
-
-        impl Interface for MetaDevice {
-            fn capabilities(&self) -> IfaceCapabilities {
-                IfaceCapabilities {
-                    medium: Medium::Ethernet,
-                    max_transmission_unit: 1500,
-                }
-            }
-            fn receive(&mut self) -> Option<PacketBuf> {
-                None
-            }
-            fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
-                self.0.borrow_mut().push(buf.meta());
-                Ok(())
-            }
-            fn can_transmit(&mut self) -> bool {
-                true
-            }
-        }
-
-        let sent = Rc::new(RefCell::new(Vec::new()));
+        let dev = TestDevice::new(Medium::Ethernet);
+        let sent = dev.tx_meta.clone();
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = stack
-            .add_iface_borrowed(
-                Box::leak(Box::new(MetaDevice(sent.clone()))),
-                HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
-            )
-            .unwrap();
+        let iface = dev.install(
+            &mut stack,
+            HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
+        );
 
         let handle = stack.add_raw_socket().unwrap();
         stack

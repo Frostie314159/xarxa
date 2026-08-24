@@ -1,38 +1,24 @@
 //! This is an integration test rather than a unit test because it has to own the
 //! whole pool, and unit tests run in parallel threads of one process
 
-use xarxa::iface::{IfaceCapabilities, Interface, Medium};
+use xarxa::iface::Medium;
 use xarxa::udp::SendError;
 use xarxa::wire::{HardwareAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use xarxa::{PacketBuf, Stack};
 
-/// A device that receives nothing and drops (frees) whatever it is given.
-struct NullDevice;
+use test_device::TestDevice;
 
-impl Interface for NullDevice {
-    fn capabilities(&self) -> IfaceCapabilities {
-        let mut caps = IfaceCapabilities::default();
-        caps.medium = Medium::Ip;
-        caps.max_transmission_unit = 1500;
-        caps
-    }
-    fn receive(&mut self) -> Option<PacketBuf> {
-        None
-    }
-    fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
-        Ok(())
-    }
-    fn can_transmit(&mut self) -> bool {
-        true
-    }
-}
+// The mock device the library's own unit tests use. It lives in `src/` so that both
+// can share it; it is written against the public API, so including it here works.
+#[path = "../src/test_device.rs"]
+mod test_device;
 
 /// One test function, so that every step runs in order on the one pool.
 #[test]
 fn exhaustion() {
-    let mut dev = NullDevice;
     let mut stack = Stack::new(0x1234_5678_dead_beef);
-    let iface = stack.add_iface_borrowed(&mut dev, HardwareAddress::Ip).unwrap();
+    // The device copies out and drops (frees) whatever it is given.
+    let iface = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
     stack
         .iface(iface)
         .add_ip_addr(IpCidr::new(Ipv4Address::new(192, 168, 1, 1).into(), 24))
