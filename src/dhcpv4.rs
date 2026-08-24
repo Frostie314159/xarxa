@@ -683,6 +683,7 @@ impl IfaceState<'_> {
                 let addr = IfaceAddr {
                     cidr,
                     origin: AddrOrigin::Dhcpv4,
+                    preferred_until: None,
                 };
                 if self.ip_addrs.push(addr).is_err() {
                     warn!("dhcp: address table full, {} not assigned", cidr);
@@ -992,7 +993,8 @@ mod test {
             ipv4_addrs(&mut stack),
             &[IfaceAddr {
                 cidr: IpCidr::new(OFFERED_IP.into(), 24),
-                origin: AddrOrigin::Dhcpv4
+                origin: AddrOrigin::Dhcpv4,
+                preferred_until: None
             }]
         );
         let route = stack.routes().get_default_ipv4_route().unwrap();

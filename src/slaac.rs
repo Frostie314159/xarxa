@@ -439,13 +439,26 @@ impl IfaceState<'_> {
             let Some(address) = from_link_prefix(prefix, ethernet_addr) else {
                 continue;
             };
-            if !self.ip_addrs.iter().any(|a| a.cidr == IpCidr::Ipv6(address)) {
-                let new_addr = IfaceAddr {
-                    cidr: IpCidr::Ipv6(address),
-                    origin: AddrOrigin::Slaac,
-                };
-                if self.ip_addrs.push(new_addr).is_err() {
-                    warn!("slaac: address table full, {} not assigned", address);
+            match self.ip_addrs.iter_mut().find(|a| a.cidr == IpCidr::Ipv6(address)) {
+                // One we installed: refresh it rather than leave it behind. The router
+                // shortens a prefix's preferred lifetime to retire it, and the address
+                // formed from it has to follow, or nothing downstream can tell that it
+                // is on its way out.
+                Some(existing) if existing.origin == AddrOrigin::Slaac => {
+                    existing.preferred_until = Some(prefixinfo.preferred_until);
+                }
+                // Somebody else's, and it only happens to be the address this prefix
+                // forms. Not ours to deprecate: the expiry below leaves it alone too.
+                Some(_) => {}
+                None => {
+                    let new_addr = IfaceAddr {
+                        cidr: IpCidr::Ipv6(address),
+                        origin: AddrOrigin::Slaac,
+                        preferred_until: Some(prefixinfo.preferred_until),
+                    };
+                    if self.ip_addrs.push(new_addr).is_err() {
+                        warn!("slaac: address table full, {} not assigned", address);
+                    }
                 }
             }
         }

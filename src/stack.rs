@@ -78,11 +78,19 @@ pub enum AddrOrigin {
 /// An IP address assigned to an interface.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IfaceAddr {
     /// The address and its prefix.
     pub cidr: IpCidr,
     /// Where the address came from.
     pub origin: AddrOrigin,
+    /// When the address stops being preferred and becomes deprecated
+    /// (RFC 4862 section 5.5.4). `None` means "forever".
+    ///
+    /// Only SLAAC sets this: a router advertises a preferred lifetime alongside
+    /// the valid one, and shortens it to zero to signal that a prefix is on its
+    /// way out while addresses formed from it still work.
+    pub preferred_until: Option<Instant>,
 }
 
 impl IfaceAddr {
@@ -91,7 +99,16 @@ impl IfaceAddr {
         Self {
             cidr,
             origin: AddrOrigin::Manual,
+            preferred_until: None,
         }
+    }
+
+    /// Whether the address is still preferred, i.e. not deprecated.
+    ///
+    /// A deprecated address keeps working for connections that already use it,
+    /// but is avoided when a source address is chosen for a new one.
+    pub fn is_preferred(&self, now: Instant) -> bool {
+        self.preferred_until.is_none_or(|until| until > now)
     }
 }
 
@@ -111,6 +128,7 @@ fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAddr> {
     Some(IfaceAddr {
         cidr: IpCidr::new(Ipv6Address::from(bytes).into(), 64),
         origin: AddrOrigin::LinkLocal,
+        preferred_until: None,
     })
 }
 
@@ -479,14 +497,18 @@ impl TxContext<'_, '_> {
     #[cfg(any(feature = "udp", feature = "tcp"))]
     pub(crate) fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
         let route = self.route(dst_addr)?;
-        self.ifaces.get(route.iface.index()).get_source_address(dst_addr)
+        self.ifaces
+            .get(route.iface.index())
+            .get_source_address(dst_addr, self.inner.now)
     }
 
     /// A source address for sending to `dst_addr` out of the interface `route`
     /// names.
     #[cfg(feature = "udp")]
     pub(crate) fn get_source_address_routed(&self, route: &EgressRoute, dst_addr: &IpAddress) -> Option<IpAddress> {
-        self.ifaces.get(route.iface.index()).get_source_address(dst_addr)
+        self.ifaces
+            .get(route.iface.index())
+            .get_source_address(dst_addr, self.inner.now)
     }
 
     /// Whether the interface can take one more frame right now.
@@ -1880,7 +1902,9 @@ impl<'d> Stack<'d> {
                 let reply_src = if dst_addr.x_is_unicast() {
                     dst_addr
                 } else {
-                    self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
+                    self.ifaces
+                        .get(iface.index())
+                        .get_source_address_ipv6(&src_addr, self.inner.now)
                 };
 
                 let Some(mut reply) = PacketBuf::try_new() else {
@@ -2050,7 +2074,10 @@ impl<'d> Stack<'d> {
                 if !src_addr.x_is_unicast() {
                     return;
                 }
-                let reply_src = self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr);
+                let reply_src = self
+                    .ifaces
+                    .get(iface.index())
+                    .get_source_address_ipv6(&src_addr, self.inner.now);
                 let Some(mut reply) = build_icmpv6_error(
                     &orig,
                     &reply_src,
@@ -2134,7 +2161,9 @@ impl<'d> Stack<'d> {
         let reply_src = if dst_addr.x_is_unicast() {
             dst_addr
         } else {
-            self.ifaces.get(iface.index()).get_source_address_ipv6(&src_addr)
+            self.ifaces
+                .get(iface.index())
+                .get_source_address_ipv6(&src_addr, self.inner.now)
         };
         let Some(reply) = build_icmpv6_error(orig, &reply_src, &src_addr, msg_type, msg_code, pointer) else {
             return;
@@ -2476,7 +2505,7 @@ impl StackInner {
 
     #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
     fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv6Address) {
-        let src_addr = iface.get_source_address_ipv6(&target_addr);
+        let src_addr = iface.get_source_address_ipv6(&target_addr, self.now);
         let dst_addr = target_addr.solicited_node();
 
         // Neighbor solicit: NS header (24 bytes) plus the source link-layer
@@ -2886,12 +2915,12 @@ impl IfaceState<'_> {
 
     /// Get a source address for the given destination address.
     #[cfg(any(feature = "udp", feature = "tcp"))]
-    fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
+    fn get_source_address(&self, dst_addr: &IpAddress, #[allow(unused)] now: Instant) -> Option<IpAddress> {
         match dst_addr {
             #[cfg(feature = "ipv4")]
             IpAddress::Ipv4(addr) => self.get_source_address_ipv4(addr).map(IpAddress::Ipv4),
             #[cfg(feature = "ipv6")]
-            IpAddress::Ipv6(addr) => Some(IpAddress::Ipv6(self.get_source_address_ipv6(addr))),
+            IpAddress::Ipv6(addr) => Some(IpAddress::Ipv6(self.get_source_address_ipv6(addr, now))),
         }
     }
 
@@ -2981,7 +3010,7 @@ impl IfaceState<'_> {
     /// # Panics
     /// This function panics if the destination address is unspecified.
     #[cfg(feature = "ipv6")]
-    fn get_source_address_ipv6(&self, dst_addr: &Ipv6Address) -> Ipv6Address {
+    fn get_source_address_ipv6(&self, dst_addr: &Ipv6Address, now: Instant) -> Ipv6Address {
         assert!(!dst_addr.is_unspecified());
 
         // See RFC 6724 Section 4: Candidate source address
@@ -3028,57 +3057,70 @@ impl IfaceState<'_> {
             bits as usize
         }
 
-        // If the destination address is a loopback address, or when there are no IPv6 addresses in
-        // the interface, then the loopback address is the only candidate source address.
-        if dst_addr.is_loopback() || self.cidrs().filter(|a| matches!(a, IpCidr::Ipv6(_))).count() == 0 {
-            return Ipv6Address::LOCALHOST;
-        }
-
-        let mut candidate = self
-            .cidrs()
-            .find_map(|a| match a {
+        // An IPv6 candidate, kept together with the address it came from so that
+        // rule 3 can see which candidates the stack has deprecated.
+        fn ipv6_candidate(addr: &IfaceAddr) -> Option<(&IfaceAddr, &Ipv6Cidr)> {
+            match &addr.cidr {
                 #[cfg(feature = "ipv4")]
                 IpCidr::Ipv4(_) => None,
-                IpCidr::Ipv6(a) => Some(a),
-            })
-            .unwrap(); // NOTE: we check above that there is at least one IPv6 address.
+                IpCidr::Ipv6(cidr) => Some((addr, cidr)),
+            }
+        }
 
-        for addr in self.cidrs().filter_map(|a| match a {
-            #[cfg(feature = "ipv4")]
-            IpCidr::Ipv4(_) => None,
-            IpCidr::Ipv6(a) => Some(a),
-        }) {
-            if !is_candidate_source_address(dst_addr, &addr.address()) {
+        // If the destination address is a loopback address, or when there are no IPv6 addresses in
+        // the interface, then the loopback address is the only candidate source address.
+        if dst_addr.is_loopback() {
+            return Ipv6Address::LOCALHOST;
+        }
+        let Some((mut candidate, mut candidate_cidr)) = self.ip_addrs.iter().find_map(ipv6_candidate) else {
+            return Ipv6Address::LOCALHOST;
+        };
+
+        for (addr, cidr) in self.ip_addrs.iter().filter_map(ipv6_candidate) {
+            if !is_candidate_source_address(dst_addr, &cidr.address()) {
                 continue;
             }
 
             // Rule 1: prefer the address that is the same as the output destination address.
-            if candidate.address() != *dst_addr && addr.address() == *dst_addr {
-                candidate = addr;
+            if candidate_cidr.address() != *dst_addr && cidr.address() == *dst_addr {
+                (candidate, candidate_cidr) = (addr, cidr);
             }
 
             // Rule 2: prefer appropriate scope.
-            if (candidate.address().x_multicast_scope() as u8) < (addr.address().x_multicast_scope() as u8) {
-                if (candidate.address().x_multicast_scope() as u8) < (dst_addr.x_multicast_scope() as u8) {
-                    candidate = addr;
+            let candidate_addr = candidate_cidr.address();
+            if (candidate_addr.x_multicast_scope() as u8) < (cidr.address().x_multicast_scope() as u8) {
+                if (candidate_addr.x_multicast_scope() as u8) < (dst_addr.x_multicast_scope() as u8) {
+                    (candidate, candidate_cidr) = (addr, cidr);
                 }
-            } else if (addr.address().x_multicast_scope() as u8) > (dst_addr.x_multicast_scope() as u8) {
-                candidate = addr;
+            } else if (cidr.address().x_multicast_scope() as u8) > (dst_addr.x_multicast_scope() as u8) {
+                (candidate, candidate_cidr) = (addr, cidr);
             }
 
-            // Rule 3: avoid deprecated addresses (TODO)
+            // Rule 3: avoid deprecated addresses. A router retires a prefix by
+            // advertising it with a preferred lifetime of zero while it stays valid,
+            // so through a prefix rotation the outgoing address is still assigned and
+            // still shares its leading bits with the destinations it used to reach.
+            // RFC 6724 orders this rule above rule 8 for that reason: a preferred
+            // address wins even when a deprecated one matches more closely.
+            if candidate.is_preferred(now) != addr.is_preferred(now) {
+                if addr.is_preferred(now) {
+                    (candidate, candidate_cidr) = (addr, cidr);
+                }
+                continue;
+            }
+
             // Rule 4: prefer home addresses (TODO)
             // Rule 5: prefer outgoing interfaces (TODO)
             // Rule 5.5: prefer addresses in a prefix advertises by the next-hop (TODO).
             // Rule 6: prefer matching label (TODO)
             // Rule 7: prefer temporary addresses (TODO)
             // Rule 8: use longest matching prefix
-            if common_prefix_length(candidate, dst_addr) < common_prefix_length(addr, dst_addr) {
-                candidate = addr;
+            if common_prefix_length(candidate_cidr, dst_addr) < common_prefix_length(cidr, dst_addr) {
+                (candidate, candidate_cidr) = (addr, cidr);
             }
         }
 
-        candidate.address()
+        candidate_cidr.address()
     }
 }
 
@@ -3249,6 +3291,7 @@ mod test {
         let ll = IfaceAddr {
             cidr: IpCidr::new(OUR_LINK_LOCAL.into(), 64),
             origin: AddrOrigin::LinkLocal,
+            preferred_until: None,
         };
         let (mut stack, _rx, _tx) = test_stack(Medium::Ethernet);
         let handle = IfaceHandle::new(0);
@@ -3410,9 +3453,12 @@ mod test {
         let deadline = stack.poll(now);
         assert_eq!(tx.borrow().len(), 2);
         assert_eq!(deadline, now + Duration::from_secs(1800));
+        // The address carries the advertised preferred lifetime, so a consumer can
+        // tell a fresh address from one whose prefix is being retired.
         assert!(stack.iface(iface).ip_addrs().contains(&IfaceAddr {
             cidr: our_addr,
             origin: AddrOrigin::Slaac,
+            preferred_until: Some(now + Duration::from_secs(3600)),
         }));
         let route = stack.routes().get_default_ipv6_route().unwrap();
         assert_eq!(route.via_router, IpAddress::Ipv6(router_ll));
@@ -3515,6 +3561,150 @@ mod test {
         assert!(stack.routes().get_default_ipv6_route().is_none());
         assert!(stack.iface(iface).has_ip_addr(OUR_V6));
         assert!(stack.iface(iface).has_ip_addr(OUR_LINK_LOCAL));
+    }
+
+    /// An address the application assigned by hand is not SLAAC's to touch, even when
+    /// a prefix forms exactly that address. It keeps its origin, gains no advertised
+    /// lifetime, is not deprecated when the prefix is retired, and outlives it.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_leaves_a_manual_address_alone() {
+        let (mut stack, rx, _tx) = test_stack(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+        let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let router_ll = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+        let prefix = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        // Exactly the address SLAAC forms from `prefix` on this interface.
+        let our_addr = IpCidr::new(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0xff, 0xfe00, 0x1).into(), 64);
+
+        stack.iface(iface).add_ip_addr(our_addr).unwrap();
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+
+        let now = Instant::from_secs(6);
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        ));
+        stack.poll(now);
+
+        assert_eq!(
+            stack
+                .iface(iface)
+                .ip_addrs()
+                .iter()
+                .filter(|a| a.cidr == our_addr)
+                .count(),
+            1,
+            "slaac must not install a second copy of an address that is already assigned"
+        );
+        assert!(
+            stack
+                .iface(iface)
+                .ip_addrs()
+                .iter()
+                .any(|a| a.cidr == our_addr && a.origin == AddrOrigin::Manual && a.preferred_until.is_none()),
+            "the address stays the application's, and gains no advertised lifetime"
+        );
+
+        // The router retires the prefix. That deprecates nothing here.
+        let now = Instant::from_secs(12);
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::ZERO,
+        ));
+        stack.poll(now);
+        assert!(
+            stack
+                .iface(iface)
+                .ip_addrs()
+                .iter()
+                .any(|a| a.cidr == our_addr && a.is_preferred(now)),
+            "a retired prefix must not deprecate an address slaac does not own"
+        );
+
+        // ...and the prefix expiring does not take it away either.
+        let now = Instant::from_secs(7300);
+        stack.poll(now);
+        assert!(
+            stack.iface(iface).has_ip_addr(our_addr.address()),
+            "expiry must leave an address slaac does not own assigned"
+        );
+    }
+
+    /// A prefix on its way out is advertised with a preferred lifetime of zero
+    /// while it stays valid, so the address formed from it is still assigned and
+    /// still matches an on-prefix destination more closely than anything else.
+    /// RFC 6724 orders rule 3 above rule 8 precisely so that it stops being used
+    /// as a source anyway.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_deprecated_address_is_not_a_source() {
+        let (mut stack, rx, _tx) = test_stack(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+        let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let router_ll = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+        let outgoing = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        let incoming = Ipv6Address::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 0);
+        let outgoing_addr = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0xff, 0xfe00, 0x1);
+        let incoming_addr = Ipv6Address::new(0x2001, 0xdb9, 0, 0, 0, 0xff, 0xfe00, 0x1);
+        // On the outgoing prefix, so rule 8 on its own always answers `outgoing_addr`.
+        let dst = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x2);
+
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+
+        // Both prefixes are live, and the one the network is leaving is preferred.
+        let now = Instant::from_secs(6);
+        for prefix in [outgoing, incoming] {
+            rx.borrow_mut().push_back(router_advert(
+                router_hw,
+                router_ll,
+                Duration::from_secs(1800),
+                prefix,
+                Duration::from_secs(7200),
+                Duration::from_secs(3600),
+            ));
+        }
+        stack.poll(now);
+        assert!(stack.iface(iface).ip_addrs().iter().all(|a| a.is_preferred(now)));
+        assert_eq!(
+            stack.ifaces.get(iface.index()).get_source_address_ipv6(&dst, now),
+            outgoing_addr
+        );
+
+        // The router retires the outgoing prefix: no longer preferred, still valid.
+        let now = Instant::from_secs(12);
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            outgoing,
+            Duration::from_secs(7200),
+            Duration::ZERO,
+        ));
+        stack.poll(now);
+
+        // The address is still assigned, because it is still valid...
+        assert!(
+            stack
+                .iface(iface)
+                .ip_addrs()
+                .iter()
+                .any(|a| a.cidr.address() == IpAddress::Ipv6(outgoing_addr) && !a.is_preferred(now)),
+            "a deprecated address stays assigned until its valid lifetime ends"
+        );
+        // ...and it is no longer what the stack puts in the source field.
+        assert_eq!(
+            stack.ifaces.get(iface.index()).get_source_address_ipv6(&dst, now),
+            incoming_addr
+        );
     }
 
     /// A router advertisement that is not from a link-local source is ignored.
