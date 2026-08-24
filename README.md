@@ -85,6 +85,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - Pure IP interface medium (feature `medium-ip`)
 - IPv4 (feature `ipv4`)
   - DHCP client (feature `dhcpv4`)
+    - Raw access to all lease options by option number. (feature `dhcpv4-options`)
   - Fragmentation (feature `ipv4-fragmentation`)
   - Reassembly (feature `ipv4-reassembly`)
 - IPv6 (feature `ipv6`)

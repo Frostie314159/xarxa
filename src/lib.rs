@@ -69,6 +69,8 @@ pub mod wire;
 pub use buf::{PACKET_BUF_SIZE, PacketBuf};
 #[cfg(feature = "dhcpv4")]
 pub use dhcpv4::{DhcpConfig, DhcpLease, DhcpServerInfo};
+#[cfg(feature = "dhcpv4-options")]
+pub use dhcpv4::DhcpLeaseOptions;
 #[cfg(feature = "dns")]
 pub use dns::{DnsClient, DnsQueryHandle};
 #[cfg(feature = "icmp-errors")]

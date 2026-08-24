@@ -39,9 +39,9 @@ for extra in "" "defmt" "log" "std" "std,log" "std,defmt" "async" "std,log,async
              "tcp-timestamps" "tcp-timestamps,defmt" \
              "tcp-reno" "tcp-cubic" \
              "ipv4-fragmentation" "ipv4-reassembly" "ipv4-fragmentation,ipv4-reassembly,defmt" \
-             "dhcpv4" "dhcpv4,async" "dhcpv4,defmt" \
+             "dhcpv4" "dhcpv4,async" "dhcpv4,defmt" "dhcpv4-options" "dhcpv4-options,defmt" \
              "multicast" "multicast,defmt" "multicast,icmp-errors,icmp-ping-reply" \
-             "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,packet-log,dhcpv4,multicast,ipv4-fragmentation,ipv4-reassembly"; do
+             "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,packet-log,dhcpv4,dhcpv4-options,multicast,ipv4-fragmentation,ipv4-reassembly"; do
   run cargo check --no-default-features \
     --features "medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp${extra:+,$extra}${alloc:+,$alloc}"
 done
@@ -79,7 +79,7 @@ run cargo test
 # Unit tests only: the examples and doc tests are written against the owned
 # `Box`/`Vec` storage that only exists with `alloc`.
 run cargo test --lib --no-default-features \
-  --features "medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp,tcp-listener,std,log,async,icmp-errors,icmp-ping-reply,multicast,slaac,dhcpv4,dns,mdns,packetmeta-timestamp,tcp-timestamps,ipv4-fragmentation,ipv4-reassembly"
+  --features "medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp,tcp-listener,std,log,async,icmp-errors,icmp-ping-reply,multicast,slaac,dhcpv4,dhcpv4-options,dns,mdns,packetmeta-timestamp,tcp-timestamps,ipv4-fragmentation,ipv4-reassembly"
 # Once more with packet metadata: the default feature set leaves `PacketMeta`
 # zero-sized, so the tests that exercise it are gated on the feature.
 run cargo test --features packetmeta-timestamp
@@ -91,5 +91,5 @@ run cargo test --features tcp-timestamps
 # the other. (Without either feature TCP does no congestion control at all, and
 # the tests that exercise a congestion window are gated on `tcp-reno`.)
 run cargo test --no-default-features \
-  --features "alloc,std,log,async,icmp-ping-reply,icmp-errors,medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp,tcp-listener,dhcpv4,slaac,dns,mdns,multicast,tcp-reno,tcp-timestamps,packetmeta-timestamp,ipv4-fragmentation,ipv4-reassembly"
+  --features "alloc,std,log,async,icmp-ping-reply,icmp-errors,medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp,tcp-listener,dhcpv4,dhcpv4-options,slaac,dns,mdns,multicast,tcp-reno,tcp-timestamps,packetmeta-timestamp,ipv4-fragmentation,ipv4-reassembly"
 run cargo build --examples

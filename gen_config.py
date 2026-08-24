@@ -65,6 +65,7 @@ feature("dns_max_result_count", default=4, min=1, max=32, pow2=4)
 feature("dns_max_server_count", default=4, min=1, max=32, pow2=4)
 feature("dns_max_name_size", default=255, min=64, max=255, pow2=True)
 feature("dhcp_max_dns_server_count", default=3, min=1, max=8)
+feature("dhcp_options_buf_size", default=128, min=16, max=1024, pow2=True)
 
 # ========= Update Cargo.toml
 

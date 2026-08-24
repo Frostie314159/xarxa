@@ -42,6 +42,9 @@ const DEFAULT_PARAMETER_REQUEST_LIST: &[u8] =
 
 /// The most DNS servers a client keeps from a lease. Set by the `dhcp-max-dns-server-count-N` feature.
 pub use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
+/// The size of the raw options buffer in a lease. Set by the `dhcp-options-buf-size-N` feature.
+#[cfg(feature = "dhcpv4-options")]
+pub use crate::config::DHCP_OPTIONS_BUF_SIZE;
 
 /// A lease obtained from a DHCP server.
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -55,6 +58,11 @@ pub struct DhcpLease {
     pub router: Option<Ipv4Address>,
     /// The DNS servers, if the server gave any.
     pub dns_servers: Vec<Ipv4Address, DHCP_MAX_DNS_SERVER_COUNT>,
+    /// All options received from the DHCP server.
+    ///
+    /// You may have to ask the server to send the option you're interested in with [`DhcpConfig::parameter_request_list`].
+    #[cfg(feature = "dhcpv4-options")]
+    pub options: DhcpLeaseOptions,
 }
 
 /// How to reach a DHCP server.
@@ -66,6 +74,97 @@ pub struct DhcpServerInfo {
     /// The server identifier to put in packets. Usually the same as `address`,
     /// but can differ, for example behind a DHCP relay.
     pub identifier: Ipv4Address,
+}
+
+/// The received options of a lease. See [`DhcpLease::options`].
+///
+/// Options that don't fit in the buffer are dropped. The buffer size is set by
+/// the `dhcp-options-buf-size-N` feature.
+#[cfg(feature = "dhcpv4-options")]
+#[derive(Clone)]
+pub struct DhcpLeaseOptions {
+    // Options stored back to back, each as kind, length, data.
+    buf: [u8; DHCP_OPTIONS_BUF_SIZE],
+    len: u16,
+}
+
+#[cfg(feature = "dhcpv4-options")]
+impl DhcpLeaseOptions {
+    fn new() -> Self {
+        Self {
+            buf: [0; DHCP_OPTIONS_BUF_SIZE],
+            len: 0,
+        }
+    }
+
+    // Add one option. Errors if it doesn't fit.
+    fn push(&mut self, option: DhcpOption<'_>) -> Result<(), ()> {
+        let len = self.len as usize;
+        let total = 2 + option.data.len();
+        if option.data.len() > u8::MAX as usize || self.buf.len() - len < total {
+            return Err(());
+        }
+        self.buf[len] = option.kind;
+        self.buf[len + 1] = option.data.len() as u8;
+        self.buf[len + 2..len + total].copy_from_slice(option.data);
+        self.len = (len + total) as u16;
+        Ok(())
+    }
+
+    /// The data of the first option of the given kind, if present.
+    pub fn get(&self, kind: u8) -> Option<&[u8]> {
+        self.iter().find(|opt| opt.kind == kind).map(|opt| opt.data)
+    }
+
+    /// Iterate over all options.
+    pub fn iter(&self) -> impl Iterator<Item = DhcpOption<'_>> + '_ {
+        let mut buf = &self.buf[..self.len as usize];
+        core::iter::from_fn(move || {
+            if buf.is_empty() {
+                return None;
+            }
+            let len = buf[1] as usize;
+            let opt = DhcpOption {
+                kind: buf[0],
+                data: &buf[2..2 + len],
+            };
+            buf = &buf[2 + len..];
+            Some(opt)
+        })
+    }
+}
+
+#[cfg(feature = "dhcpv4-options")]
+impl PartialEq for DhcpLeaseOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.buf[..self.len as usize] == other.buf[..other.len as usize]
+    }
+}
+
+#[cfg(feature = "dhcpv4-options")]
+impl Eq for DhcpLeaseOptions {}
+
+#[cfg(feature = "dhcpv4-options")]
+impl core::fmt::Debug for DhcpLeaseOptions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+#[cfg(all(feature = "dhcpv4-options", feature = "defmt"))]
+impl defmt::Format for DhcpLeaseOptions {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "[");
+        let mut first = true;
+        for opt in self.iter() {
+            if !first {
+                defmt::write!(f, ", ");
+            }
+            first = false;
+            defmt::write!(f, "{}", opt);
+        }
+        defmt::write!(f, "]");
+    }
 }
 
 #[derive(Debug)]
@@ -257,11 +356,24 @@ impl Client {
                 });
         }
 
+        #[cfg(feature = "dhcpv4-options")]
+        let options = {
+            let mut options = DhcpLeaseOptions::new();
+            for opt in packet.options() {
+                if options.push(opt).is_err() {
+                    debug!("DHCP lease options buffer full, dropping option {}", opt.kind);
+                }
+            }
+            options
+        };
+
         let lease = DhcpLease {
             server,
             address: Ipv4Cidr::new(packet.your_ip(), prefix_len),
             router: packet.option(field::OPT_ROUTER).and_then(parse_ipv4),
             dns_servers,
+            #[cfg(feature = "dhcpv4-options")]
+            options,
         };
 
         // Set renew and rebind times as per RFC 2131:
@@ -1209,5 +1321,58 @@ mod test {
             packet.option(field::OPT_PARAMETER_REQUEST_LIST),
             Some(&[1, 3, 6, 42][..])
         );
+    }
+
+    #[test]
+    #[cfg(feature = "dhcpv4-options")]
+    fn test_lease_options() {
+        let (mut stack, rx, _tx) = test_stack();
+        stack.poll(at(0)); // DISCOVER
+
+        let mut options = ack_options();
+        options.push(DhcpOption {
+            kind: field::OPT_NTP_SERVERS,
+            data: &[192, 168, 1, 2],
+        });
+        rx.borrow_mut()
+            .push_back(reply(DhcpMessageType::Offer, XID, OFFERED_IP, &options));
+        stack.poll(at(1)); // REQUEST
+        rx.borrow_mut()
+            .push_back(reply(DhcpMessageType::Ack, XID, OFFERED_IP, &options));
+        stack.poll(at(2));
+
+        let lease = stack.iface(IFACE).dhcpv4_lease().cloned().unwrap();
+        assert_eq!(lease.options.get(field::OPT_NTP_SERVERS), Some(&[192, 168, 1, 2][..]));
+        assert_eq!(lease.options.get(field::OPT_SUBNET_MASK), Some(&[255, 255, 255, 0][..]));
+        assert_eq!(lease.options.get(field::OPT_HOST_NAME), None);
+
+        // Every option from the ACK is there, in order, the ones the client
+        // parses itself included.
+        let kinds: Vec<u8> = lease.options.iter().map(|o| o.kind).collect();
+        assert_eq!(
+            kinds,
+            &[
+                field::OPT_DHCP_MESSAGE_TYPE,
+                field::OPT_SERVER_IDENTIFIER,
+                field::OPT_SUBNET_MASK,
+                field::OPT_ROUTER,
+                field::OPT_DOMAIN_NAME_SERVER,
+                field::OPT_IP_LEASE_TIME,
+                field::OPT_NTP_SERVERS,
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dhcpv4-options")]
+    fn test_lease_options_full() {
+        let mut options = DhcpLeaseOptions::new();
+        // Never fits: the buffer can't hold its own size plus two.
+        let data = [0xaa; DHCP_OPTIONS_BUF_SIZE];
+        assert!(options.push(DhcpOption { kind: 42, data: &data }).is_err());
+        // A dropped option doesn't stop later ones.
+        assert!(options.push(DhcpOption { kind: 1, data: &[7] }).is_ok());
+        assert_eq!(options.get(1), Some(&[7][..]));
+        assert_eq!(options.get(42), None);
     }
 }

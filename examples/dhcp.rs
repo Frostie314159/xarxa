@@ -41,8 +41,12 @@ fn main() {
         .unwrap();
 
     // That's all it takes: the stack installs the address and default route
-    // itself once a lease comes in, and keeps it renewed.
-    stack.iface(iface).set_dhcpv4(Some(DhcpConfig::default()));
+    // itself once a lease comes in, and keeps it renewed. The parameter request
+    // list additionally asks the server for NTP servers (option 42), read raw
+    // from the lease below.
+    let mut config = DhcpConfig::default();
+    config.parameter_request_list = Some(&[1, 3, 6, 42]);
+    stack.iface(iface).set_dhcpv4(Some(config));
 
     let mut generation = stack.iface(iface).config_generation();
     loop {
@@ -57,6 +61,8 @@ fn main() {
                     log::info!("DHCP lease: {}", lease.address);
                     log::info!("  router: {:?}", lease.router);
                     log::info!("  DNS servers: {:?}", lease.dns_servers);
+                    // Any option can be read raw from the lease, by number.
+                    log::info!("  NTP servers (raw option 42): {:?}", lease.options.get(42));
                 }
                 None => log::info!("DHCP: no lease"),
             }
