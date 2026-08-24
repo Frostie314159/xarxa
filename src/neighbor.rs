@@ -6,7 +6,7 @@ use crate::storage::{BoundedVec, Full};
 use crate::buf::PacketBuf;
 use crate::stack::IfaceHandle;
 use crate::time::{Duration, Instant};
-use crate::wire::{EthernetAddress, IpAddress};
+use crate::wire::{HardwareAddress, IpAddress};
 
 /// Key identifying a neighbor: the interface it is reachable through, plus its
 /// protocol address.
@@ -42,7 +42,7 @@ enum State {
     },
     /// The neighbor's hardware address is known.
     Reachable {
-        hardware_addr: EthernetAddress,
+        hardware_addr: HardwareAddress,
         /// The timestamp past which the mapping should be discarded.
         expires_at: Instant,
     },
@@ -53,7 +53,7 @@ enum State {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Answer {
     /// The neighbor address is in the cache and not expired.
-    Found(EthernetAddress),
+    Found(HardwareAddress),
     /// Resolution of this neighbor is already in progress.
     Pending,
     /// The neighbor address is not in the cache, or has expired.
@@ -179,7 +179,7 @@ impl Cache {
             .fold(Instant::MAX, Instant::min)
     }
 
-    pub fn reset_expiry_if_existing(&mut self, key: Key, source_hardware_addr: EthernetAddress, timestamp: Instant) {
+    pub fn reset_expiry_if_existing(&mut self, key: Key, source_hardware_addr: HardwareAddress, timestamp: Instant) {
         if let Some(State::Reachable {
             hardware_addr,
             expires_at,
@@ -190,7 +190,7 @@ impl Cache {
         }
     }
 
-    pub fn fill(&mut self, key: Key, hardware_addr: EthernetAddress, timestamp: Instant) {
+    pub fn fill(&mut self, key: Key, hardware_addr: HardwareAddress, timestamp: Instant) {
         debug_assert!(key.1.is_unicast());
         debug_assert!(hardware_addr.is_unicast());
 
@@ -198,7 +198,7 @@ impl Cache {
         self.fill_with_expiration(key, hardware_addr, expires_at);
     }
 
-    pub fn fill_with_expiration(&mut self, key: Key, hardware_addr: EthernetAddress, expires_at: Instant) {
+    pub fn fill_with_expiration(&mut self, key: Key, hardware_addr: HardwareAddress, expires_at: Instant) {
         debug_assert!(key.1.is_unicast());
         debug_assert!(hardware_addr.is_unicast());
 
@@ -390,10 +390,34 @@ mod test {
         taken
     }
 
-    const HADDR_A: EthernetAddress = EthernetAddress([0, 0, 0, 0, 0, 1]);
-    const HADDR_B: EthernetAddress = EthernetAddress([0, 0, 0, 0, 0, 2]);
-    const HADDR_C: EthernetAddress = EthernetAddress([0, 0, 0, 0, 0, 3]);
-    const HADDR_D: EthernetAddress = EthernetAddress([0, 0, 0, 0, 0, 4]);
+    #[cfg(feature = "medium-ethernet")]
+    const fn haddr(n: u8) -> HardwareAddress {
+        HardwareAddress::Ethernet(crate::wire::EthernetAddress([0, 0, 0, 0, 0, n]))
+    }
+    #[cfg(not(feature = "medium-ethernet"))]
+    const fn haddr(n: u8) -> HardwareAddress {
+        HardwareAddress::Ieee802154(crate::wire::Ieee802154Address::Extended([0, 0, 0, 0, 0, 0, 0, n]))
+    }
+
+    /// An 802.15.4 address is cached like an Ethernet one.
+    #[test]
+    #[cfg(feature = "medium-ieee802154")]
+    fn fill_ieee802154() {
+        let addr = HardwareAddress::Ieee802154(crate::wire::Ieee802154Address::Extended([
+            0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
+        ]));
+        let mut cache = Cache::new();
+        cache.fill(key(MOCK_IP_ADDR_1), addr, Instant::from_millis(0));
+        assert_eq!(
+            cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
+            Answer::Found(addr)
+        );
+    }
+
+    const HADDR_A: HardwareAddress = haddr(1);
+    const HADDR_B: HardwareAddress = haddr(2);
+    const HADDR_C: HardwareAddress = haddr(3);
+    const HADDR_D: HardwareAddress = haddr(4);
 
     fn key(addr: Ipv6Address) -> Key {
         (IF_0, addr.into())

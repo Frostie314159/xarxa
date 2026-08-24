@@ -7,17 +7,32 @@ drivers implement to exchange owned [`PacketBuf`]s with the stack:
   * on transmit, the stack hands a built frame down to the driver, which owns the buffer
     until the hardware is done with it, then drops it.
 
-This module provides one implementation of [Interface]: the [TunTapInterface], to transmit and
-receive frames on the host OS.
+This module provides two implementations of [Interface] for the host OS: the
+[TunTapInterface], a virtual TUN/TAP interface, and the [RawSocketInterface], a
+packet socket bound to an existing interface (Ethernet or IEEE 802.15.4).
 */
 
 use crate::buf::PacketBuf;
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", any(feature = "medium-ethernet", feature = "medium-ip")))]
 mod tuntap;
 
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", any(feature = "medium-ethernet", feature = "medium-ip")))]
 pub use self::tuntap::TunTapInterface;
+
+#[cfg(all(
+    feature = "std",
+    any(target_os = "linux", target_os = "android"),
+    any(feature = "medium-ethernet", feature = "medium-ieee802154")
+))]
+mod raw_socket;
+
+#[cfg(all(
+    feature = "std",
+    any(target_os = "linux", target_os = "android"),
+    any(feature = "medium-ethernet", feature = "medium-ieee802154")
+))]
+pub use self::raw_socket::RawSocketInterface;
 
 /// Type of medium of an interface.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -31,6 +46,14 @@ pub enum Medium {
     /// Ethernet header. MAC addresses are not used.
     #[cfg(feature = "medium-ip")]
     Ip,
+
+    /// IEEE 802.15.4 medium. Devices of this type send and receive 802.15.4
+    /// MAC frames carrying 6LoWPAN.
+    ///
+    /// [`IfaceCapabilities::max_transmission_unit`] is the whole MAC frame
+    /// without the FCS: 125 for a 127-byte PHY frame with a 2-byte FCS.
+    #[cfg(feature = "medium-ieee802154")]
+    Ieee802154,
 }
 
 /// A description of iface capabilities.
@@ -64,12 +87,16 @@ impl Default for IfaceCapabilities {
         Self {
             #[cfg(feature = "medium-ethernet")]
             medium: Medium::Ethernet,
-            #[cfg(not(feature = "medium-ethernet"))]
+            #[cfg(all(not(feature = "medium-ethernet"), feature = "medium-ip"))]
             medium: Medium::Ip,
+            #[cfg(all(not(feature = "medium-ethernet"), not(feature = "medium-ip")))]
+            medium: Medium::Ieee802154,
             #[cfg(feature = "medium-ethernet")]
             max_transmission_unit: 1514,
-            #[cfg(not(feature = "medium-ethernet"))]
+            #[cfg(all(not(feature = "medium-ethernet"), feature = "medium-ip"))]
             max_transmission_unit: 1500,
+            #[cfg(all(not(feature = "medium-ethernet"), not(feature = "medium-ip")))]
+            max_transmission_unit: 125,
         }
     }
 }
@@ -140,6 +167,25 @@ pub trait Interface {
     #[cfg(feature = "packetmeta-timestamp")]
     fn poll_tx_timestamp(&mut self) -> Option<crate::meta::TxTimestamp> {
         None
+    }
+}
+
+impl<T: Interface + ?Sized> Interface for &mut T {
+    fn capabilities(&self) -> IfaceCapabilities {
+        T::capabilities(self)
+    }
+    fn receive(&mut self) -> Option<PacketBuf> {
+        T::receive(self)
+    }
+    fn can_transmit(&mut self) -> bool {
+        T::can_transmit(self)
+    }
+    fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
+        T::transmit(self, buf)
+    }
+    #[cfg(feature = "packetmeta-timestamp")]
+    fn poll_tx_timestamp(&mut self) -> Option<crate::meta::TxTimestamp> {
+        T::poll_tx_timestamp(self)
     }
 }
 

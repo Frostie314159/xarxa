@@ -232,7 +232,7 @@ impl IfaceState<'_> {
         Ok(())
     }
 
-    #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+    #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
     pub(crate) fn update_solicited_node_groups(&mut self) {
         // Remove old solicited-node multicast addresses
         // Walk the group table by index: leaving a group may remove the entry
@@ -741,6 +741,8 @@ mod test {
                 match medium {
                     Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
                     Medium::Ip => HardwareAddress::Ip,
+                    #[cfg(feature = "medium-ieee802154")]
+                    Medium::Ieee802154 => unreachable!(),
                 },
             )
             .unwrap();
@@ -765,6 +767,8 @@ mod test {
                     bytes[ETHERNET_HEADER_LEN..].to_vec()
                 }
                 Medium::Ip => frame,
+                #[cfg(feature = "medium-ieee802154")]
+                Medium::Ieee802154 => unreachable!(),
             })
             .collect()
     }
@@ -791,6 +795,8 @@ mod test {
                 frame
             }
             Medium::Ip => packet,
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => unreachable!(),
         };
         rx.borrow_mut().push_back(frame);
         stack.poll(now)

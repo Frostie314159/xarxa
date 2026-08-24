@@ -83,6 +83,12 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Neighbor cache with expiry, renewal on use.
   - The network stack buffers egress packets pending network resolution. Unreachable neighbors don't [clog sockets](https://github.com/smoltcp-rs/smoltcp/issues/594).
 - Pure IP interface medium (feature `medium-ip`)
+- IEEE 802.15.4 interface medium (feature `medium-ieee802154`)
+  - 6LoWPAN header compression: IPHC for the IPv6 header, NHC for UDP and extension headers, done in place in the packet buffer.
+  - Address contexts for decompression.
+  - NDISC over 802.15.4, link-local address from the extended address.
+  - 6LoWPAN fragmentation (feature `sixlowpan-fragmentation`) 
+  - 6LoWPAN reassembly (feature `sixlowpan-reassembly`)
 - IPv4 (feature `ipv4`)
   - DHCP client (feature `dhcpv4`)
     - Raw access to all lease options by option number. (feature `dhcpv4-options`)
@@ -132,8 +138,6 @@ All of the below is planned. Please open an issue or reach out on [the Matrix ch
 - IPv6 DAD (duplicate address detection)
 - IPv6 RDNSS (DNS servers from router advertisements)
 - an equivalent to smoltcp's `any_ip`
-- 6LoWPAN
-- IEEE 802.15.4
 - IPv6 fragmentation and reassembly
 - TCP segmentation offload
 - TCP SACK

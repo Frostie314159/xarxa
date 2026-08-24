@@ -14,6 +14,9 @@ default = [
     "icmp-errors",
     "medium-ethernet",
     "medium-ip",
+    "medium-ieee802154",
+    "sixlowpan-fragmentation",
+    "sixlowpan-reassembly",
     "ipv4",
     "ipv4-fragmentation",
     "ipv4-reassembly",
@@ -52,6 +55,12 @@ medium-ethernet = []
 ## Support interfaces that send and receive bare IP packets, without a link-layer
 ## header.
 medium-ip = []
+## Support IEEE 802.15.4 interfaces carrying 6LoWPAN (RFC 4944, RFC 6282). Needs `ipv6`.
+medium-ieee802154 = ["ipv6"]
+## Fragment outgoing 6LoWPAN packets larger than one 802.15.4 frame. Needs `medium-ieee802154`.
+sixlowpan-fragmentation = ["medium-ieee802154"]
+## Reassemble incoming 6LoWPAN fragments. Needs `medium-ieee802154`.
+sixlowpan-reassembly = ["medium-ieee802154"]
 ## Support IPv4 (and, with `medium-ethernet`, ARP).
 ipv4 = []
 ## Fragment outgoing IPv4 packets larger than the interface MTU. Needs `ipv4`.
@@ -73,8 +82,9 @@ dhcpv4 = ["ipv4", "medium-ethernet"]
 ## Allow reading received DHCP options.
 ## Requires a small buffer. Size is set by the `dhcp-options-buf-size-N` features.
 dhcpv4-options = ["dhcpv4"]
-## IPv6 stateless address autoconfiguration (SLAAC). Needs `ipv6` and `medium-ethernet`.
-slaac = ["ipv6", "medium-ethernet"]
+## IPv6 stateless address autoconfiguration (SLAAC). Needs `ipv6`, and
+## `medium-ethernet` or `medium-ieee802154`.
+slaac = ["ipv6"]
 ## DNS client.
 dns = ["udp"]
 ## Resolve `.local` names with multicast DNS in the DNS client.
@@ -342,6 +352,23 @@ reassembly-buffer-count-8 = []
 reassembly-buffer-count-16 = []
 reassembly-buffer-count-32 = []
 
+sixlowpan-address-context-count-1 = []
+sixlowpan-address-context-count-2 = []
+sixlowpan-address-context-count-3 = []
+sixlowpan-address-context-count-4 = [] # Default
+sixlowpan-address-context-count-5 = []
+sixlowpan-address-context-count-6 = []
+sixlowpan-address-context-count-7 = []
+sixlowpan-address-context-count-8 = []
+sixlowpan-address-context-count-9 = []
+sixlowpan-address-context-count-10 = []
+sixlowpan-address-context-count-11 = []
+sixlowpan-address-context-count-12 = []
+sixlowpan-address-context-count-13 = []
+sixlowpan-address-context-count-14 = []
+sixlowpan-address-context-count-15 = []
+sixlowpan-address-context-count-16 = []
+
 dns-max-query-count-1 = []
 dns-max-query-count-2 = []
 dns-max-query-count-3 = []
@@ -422,6 +449,10 @@ required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6
 [[example]]
 name = "dns"
 required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "dns"]
+
+[[example]]
+name = "sixlowpan"
+required-features = ["std", "log", "medium-ieee802154", "sixlowpan-fragmentation", "sixlowpan-reassembly", "udp", "tcp-listener"]
 
 [[example]]
 name = "dhcp"

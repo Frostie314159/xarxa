@@ -1,4 +1,5 @@
-//! IPv4 reassembly (feature `ipv4-reassembly`).
+//! Reassembly of incoming fragments: IPv4 (feature `ipv4-reassembly`) and
+//! 6LoWPAN (feature `sixlowpan-reassembly`).
 //!
 //! The fragments of one datagram are copied into a `PacketBuf` taken from the
 //! pool, at their offsets, and the buffer is handed up the stack whole once the
@@ -217,6 +218,7 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
 }
 
 /// The fields that identify the fragments of one IPv4 datagram.
+#[cfg(feature = "ipv4-reassembly")]
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) struct Ipv4FragKey {
@@ -226,6 +228,7 @@ pub(crate) struct Ipv4FragKey {
     protocol: IpProtocol,
 }
 
+#[cfg(feature = "ipv4-reassembly")]
 impl Ipv4FragKey {
     /// The key identifying the packet a fragment belongs to.
     pub(crate) fn of(packet: &Ipv4Packet<'_>) -> Self {
@@ -241,7 +244,10 @@ impl Ipv4FragKey {
 #[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) enum FragKey {
+    #[cfg(feature = "ipv4-reassembly")]
     Ipv4(Ipv4FragKey),
+    #[cfg(feature = "sixlowpan-reassembly")]
+    Sixlowpan(SixlowpanFragKey),
 }
 
 pub(crate) struct FragmentsBuffer {
@@ -262,16 +268,16 @@ impl FragmentsBuffer {
 impl Stack<'_> {
     /// Get the packet reassembly timeout.
     ///
-    /// This is how long the fragments of an incoming IPv4 packet are kept while
-    /// waiting for the rest of it. The default is 60 seconds.
+    /// This is how long the fragments of an incoming IPv4 or 6LoWPAN packet are
+    /// kept while waiting for the rest of it. The default is 60 seconds.
     pub fn reassembly_timeout(&self) -> Duration {
         self.fragments.reassembly_timeout
     }
 
     /// Set the packet reassembly timeout.
     ///
-    /// Fragments of an incoming IPv4 packet that is not complete by then are
-    /// dropped, and the packet buffer they were kept in is freed.
+    /// Fragments of an incoming IPv4 or 6LoWPAN packet that is not complete by
+    /// then are dropped, and the packet buffer they were kept in is freed.
     pub fn set_reassembly_timeout(&mut self, timeout: Duration) {
         self.fragments.reassembly_timeout = timeout;
     }
@@ -281,6 +287,7 @@ impl Stack<'_> {
     /// Returns the whole packet once its last fragment is in, with this
     /// fragment's IP header in front, patched to describe the whole datagram.
     /// `None` while the packet is incomplete, or if the fragment was dropped.
+    #[cfg(feature = "ipv4-reassembly")]
     pub(crate) fn reassemble_ipv4(&mut self, mut buf: PacketBuf) -> Option<PacketBuf> {
         let ipv4_packet = Ipv4Packet::new_unchecked(&mut buf);
 

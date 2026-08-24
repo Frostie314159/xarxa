@@ -56,8 +56,12 @@ feature("tcp_listener_backlog", default=4, min=1, max=64, pow2=8)
 feature("assembler_max_segment_count", default=4, min=1, max=32, pow2=4)
 
 # IPv4 and 6LoWPAN reassembly (features `ipv4-reassembly`,
-# `sixlowpan-fragmentation`): datagrams reassembled at once.
+# `sixlowpan-reassembly`): datagrams reassembled at once.
 feature("reassembly_buffer_count", default=1, min=1, max=32, pow2=4)
+
+# 6LoWPAN address contexts per interface (feature `medium-ieee802154`). The
+# context identifier is 4 bits, so 16 is the most a packet can name.
+feature("sixlowpan_address_context_count", default=4, min=1, max=16)
 
 # DNS and DHCP.
 feature("dns_max_query_count", default=4, min=1, max=32, pow2=4)

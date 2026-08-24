@@ -60,6 +60,8 @@ fn main() {
             match medium {
                 Medium::Ip => HardwareAddress::Ip,
                 Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01])),
+                #[allow(unreachable_patterns)]
+                _ => unreachable!(),
             },
         )
         .unwrap();

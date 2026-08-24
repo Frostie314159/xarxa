@@ -7,8 +7,14 @@
 #[cfg(any(feature = "alloc", test))]
 extern crate alloc;
 
-#[cfg(not(any(feature = "medium-ethernet", feature = "medium-ip")))]
-compile_error!("You must enable at least one of the following features: medium-ethernet, medium-ip");
+#[cfg(not(any(feature = "medium-ethernet", feature = "medium-ip", feature = "medium-ieee802154")))]
+compile_error!("You must enable at least one of the following features: medium-ethernet, medium-ip, medium-ieee802154");
+
+#[cfg(all(
+    feature = "slaac",
+    not(any(feature = "medium-ethernet", feature = "medium-ieee802154"))
+))]
+compile_error!("The slaac feature needs medium-ethernet or medium-ieee802154.");
 
 #[cfg(not(any(feature = "ipv4", feature = "ipv6")))]
 compile_error!("You must enable at least one of the following features: ipv4, ipv6");
@@ -35,7 +41,7 @@ pub mod buf;
 pub mod dhcpv4;
 #[cfg(feature = "dns")]
 pub mod dns;
-#[cfg(feature = "ipv4-fragmentation")]
+#[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 mod fragmentation;
 #[cfg(feature = "icmp-errors")]
 mod icmp_error;
@@ -43,16 +49,18 @@ pub mod iface;
 pub mod meta;
 #[cfg(feature = "multicast")]
 pub mod multicast;
-#[cfg(feature = "medium-ethernet")]
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 pub mod neighbor;
 #[cfg(feature = "packet-log")]
 mod packet_log;
 mod rand;
 #[cfg(feature = "raw")]
 pub mod raw;
-#[cfg(feature = "ipv4-reassembly")]
+#[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
 mod reassembly;
 pub mod route;
+#[cfg(feature = "medium-ieee802154")]
+mod sixlowpan;
 #[cfg(feature = "slaac")]
 pub mod slaac;
 pub mod stack;
@@ -67,10 +75,10 @@ mod waker;
 pub mod wire;
 
 pub use buf::{PACKET_BUF_SIZE, PacketBuf};
-#[cfg(feature = "dhcpv4")]
-pub use dhcpv4::{DhcpConfig, DhcpLease, DhcpServerInfo};
 #[cfg(feature = "dhcpv4-options")]
 pub use dhcpv4::DhcpLeaseOptions;
+#[cfg(feature = "dhcpv4")]
+pub use dhcpv4::{DhcpConfig, DhcpLease, DhcpServerInfo};
 #[cfg(feature = "dns")]
 pub use dns::{DnsClient, DnsQueryHandle};
 #[cfg(feature = "icmp-errors")]

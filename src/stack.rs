@@ -10,17 +10,17 @@ use crate::config::TCP_SOCKET_COUNT;
 #[cfg(feature = "udp")]
 use crate::config::UDP_SOCKET_COUNT;
 use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
-#[cfg(feature = "ipv4-fragmentation")]
+#[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 use crate::fragmentation::Fragmenter;
 #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
 use crate::icmp_error::{IcmpError, parse_quoted_packet};
 use crate::iface::{IfaceCapabilities, Interface, Medium};
-#[cfg(feature = "medium-ethernet")]
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, Key as NeighborKey, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
 #[cfg(feature = "raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketState};
-#[cfg(feature = "ipv4-reassembly")]
+#[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
 use crate::reassembly::FragmentsBuffer;
 use crate::route::Routes;
 use crate::storage::{Full, MaybeBox, Slab, Vec};
@@ -44,7 +44,7 @@ pub struct Stack<'d> {
     pub(crate) ifaces: Slab<IfaceState<'d>, IFACE_COUNT>,
     #[allow(unused)]
     pub(crate) sockets: Sockets<'d>,
-    #[cfg(feature = "ipv4-reassembly")]
+    #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
     pub(crate) fragments: FragmentsBuffer,
 }
 
@@ -74,7 +74,7 @@ pub enum AddrOrigin {
     #[cfg(feature = "dhcpv4")]
     Dhcpv4,
     /// The IPv6 link-local address the stack derives from the hardware address.
-    #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+    #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
     LinkLocal,
     /// Formed by SLAAC from a router-advertised prefix.
     #[cfg(feature = "slaac")]
@@ -101,19 +101,14 @@ impl IfaceAddr {
     }
 }
 
-/// The IPv6 link-local address derived from an Ethernet address (RFC 4291 §2.5.1,
-/// modified EUI-64).
-#[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+/// The IPv6 link-local address derived from a hardware address (RFC 4291 §2.5.1,
+/// modified EUI-64; RFC 4944 §6 for an extended 802.15.4 address).
+#[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAddr> {
-    let mac = match hardware_addr {
-        HardwareAddress::Ethernet(mac) => mac,
-        #[allow(unreachable_patterns)]
-        _ => return None,
-    };
     let mut bytes = [0u8; 16];
     bytes[0] = 0xfe;
     bytes[1] = 0x80;
-    bytes[8..].copy_from_slice(&mac.as_eui_64());
+    bytes[8..].copy_from_slice(&hardware_addr.as_eui_64()?);
     Some(IfaceAddr {
         cidr: IpCidr::new(Ipv6Address::from(bytes).into(), 64),
         origin: AddrOrigin::LinkLocal,
@@ -123,7 +118,7 @@ fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAddr> {
 /// An interface added to the stack, with its configuration.
 pub(crate) struct IfaceState<'d> {
     pub(crate) handle: IfaceHandle,
-    dev: MaybeBox<'d, dyn Interface + 'd>,
+    pub(crate) dev: MaybeBox<'d, dyn Interface + 'd>,
     pub(crate) hardware_addr: HardwareAddress,
     pub(crate) ip_addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT>,
     /// Bumped whenever the interface's addresses or routes change.
@@ -136,13 +131,18 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) slaac: Option<crate::slaac::Slaac>,
     #[cfg(feature = "multicast")]
     pub(crate) multicast: crate::multicast::State,
-    #[cfg(feature = "ipv4-fragmentation")]
+    #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
     pub(crate) fragmenter: Fragmenter,
+    #[cfg(feature = "medium-ieee802154")]
+    pub(crate) sixlowpan: crate::sixlowpan::State,
 }
 
 /// An interface borrowed from a [`Stack`], returned by [`Stack::iface`].
 pub struct Iface<'a, 'd> {
-    #[cfg_attr(not(feature = "medium-ethernet"), allow(dead_code))]
+    #[cfg_attr(
+        not(any(feature = "medium-ethernet", feature = "medium-ieee802154")),
+        allow(dead_code)
+    )]
     inner: &'a mut StackInner,
     ifaces: &'a mut Slab<IfaceState<'d>, IFACE_COUNT>,
     index: usize,
@@ -195,6 +195,10 @@ impl<'d> Iface<'_, 'd> {
     /// old address in their neighbor caches until it expires. Send a gratuitous ARP
     /// or unsolicited neighbor advertisement from a raw socket if that matters.
     ///
+    /// An IEEE 802.15.4 interface must use an extended address. A short address
+    /// is accepted, but the stack can not put it in NDISC link-layer address
+    /// options, so neighbor discovery does not work with one.
+    ///
     /// # Panics
     /// Panics if the address is not of the kind the device's medium uses.
     pub fn set_hardware_addr(&mut self, addr: HardwareAddress) {
@@ -205,7 +209,7 @@ impl<'d> Iface<'_, 'd> {
             "hardware address does not match the interface's medium"
         );
         self.state_mut().hardware_addr = addr;
-        #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+        #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
         {
             let ip_addrs = &mut self.state_mut().ip_addrs;
             let had = ip_addrs.iter().any(|a| a.origin == AddrOrigin::LinkLocal);
@@ -298,7 +302,7 @@ impl<'d> Iface<'_, 'd> {
             addrs.iter().all(|a| a.cidr.address().is_unicast()),
             "only unicast addresses can be assigned to an interface"
         );
-        #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+        #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
         for a in self.state().ip_addrs.iter() {
             if a.origin == AddrOrigin::LinkLocal && !addrs.iter().any(|n| n.cidr.address() == a.cidr.address()) {
                 addrs.push(*a).map_err(|_| Full)?;
@@ -372,12 +376,12 @@ impl<'d> Iface<'_, 'd> {
     /// already on restarts it.
     ///
     /// # Panics
-    /// Panics if the interface is not an Ethernet interface.
+    /// Panics if the interface is not an Ethernet or IEEE 802.15.4 interface.
     #[cfg(feature = "slaac")]
     pub fn set_slaac(&mut self, config: Option<crate::slaac::SlaacConfig>) {
         assert!(
-            matches!(self.state().hardware_addr, HardwareAddress::Ethernet(_)),
-            "SLAAC needs an Ethernet interface"
+            self.state().has_link_layer(),
+            "SLAAC needs an Ethernet or IEEE 802.15.4 interface"
         );
         let Iface { inner, ifaces, index } = self;
         let iface = ifaces.get_mut(*index);
@@ -416,9 +420,9 @@ pub(crate) struct StackInner {
     pub(crate) now: Instant,
     #[cfg_attr(not(any(feature = "udp", feature = "tcp")), allow(dead_code))]
     pub(crate) rand: Rand,
-    #[cfg(feature = "medium-ethernet")]
-    neighbor_cache: NeighborCache,
-    #[cfg(feature = "medium-ethernet")]
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub(crate) neighbor_cache: NeighborCache,
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     pending: PendingQueue,
     pub(crate) routes: Routes,
     #[cfg(feature = "ipv4-fragmentation")]
@@ -443,9 +447,9 @@ impl StackInner {
     /// Forget everything the link layer learned about an interface: its neighbor
     /// cache entries and the packets parked on them.
     pub(crate) fn purge_iface_link_state(&mut self, handle: IfaceHandle) {
-        #[cfg(not(feature = "medium-ethernet"))]
+        #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
         let _ = handle;
-        #[cfg(feature = "medium-ethernet")]
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         {
             self.neighbor_cache.purge_iface(handle);
             self.pending.purge_iface(handle);
@@ -522,14 +526,7 @@ impl TxContext<'_, '_> {
     /// Panics if the handle is stale (the interface was removed).
     #[cfg(any(feature = "udp", feature = "tcp", feature = "raw"))]
     pub(crate) fn can_transmit(&mut self, iface: IfaceHandle) -> bool {
-        let iface = self.ifaces.get_mut(iface.index());
-        // The fragments of a packet still going out have first claim on the
-        // device: a new packet would take their room, or need the fragmenter itself.
-        #[cfg(feature = "ipv4-fragmentation")]
-        if !iface.fragmenter.is_empty() {
-            return false;
-        }
-        iface.can_transmit()
+        self.ifaces.get_mut(iface.index()).can_transmit_new_packet()
     }
 
     /// Make the egress routing decision for a destination: the interface the
@@ -681,10 +678,10 @@ pub(crate) fn alloc_ephemeral_port(rand: &mut Rand, mut in_use: impl FnMut(u16) 
 }
 
 /// The result of a neighbor lookup.
-#[cfg(feature = "medium-ethernet")]
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 enum NeighborLookup {
     /// The destination hardware address.
-    Found(EthernetAddress),
+    Found(HardwareAddress),
     /// The neighbor is being resolved; the packet should be queued as pending.
     Pending { next_hop: IpAddress },
 }
@@ -706,9 +703,9 @@ impl<'d> Stack<'d> {
             inner: StackInner {
                 now: Instant::ZERO,
                 rand,
-                #[cfg(feature = "medium-ethernet")]
+                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
-                #[cfg(feature = "medium-ethernet")]
+                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 pending: PendingQueue::new(),
                 routes: Routes::new(),
                 #[cfg(feature = "ipv4-fragmentation")]
@@ -729,7 +726,7 @@ impl<'d> Stack<'d> {
                 #[cfg(not(feature = "tcp"))]
                 _lent: core::marker::PhantomData,
             },
-            #[cfg(feature = "ipv4-reassembly")]
+            #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
             fragments: FragmentsBuffer::new(),
         }
     }
@@ -802,9 +799,11 @@ impl<'d> Stack<'d> {
             dev.capabilities().medium,
             "hardware address does not match the interface's medium"
         );
+        #[cfg(feature = "medium-ieee802154")]
+        let sixlowpan = crate::sixlowpan::State::new(&mut self.inner.rand);
         #[allow(unused_mut)]
         let mut ip_addrs = Vec::new();
-        #[cfg(all(feature = "ipv6", feature = "medium-ethernet"))]
+        #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
         if let Some(ll) = link_local_addr(hardware_addr) {
             // Can't fail: the table is empty and holds at least one address.
             let _ = ip_addrs.push(ll);
@@ -823,13 +822,18 @@ impl<'d> Stack<'d> {
             slaac: None,
             #[cfg(feature = "multicast")]
             multicast: crate::multicast::State::new(),
-            #[cfg(feature = "ipv4-fragmentation")]
+            #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
             fragmenter: Fragmenter::new(),
+            #[cfg(feature = "medium-ieee802154")]
+            sixlowpan,
         })?;
         // The link-local address is already assigned, so its solicited-node
         // group is joined before the first configuration change.
-        #[cfg(all(feature = "multicast", feature = "ipv6", feature = "medium-ethernet"))]
-        if self.ifaces.get(index).medium() == Medium::Ethernet {
+        #[cfg(all(
+            feature = "multicast",
+            all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6")
+        ))]
+        if self.ifaces.get(index).has_link_layer() {
             self.ifaces.get_mut(index).update_solicited_node_groups();
         }
         Ok(IfaceHandle::new(index))
@@ -854,7 +858,7 @@ impl<'d> Stack<'d> {
     /// Panics if the handle is stale (the interface was already removed).
     pub fn remove_iface(&mut self, handle: IfaceHandle) {
         self.ifaces.remove(handle.index());
-        #[cfg(feature = "medium-ethernet")]
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         {
             self.inner.neighbor_cache.purge_iface(handle);
             self.inner.pending.purge_iface(handle);
@@ -1130,10 +1134,10 @@ impl<'d> Stack<'d> {
         self.inner.now = timestamp;
 
         // Drop queued packets whose neighbor resolution timed out.
-        #[cfg(feature = "medium-ethernet")]
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         self.inner.pending.purge_expired(timestamp);
 
-        #[cfg(feature = "ipv4-reassembly")]
+        #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
         self.fragments.assembler.remove_expired(timestamp);
 
         let mut next = 0;
@@ -1141,7 +1145,7 @@ impl<'d> Stack<'d> {
             next = index + 1;
             let handle = IfaceHandle::new(index);
 
-            #[cfg(feature = "medium-ethernet")]
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             self.poll_neighbor_timers(handle);
 
             #[allow(unused_mut)]
@@ -1155,11 +1159,11 @@ impl<'d> Stack<'d> {
                 self.process(handle, buf);
             }
 
-            #[cfg(feature = "medium-ethernet")]
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             self.inner.flush_resolved_pending(self.ifaces.get_mut(index));
 
-            #[cfg(feature = "ipv4-fragmentation")]
-            self.inner.ipv4_egress(self.ifaces.get_mut(index));
+            #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
+            self.inner.fragment_egress(self.ifaces.get_mut(index));
 
             #[cfg(feature = "dhcpv4")]
             self.ifaces.get_mut(index).dhcpv4_dispatch(&mut self.inner);
@@ -1214,13 +1218,13 @@ impl<'d> Stack<'d> {
             }
         }
 
-        #[cfg(feature = "medium-ethernet")]
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         {
             deadline = deadline.min(self.inner.neighbor_cache.poll_at());
             deadline = deadline.min(self.inner.pending.poll_at());
         }
 
-        #[cfg(feature = "ipv4-reassembly")]
+        #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
         {
             deadline = deadline.min(self.fragments.assembler.poll_at());
         }
@@ -1431,6 +1435,8 @@ impl<'d> Stack<'d> {
             Medium::Ethernet => self.process_ethernet(iface, buf),
             #[cfg(feature = "medium-ip")]
             Medium::Ip => self.process_ip(iface, buf),
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => self.process_ieee802154(iface, buf),
         }
     }
 
@@ -1471,7 +1477,7 @@ impl<'d> Stack<'d> {
             #[cfg(feature = "ipv4")]
             EthernetProtocol::Ipv4 => self.process_ipv4(iface, Some(src_addr), buf),
             #[cfg(feature = "ipv6")]
-            EthernetProtocol::Ipv6 => self.process_ipv6(iface, Some(src_addr), buf),
+            EthernetProtocol::Ipv6 => self.process_ipv6(iface, Some(HardwareAddress::Ethernet(src_addr)), buf),
             // Drop all other traffic.
             _ => {}
         }
@@ -1491,7 +1497,10 @@ impl<'d> Stack<'d> {
         }
     }
 
+    // IPv4 only arrives over Ethernet and IP interfaces; a build with neither
+    // medium never calls this.
     #[cfg(feature = "ipv4")]
+    #[cfg_attr(not(any(feature = "medium-ethernet", feature = "medium-ip")), allow(dead_code))]
     fn process_ipv4(&mut self, iface: IfaceHandle, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
         let ipv4_packet = check!(Ipv4Packet::new_checked(&mut buf));
 
@@ -1569,7 +1578,7 @@ impl<'d> Stack<'d> {
             {
                 self.inner.neighbor_cache.reset_expiry_if_existing(
                     (iface.handle, IpAddress::Ipv4(src_addr)),
-                    eth_src,
+                    HardwareAddress::Ethernet(eth_src),
                     self.inner.now,
                 );
             }
@@ -1807,8 +1816,10 @@ impl<'d> Stack<'d> {
         }
     }
 
+    /// `ll_src` is the link-layer source address of the frame the packet arrived
+    /// in, `None` on a medium without link-layer addresses.
     #[cfg(feature = "ipv6")]
-    fn process_ipv6(&mut self, iface: IfaceHandle, eth_src: Option<EthernetAddress>, mut buf: PacketBuf) {
+    pub(crate) fn process_ipv6(&mut self, iface: IfaceHandle, ll_src: Option<HardwareAddress>, mut buf: PacketBuf) {
         let ipv6_packet = check!(Ipv6Packet::new_checked(&mut buf));
 
         if ipv6_packet.version() != 6 {
@@ -1834,13 +1845,13 @@ impl<'d> Stack<'d> {
                 return;
             }
 
-            #[cfg(feature = "medium-ethernet")]
-            if let Some(eth_src) = eth_src
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+            if let Some(ll_src) = ll_src
                 && dst_addr.x_is_unicast()
             {
                 self.inner.neighbor_cache.reset_expiry_if_existing(
                     (iface.handle, IpAddress::Ipv6(src_addr)),
-                    eth_src,
+                    ll_src,
                     self.inner.now,
                 );
             }
@@ -1897,7 +1908,7 @@ impl<'d> Stack<'d> {
         buf.pull_front(l4_offset);
 
         match next_header {
-            IpProtocol::Icmpv6 => self.process_icmpv6(iface, eth_src, src_addr, dst_addr, hop_limit, buf),
+            IpProtocol::Icmpv6 => self.process_icmpv6(iface, ll_src, src_addr, dst_addr, hop_limit, buf),
             #[cfg(feature = "udp")]
             IpProtocol::Udp => self.process_udp(
                 iface,
@@ -1932,14 +1943,14 @@ impl<'d> Stack<'d> {
     fn process_icmpv6(
         &mut self,
         iface: IfaceHandle,
-        eth_src: Option<EthernetAddress>,
+        ll_src: Option<HardwareAddress>,
         src_addr: Ipv6Address,
         dst_addr: Ipv6Address,
         hop_limit: u8,
         mut buf: PacketBuf,
     ) {
-        #[cfg(not(all(feature = "medium-ethernet", feature = "ipv6")))]
-        let _ = (eth_src, hop_limit);
+        #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
+        let _ = (ll_src, hop_limit);
         #[cfg(not(feature = "icmp-ping-reply"))]
         let _ = iface;
 
@@ -1997,14 +2008,14 @@ impl<'d> Stack<'d> {
             }
 
             // NDISC is only processed if the packet arrived with the un-decremented
-            // hop limit, and only on Ethernet mediums.
-            #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
-            Icmpv6Message::NeighborSolicit if hop_limit == 0xff && eth_src.is_some() => self
+            // hop limit, and only on mediums with link-layer addresses.
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+            Icmpv6Message::NeighborSolicit if hop_limit == 0xff && ll_src.is_some() => self
                 .inner
                 .process_ndisc_solicit(self.ifaces.get_mut(iface.index()), src_addr, dst_addr, &mut icmp_packet),
 
-            #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
-            Icmpv6Message::NeighborAdvert if hop_limit == 0xff && eth_src.is_some() => {
+            #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+            Icmpv6Message::NeighborAdvert if hop_limit == 0xff && ll_src.is_some() => {
                 self.inner
                     .process_ndisc_advert(self.ifaces.get_mut(iface.index()), src_addr, &mut icmp_packet)
             }
@@ -2021,7 +2032,7 @@ impl<'d> Stack<'d> {
             #[cfg(feature = "slaac")]
             Icmpv6Message::RouterAdvert
                 if hop_limit == 0xff
-                    && eth_src.is_some()
+                    && ll_src.is_some()
                     && src_addr.is_link_local()
                     && (dst_addr == IPV6_LINK_LOCAL_ALL_NODES || dst_addr.is_link_local()) =>
             {
@@ -2039,7 +2050,7 @@ impl<'d> Stack<'d> {
     /// Advance the solicitation retransmission timers of the neighbors being resolved
     /// on this interface, retransmitting solicitations and failing resolutions that
     /// exhausted their probes.
-    #[cfg(feature = "medium-ethernet")]
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     fn poll_neighbor_timers(&mut self, iface: IfaceHandle) {
         let mut cursor = 0;
         while let Some(event) = self
@@ -2075,7 +2086,10 @@ impl<'d> Stack<'d> {
     /// where the erring TCP/UDP socket, or a raw-socket ping application,
     /// receives it, rather than transmitted to the wire. `orig` is the queued
     /// packet, a whole IP frame.
-    #[cfg(all(feature = "medium-ethernet", feature = "icmp-errors"))]
+    #[cfg(all(
+        any(feature = "medium-ethernet", feature = "medium-ieee802154"),
+        feature = "icmp-errors"
+    ))]
     fn deliver_neighbor_failure_error(&mut self, iface: IfaceHandle, mut orig: PacketBuf) {
         match IpVersion::of_packet(&orig) {
             #[cfg(feature = "ipv4")]
@@ -2297,7 +2311,11 @@ impl StackInner {
         // We fill from requests too because if someone is requesting our address they
         // are probably going to talk to us, so we avoid having to request their address
         // when we later reply to them.
-        self.fill_neighbor(iface, IpAddress::Ipv4(source_protocol_addr), source_hardware_addr);
+        self.fill_neighbor(
+            iface,
+            IpAddress::Ipv4(source_protocol_addr),
+            HardwareAddress::Ethernet(source_hardware_addr),
+        );
 
         if operation == ArpOperation::Request {
             let Some(mut reply) = PacketBuf::try_new() else {
@@ -2322,7 +2340,7 @@ impl StackInner {
         }
     }
 
-    #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
+    #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
     fn process_ndisc_solicit(
         &mut self,
         iface: &mut IfaceState<'_>,
@@ -2338,7 +2356,7 @@ impl StackInner {
         let lladdr = check!(ndisc_lladdr_option(icmp_packet, NdiscOptionType::SourceLinkLayerAddr));
 
         if let Some(lladdr) = lladdr {
-            let lladdr = check!(lladdr.parse_ethernet());
+            let lladdr = check!(lladdr.parse(iface.medium()));
             if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
                 return;
             }
@@ -2347,13 +2365,14 @@ impl StackInner {
 
         if iface.has_solicited_node(dst_addr) && iface.has_ip_addr(target_addr) {
             // Neighbor advert: NA header (24 bytes) plus the target link-layer
-            // address option (8 bytes).
+            // address option.
             let Some(mut reply) = PacketBuf::try_new() else {
                 trace!("ndisc: no packet buffer for neighbor advert");
                 return;
             };
-            reply.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
-            reply.set_len(24 + 8);
+            let opt_len = lladdr_option_len(iface.hardware_addr);
+            reply.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
+            reply.set_len(24 + opt_len);
             {
                 let mut na = Icmpv6Packet::new_unchecked(&mut reply);
                 na.set_msg_type(Icmpv6Message::NeighborAdvert);
@@ -2361,19 +2380,18 @@ impl StackInner {
                 na.clear_reserved();
                 na.set_neighbor_flags(NdiscNeighborFlags::SOLICITED);
                 na.set_target_addr(target_addr);
-                {
-                    let mut opt = NdiscOption::new_unchecked(na.payload_mut());
-                    opt.set_option_type(NdiscOptionType::TargetLinkLayerAddr);
-                    opt.set_data_len(1);
-                    opt.set_link_layer_addr(RawHardwareAddress::from(iface.ethernet_addr()));
-                }
+                write_lladdr_option(
+                    na.payload_mut(),
+                    NdiscOptionType::TargetLinkLayerAddr,
+                    iface.hardware_addr,
+                );
                 na.fill_checksum(&target_addr, &src_addr);
             }
             self.transmit_ndisc(iface, reply, target_addr, src_addr);
         }
     }
 
-    #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
+    #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
     fn process_ndisc_advert(
         &mut self,
         iface: &mut IfaceState<'_>,
@@ -2390,7 +2408,7 @@ impl StackInner {
 
         let ip_addr = IpAddress::Ipv6(src_addr);
         if let Some(lladdr) = lladdr {
-            let lladdr = check!(lladdr.parse_ethernet());
+            let lladdr = check!(lladdr.parse(iface.medium()));
             if !lladdr.is_unicast() || !target_addr.x_is_unicast() {
                 return;
             }
@@ -2403,11 +2421,15 @@ impl StackInner {
     }
 
     /// Send a solicitation (ARP request / NDISC neighbor solicit) for the given address.
-    #[cfg(feature = "medium-ethernet")]
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     fn solicit_neighbor(&mut self, iface: &mut IfaceState<'_>, addr: IpAddress) {
         match addr {
-            #[cfg(feature = "ipv4")]
+            #[cfg(all(feature = "ipv4", feature = "medium-ethernet"))]
             IpAddress::Ipv4(addr) => self.transmit_arp_request(iface, addr),
+            // IPv4 is never dispatched to an 802.15.4 interface (`dispatch_ip`),
+            // so no IPv4 resolution ever starts without Ethernet.
+            #[cfg(all(feature = "ipv4", not(feature = "medium-ethernet")))]
+            IpAddress::Ipv4(_) => unreachable!(),
             #[cfg(feature = "ipv6")]
             IpAddress::Ipv6(addr) => self.transmit_ndisc_solicit(iface, addr),
         }
@@ -2415,12 +2437,12 @@ impl StackInner {
 
     /// Fill the neighbor cache, and flush any packets that were queued waiting for
     /// this neighbor to resolve.
-    #[cfg(feature = "medium-ethernet")]
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     pub(crate) fn fill_neighbor(
         &mut self,
         iface: &mut IfaceState<'_>,
         addr: IpAddress,
-        hardware_addr: EthernetAddress,
+        hardware_addr: HardwareAddress,
     ) {
         let key = (iface.handle, addr);
         self.neighbor_cache.fill(key, hardware_addr, self.now);
@@ -2430,30 +2452,54 @@ impl StackInner {
     /// Transmit the packets parked on `key`, now resolved to `hardware_addr`, in
     /// FIFO order, for as long as the device has room. The rest stay parked, and
     /// `flush_resolved_pending` retries them on the next `poll`.
-    #[cfg(feature = "medium-ethernet")]
-    fn flush_pending(&mut self, iface: &mut IfaceState<'_>, key: &NeighborKey, hardware_addr: EthernetAddress) {
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    fn flush_pending(&mut self, iface: &mut IfaceState<'_>, key: &NeighborKey, hardware_addr: HardwareAddress) {
         while self.pending.has_matching(key) {
-            if !iface.dev.can_transmit() {
+            if !iface.can_transmit_new_packet() {
                 trace!("neighbor: device has no room, {} stays parked", key.1);
                 return;
             }
             // NOTE(unwrap): checked by `has_matching` above.
             let packet = unwrap!(self.pending.pop_matching(key));
             trace!("neighbor: {} resolved, flushing queued packet", key.1);
-            let ethertype = match packet.key.1 {
-                #[cfg(feature = "ipv4")]
-                IpAddress::Ipv4(_) => EthernetProtocol::Ipv4,
-                #[cfg(feature = "ipv6")]
-                IpAddress::Ipv6(_) => EthernetProtocol::Ipv6,
-            };
-            self.transmit_ethernet(iface, hardware_addr, packet.buf, ethertype);
+            self.transmit_link(iface, hardware_addr, packet.buf, packet.key.1);
+        }
+    }
+
+    /// Hand an IP packet whose next hop resolved to `hardware_addr` to the
+    /// link layer of the interface's medium. `dst_addr` names the IP version.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    fn transmit_link(
+        &mut self,
+        iface: &mut IfaceState<'_>,
+        hardware_addr: HardwareAddress,
+        buf: PacketBuf,
+        dst_addr: IpAddress,
+    ) {
+        #[cfg(not(feature = "medium-ethernet"))]
+        let _ = dst_addr;
+        match hardware_addr {
+            #[cfg(feature = "medium-ethernet")]
+            HardwareAddress::Ethernet(hardware_addr) => {
+                let ethertype = match dst_addr {
+                    #[cfg(feature = "ipv4")]
+                    IpAddress::Ipv4(_) => EthernetProtocol::Ipv4,
+                    #[cfg(feature = "ipv6")]
+                    IpAddress::Ipv6(_) => EthernetProtocol::Ipv6,
+                };
+                self.transmit_ethernet(iface, hardware_addr, buf, ethertype)
+            }
+            #[cfg(feature = "medium-ieee802154")]
+            HardwareAddress::Ieee802154(hardware_addr) => self.dispatch_ieee802154(iface, hardware_addr, buf),
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => unreachable!(),
         }
     }
 
     /// Retry the packets parked on this interface whose neighbor is resolved:
     /// they were left parked because the device had no room when the
     /// resolution came in.
-    #[cfg(feature = "medium-ethernet")]
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     pub(crate) fn flush_resolved_pending(&mut self, iface: &mut IfaceState<'_>) {
         let mut cursor = 0;
         while let Some((index, key)) = self.pending.next_on(iface.handle, cursor) {
@@ -2478,7 +2524,7 @@ impl StackInner {
     ///
     /// `next_hop` is the pre-routed address to resolve on the link, from an
     /// [`EgressRoute`].
-    #[cfg(feature = "medium-ethernet")]
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     fn lookup_hardware_addr(
         &mut self,
         iface: &mut IfaceState<'_>,
@@ -2486,21 +2532,37 @@ impl StackInner {
         next_hop: IpAddress,
     ) -> NeighborLookup {
         if iface.is_broadcast(dst_addr) {
-            return NeighborLookup::Found(EthernetAddress::BROADCAST);
+            let hardware_addr = match iface.medium() {
+                #[cfg(feature = "medium-ethernet")]
+                Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress::BROADCAST),
+                #[cfg(feature = "medium-ieee802154")]
+                Medium::Ieee802154 => HardwareAddress::Ieee802154(Ieee802154Address::BROADCAST),
+                #[cfg(feature = "medium-ip")]
+                Medium::Ip => unreachable!(),
+            };
+            return NeighborLookup::Found(hardware_addr);
         }
 
         if dst_addr.is_multicast() {
-            let hardware_addr = match *dst_addr {
-                #[cfg(feature = "ipv4")]
-                IpAddress::Ipv4(addr) => {
-                    let b = addr.octets();
-                    EthernetAddress::from_bytes(&[0x01, 0x00, 0x5e, b[1] & 0x7F, b[2], b[3]])
-                }
-                #[cfg(feature = "ipv6")]
-                IpAddress::Ipv6(addr) => {
-                    let b = addr.octets();
-                    EthernetAddress::from_bytes(&[0x33, 0x33, b[12], b[13], b[14], b[15]])
-                }
+            let hardware_addr = match iface.medium() {
+                #[cfg(feature = "medium-ethernet")]
+                Medium::Ethernet => HardwareAddress::Ethernet(match *dst_addr {
+                    #[cfg(feature = "ipv4")]
+                    IpAddress::Ipv4(addr) => {
+                        let b = addr.octets();
+                        EthernetAddress::from_bytes(&[0x01, 0x00, 0x5e, b[1] & 0x7F, b[2], b[3]])
+                    }
+                    #[cfg(feature = "ipv6")]
+                    IpAddress::Ipv6(addr) => {
+                        let b = addr.octets();
+                        EthernetAddress::from_bytes(&[0x33, 0x33, b[12], b[13], b[14], b[15]])
+                    }
+                }),
+                // RFC 4944 §9: IPv6 multicast is broadcast on the link.
+                #[cfg(feature = "medium-ieee802154")]
+                Medium::Ieee802154 => HardwareAddress::Ieee802154(Ieee802154Address::BROADCAST),
+                #[cfg(feature = "medium-ip")]
+                Medium::Ip => unreachable!(),
             };
 
             return NeighborLookup::Found(hardware_addr);
@@ -2551,32 +2613,32 @@ impl StackInner {
         self.transmit_ethernet(iface, EthernetAddress::BROADCAST, buf, EthernetProtocol::Arp);
     }
 
-    #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
+    #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
     fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv6Address) {
         let src_addr = iface.get_source_address_ipv6(&target_addr);
         let dst_addr = target_addr.solicited_node();
 
         // Neighbor solicit: NS header (24 bytes) plus the source link-layer
-        // address option (8 bytes).
+        // address option.
         let Some(mut buf) = PacketBuf::try_new() else {
             // The retransmission timer sends the next one.
             trace!("ndisc: no packet buffer for neighbor solicit");
             return;
         };
-        buf.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
-        buf.set_len(24 + 8);
+        let opt_len = lladdr_option_len(iface.hardware_addr);
+        buf.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
+        buf.set_len(24 + opt_len);
         {
             let mut ns = Icmpv6Packet::new_unchecked(&mut buf);
             ns.set_msg_type(Icmpv6Message::NeighborSolicit);
             ns.set_msg_code(0);
             ns.clear_reserved();
             ns.set_target_addr(target_addr);
-            {
-                let mut opt = NdiscOption::new_unchecked(ns.payload_mut());
-                opt.set_option_type(NdiscOptionType::SourceLinkLayerAddr);
-                opt.set_data_len(1);
-                opt.set_link_layer_addr(RawHardwareAddress::from(iface.ethernet_addr()));
-            }
+            write_lladdr_option(
+                ns.payload_mut(),
+                NdiscOptionType::SourceLinkLayerAddr,
+                iface.hardware_addr,
+            );
             ns.fill_checksum(&src_addr, &dst_addr);
         }
         // The solicited-node destination is multicast, so this never recurses back
@@ -2588,7 +2650,7 @@ impl StackInner {
     ///
     /// NDISC is link-scoped: the packet is never routed, and the next hop is the
     /// destination itself (an on-link neighbor or a multicast group).
-    #[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
+    #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
     pub(crate) fn transmit_ndisc(
         &mut self,
         iface: &mut IfaceState<'_>,
@@ -2682,20 +2744,42 @@ impl StackInner {
         buf: PacketBuf,
         ethertype: EthernetProtocol,
     ) {
-        #[cfg(not(feature = "medium-ethernet"))]
+        #[cfg(not(any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
         let _ = (dst_addr, next_hop, ethertype);
+        #[cfg(not(feature = "medium-ethernet"))]
+        let _ = ethertype;
 
         match iface.dev.capabilities().medium {
             #[cfg(feature = "medium-ip")]
             Medium::Ip => self.transmit_raw(iface, buf),
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => match self.lookup_hardware_addr(iface, &dst_addr, next_hop) {
-                NeighborLookup::Found(hardware_addr) => self.transmit_ethernet(iface, hardware_addr, buf, ethertype),
+                NeighborLookup::Found(hardware_addr) => {
+                    self.transmit_ethernet(iface, hardware_addr.ethernet_or_panic(), buf, ethertype)
+                }
                 NeighborLookup::Pending { next_hop } => {
                     debug!("neighbor {} pending, queing packet", next_hop);
                     self.pending.push((iface.handle, next_hop), buf, self.now);
                 }
             },
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => {
+                // The medium is IPv6-only.
+                #[cfg(feature = "ipv4")]
+                if let IpAddress::Ipv4(_) = dst_addr {
+                    debug!("dropping IPv4 packet routed to an IEEE 802.15.4 interface");
+                    return;
+                }
+                match self.lookup_hardware_addr(iface, &dst_addr, next_hop) {
+                    NeighborLookup::Found(hardware_addr) => {
+                        self.dispatch_ieee802154(iface, hardware_addr.ieee802154_or_panic(), buf)
+                    }
+                    NeighborLookup::Pending { next_hop } => {
+                        debug!("neighbor {} pending, queing packet", next_hop);
+                        self.pending.push((iface.handle, next_hop), buf, self.now);
+                    }
+                }
+            }
         }
     }
 
@@ -2715,7 +2799,7 @@ impl StackInner {
         self.transmit_raw(iface, buf);
     }
 
-    fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
+    pub(crate) fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
         #[cfg(feature = "packet-log")]
         {
             trace!("sent on iface {}", iface.handle.index());
@@ -2736,6 +2820,8 @@ fn packet_log_layer(medium: Medium) -> crate::packet_log::Layer {
         Medium::Ethernet => crate::packet_log::Layer::Ethernet,
         #[cfg(feature = "medium-ip")]
         Medium::Ip => crate::packet_log::Layer::Ip,
+        #[cfg(feature = "medium-ieee802154")]
+        Medium::Ieee802154 => crate::packet_log::Layer::Ieee802154,
     }
 }
 
@@ -2899,12 +2985,32 @@ fn process_hop_by_hop(payload: &[u8]) -> crate::wire::Result<HopByHopAction> {
 
 impl IfaceState<'_> {
     /// The interface's medium.
-    #[cfg(all(
-        feature = "medium-ethernet",
-        any(feature = "raw", all(feature = "multicast", feature = "ipv6"))
-    ))]
+    #[allow(dead_code)]
     pub(crate) fn medium(&self) -> Medium {
         self.dev.capabilities().medium
+    }
+
+    /// Whether the interface's medium has link-layer addresses, and so does
+    /// neighbor discovery (Ethernet and IEEE 802.15.4).
+    #[allow(dead_code)]
+    pub(crate) fn has_link_layer(&self) -> bool {
+        match self.medium() {
+            #[cfg(feature = "medium-ethernet")]
+            Medium::Ethernet => true,
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => true,
+            #[cfg(feature = "medium-ip")]
+            Medium::Ip => false,
+        }
+    }
+
+    /// The interface's IEEE 802.15.4 address.
+    ///
+    /// Panics on another medium; only the 802.15.4 paths call it, and
+    /// `add_iface` checks the address matches the medium.
+    #[cfg(feature = "medium-ieee802154")]
+    pub(crate) fn ieee802154_addr(&self) -> Ieee802154Address {
+        self.hardware_addr.ieee802154_or_panic()
     }
 
     /// The interface's Ethernet address.
@@ -2922,8 +3028,12 @@ impl IfaceState<'_> {
     /// Also keeps the solicited-node multicast groups in step with the addresses,
     /// since every address change passes through here.
     pub(crate) fn config_changed(&mut self) {
-        #[cfg(all(feature = "multicast", feature = "ipv6", feature = "medium-ethernet"))]
-        if self.medium() == Medium::Ethernet {
+        #[cfg(all(
+            feature = "multicast",
+            any(feature = "medium-ethernet", feature = "medium-ieee802154"),
+            feature = "ipv6"
+        ))]
+        if self.has_link_layer() {
             self.update_solicited_node_groups();
         }
         self.config_generation = self.config_generation.wrapping_add(1);
@@ -2941,14 +3051,45 @@ impl IfaceState<'_> {
             Medium::Ethernet => caps.max_transmission_unit - ETHERNET_HEADER_LEN,
             #[cfg(feature = "medium-ip")]
             Medium::Ip => caps.max_transmission_unit,
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => crate::sixlowpan::ip_mtu(caps.max_transmission_unit),
         };
         mtu.min(PACKET_BUF_SIZE - LINK_HEADER_LEN)
     }
 
     /// Whether the device can take one more frame right now.
-    #[cfg(any(feature = "udp", feature = "tcp", feature = "raw", feature = "ipv4-fragmentation"))]
+    #[cfg(any(
+        feature = "udp",
+        feature = "tcp",
+        feature = "raw",
+        feature = "ipv4-fragmentation",
+        feature = "sixlowpan-fragmentation",
+        feature = "medium-ethernet",
+        feature = "medium-ieee802154"
+    ))]
     pub(crate) fn can_transmit(&mut self) -> bool {
         self.dev.can_transmit()
+    }
+
+    /// Whether a new packet can be handed to the interface right now.
+    ///
+    /// Unlike [`can_transmit`](Self::can_transmit), this is `false` while the
+    /// fragments of a packet are still going out: they have first claim on the
+    /// device, and a new packet would take their room, or need the fragmenter
+    /// itself.
+    #[cfg(any(
+        feature = "udp",
+        feature = "tcp",
+        feature = "raw",
+        feature = "medium-ethernet",
+        feature = "medium-ieee802154"
+    ))]
+    pub(crate) fn can_transmit_new_packet(&mut self) -> bool {
+        #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
+        if !self.fragmenter.is_empty() {
+            return false;
+        }
+        self.can_transmit()
     }
 
     /// The assigned addresses, without their origin.
@@ -2980,7 +3121,16 @@ impl IfaceState<'_> {
     /// This function tries to find the first IPv4 address from the interface
     /// that is in the same subnet as the destination address. If no such
     /// address is found, the first IPv4 address from the interface is returned.
-    #[cfg(all(feature = "ipv4", any(feature = "medium-ethernet", feature = "udp", feature = "tcp")))]
+    // Used by ARP, the sockets, and the neighbor-failure ICMP error.
+    #[cfg(all(
+        feature = "ipv4",
+        any(
+            feature = "medium-ethernet",
+            feature = "udp",
+            feature = "tcp",
+            all(feature = "medium-ieee802154", feature = "icmp-errors")
+        )
+    ))]
     fn get_source_address_ipv4(&self, dst_addr: &Ipv4Address) -> Option<Ipv4Address> {
         let mut first_ipv4 = None;
         for cidr in self.cidrs() {
@@ -3013,7 +3163,7 @@ impl IfaceState<'_> {
 
     /// Checks if an address is broadcast, taking into account ipv4 subnet-local
     /// broadcast addresses.
-    #[cfg(any(feature = "medium-ethernet", feature = "udp"))]
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154", feature = "udp"))]
     pub(crate) fn is_broadcast(&self, address: &IpAddress) -> bool {
         match address {
             #[cfg(feature = "ipv4")]
@@ -3200,7 +3350,26 @@ impl IfaceState<'_> {
 
 /// Scan the NDISC options of a neighbor solicitation/advertisement for the (source or
 /// target) link-layer address option.
-#[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
+/// The length of an NDISC link-layer address option carrying `addr`: type
+/// and length bytes plus the address, padded to a multiple of 8 (8 for an
+/// Ethernet address, 16 for an extended 802.15.4 address, RFC 4944 §8).
+#[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
+pub(crate) fn lladdr_option_len(addr: HardwareAddress) -> usize {
+    (2 + addr.as_bytes().len()).div_ceil(8) * 8
+}
+
+/// Write an NDISC link-layer address option into `opt`, which must be
+/// [`lladdr_option_len`] bytes long. The padding bytes are zeroed.
+#[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
+pub(crate) fn write_lladdr_option(opt: &mut [u8], option_type: NdiscOptionType, addr: HardwareAddress) {
+    opt.fill(0);
+    let mut opt = NdiscOption::new_unchecked(opt);
+    opt.set_option_type(option_type);
+    opt.set_data_len((lladdr_option_len(addr) / 8) as u8);
+    opt.set_link_layer_addr(RawHardwareAddress::from(addr));
+}
+
+#[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 fn ndisc_lladdr_option(
     icmp_packet: &mut Icmpv6Packet<'_>,
     option_type: NdiscOptionType,
@@ -3233,7 +3402,7 @@ fn ndisc_lladdr_option(
     feature = "udp",
     feature = "tcp"
 ))]
-mod test {
+pub(crate) mod test {
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
     use std::rc::Rc;
@@ -3270,15 +3439,15 @@ mod test {
 
     /// A mock device: receives injected packets, records transmitted frames.
     /// `room` limits how many more frames it accepts (`None`: unlimited).
-    struct TestDevice {
-        medium: Medium,
-        mtu: usize,
-        rx: Rc<RefCell<VecDeque<Vec<u8>>>>,
-        tx: Rc<RefCell<Vec<Vec<u8>>>>,
-        room: Room,
+    pub(crate) struct TestDevice {
+        pub(crate) medium: Medium,
+        pub(crate) mtu: usize,
+        pub(crate) rx: Rc<RefCell<VecDeque<Vec<u8>>>>,
+        pub(crate) tx: Rc<RefCell<Vec<Vec<u8>>>>,
+        pub(crate) room: Room,
     }
 
-    type Room = Rc<Cell<Option<usize>>>;
+    pub(crate) type Room = Rc<Cell<Option<usize>>>;
 
     impl Interface for TestDevice {
         fn capabilities(&self) -> IfaceCapabilities {
@@ -3315,8 +3484,8 @@ mod test {
     const OUR_V6: Ipv6Address = Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 1);
     const REMOTE_V6: Ipv6Address = Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 2);
 
-    type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
-    type Sent = Rc<RefCell<Vec<Vec<u8>>>>;
+    pub(crate) type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
+    pub(crate) type Sent = Rc<RefCell<Vec<Vec<u8>>>>;
 
     /// A stack with one interface of the given medium, owning [`OUR_V4`]/24 and
     /// [`OUR_V6`]/64.
@@ -3348,6 +3517,8 @@ mod test {
                 match medium {
                     Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
                     Medium::Ip => HardwareAddress::Ip,
+                    #[cfg(feature = "medium-ieee802154")]
+                    Medium::Ieee802154 => HardwareAddress::Ieee802154(Ieee802154Address::Extended([0x02; 8])),
                 },
             )
             .unwrap();
@@ -3661,7 +3832,7 @@ mod test {
     }
 
     /// Inject a packet into the device and poll the stack to process it.
-    fn inject(stack: &mut Stack, rx: &Queue, bytes: Vec<u8>) {
+    pub(crate) fn inject(stack: &mut Stack, rx: &Queue, bytes: Vec<u8>) {
         rx.borrow_mut().push_back(bytes);
         stack.poll(Instant::ZERO);
     }
@@ -3685,7 +3856,12 @@ mod test {
     }
 
     /// A whole IPv6 packet.
-    fn ipv6_packet(src_addr: Ipv6Address, dst_addr: Ipv6Address, protocol: IpProtocol, payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn ipv6_packet(
+        src_addr: Ipv6Address,
+        dst_addr: Ipv6Address,
+        protocol: IpProtocol,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut bytes = vec![0; IPV6_HEADER_LEN + payload.len()];
         {
             let mut ip = Ipv6Packet::new_unchecked(&mut bytes[..]);
@@ -3701,7 +3877,13 @@ mod test {
     }
 
     /// A UDP datagram (UDP header + payload), checksum filled in.
-    fn udp_datagram(src_addr: IpAddress, src_port: u16, dst_addr: IpAddress, dst_port: u16, payload: &[u8]) -> Vec<u8> {
+    pub(crate) fn udp_datagram(
+        src_addr: IpAddress,
+        src_port: u16,
+        dst_addr: IpAddress,
+        dst_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut bytes = vec![0; UDP_HEADER_LEN + payload.len()];
         {
             let mut udp = UdpPacket::new_unchecked(&mut bytes[..]);
@@ -4561,7 +4743,7 @@ mod test {
     }
 
     /// An ICMPv6 echo request or reply, checksum filled in.
-    fn icmpv6_echo(
+    pub(crate) fn icmpv6_echo(
         msg_type: Icmpv6Message,
         ident: u16,
         seq_no: u16,
@@ -4884,6 +5066,8 @@ mod test {
         match medium {
             Medium::Ethernet => ETHERNET_HEADER_LEN,
             Medium::Ip => 0,
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => unreachable!(),
         }
     }
 
@@ -4904,6 +5088,8 @@ mod test {
                 frame[ETHERNET_HEADER_LEN..].copy_from_slice(packet);
                 frame
             }
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => unreachable!(),
         }
     }
 

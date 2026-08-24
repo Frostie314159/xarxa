@@ -16,9 +16,9 @@ use crate::route::{Route as IfaceRoute, RouteOrigin};
 use crate::stack::{AddrOrigin, IfaceAddr, IfaceState, StackInner};
 use crate::time::{Duration, Instant};
 use crate::wire::{
-    ETHERNET_HEADER_LEN, IPV6_HEADER_LEN, IPV6_LINK_LOCAL_ALL_ROUTERS, Icmpv6Message, Icmpv6Packet, IpCidr,
-    Ipv6Address, Ipv6Cidr, NdiscOption, NdiscOptionType, NdiscPrefixInfoFlags, NdiscRouterFlags, RawHardwareAddress,
-    ipv6::AddressExt,
+    HardwareAddress, IPV6_HEADER_LEN, IPV6_LINK_LOCAL_ALL_ROUTERS, Icmpv6Message, Icmpv6Packet, IpCidr, Ipv6Address,
+    Ipv6Cidr, LINK_HEADER_LEN, NdiscOption, NdiscOptionType, NdiscPrefixInfoFlags, NdiscRouterFlags,
+    RawHardwareAddress, ipv6::AddressExt,
 };
 
 const MAX_RTR_SOLICITATIONS: u8 = 3;
@@ -354,13 +354,13 @@ impl Slaac {
 
 /// Form the address `link_prefix` + EUI-64 of `hardware_addr`, if the prefix is
 /// 64 bits long.
-fn from_link_prefix(link_prefix: &Ipv6Cidr, ethernet_addr: crate::wire::EthernetAddress) -> Option<Ipv6Cidr> {
+fn from_link_prefix(link_prefix: &Ipv6Cidr, hardware_addr: HardwareAddress) -> Option<Ipv6Cidr> {
     if link_prefix.prefix_len() != 64 {
         return None;
     }
     let mut bytes = [0; 16];
     bytes[0..8].copy_from_slice(&link_prefix.address().octets()[0..8]);
-    bytes[8..16].copy_from_slice(&ethernet_addr.as_eui_64());
+    bytes[8..16].copy_from_slice(&hardware_addr.as_eui_64()?);
     Some(Ipv6Cidr::new(Ipv6Address::from_octets(bytes), 64))
 }
 
@@ -415,7 +415,7 @@ impl IfaceState<'_> {
         slaac.process_advertisement(&src_addr, flags, router_lifetime, prefixes, inner.now);
 
         if let Some(lladdr) = lladdr
-            && let Ok(lladdr) = lladdr.parse_ethernet()
+            && let Ok(lladdr) = lladdr.parse(self.medium())
             && lladdr.is_unicast()
         {
             inner.fill_neighbor(self, crate::wire::IpAddress::Ipv6(src_addr), lladdr);
@@ -425,7 +425,7 @@ impl IfaceState<'_> {
     /// Synchronize the slaac address and router state with the interface state.
     pub(crate) fn sync_slaac_state(&mut self, inner: &mut StackInner) {
         let timestamp = inner.now;
-        let ethernet_addr = self.ethernet_addr();
+        let hardware_addr = self.hardware_addr;
         let Some(slaac) = &self.slaac else { return };
 
         // Addresses come and go without touching the link state: the router that
@@ -436,7 +436,7 @@ impl IfaceState<'_> {
             if !prefixinfo.is_valid(timestamp) {
                 continue;
             }
-            let Some(address) = from_link_prefix(prefix, ethernet_addr) else {
+            let Some(address) = from_link_prefix(prefix, hardware_addr) else {
                 continue;
             };
             if !self.ip_addrs.iter().any(|a| a.cidr == IpCidr::Ipv6(address)) {
@@ -454,7 +454,7 @@ impl IfaceState<'_> {
             IpCidr::Ipv6(address) => {
                 !(a.origin == AddrOrigin::Slaac
                     && slaac.prefix.iter().any(|(prefix, prefixinfo)| {
-                        !prefixinfo.is_valid(timestamp) && from_link_prefix(prefix, ethernet_addr) == Some(address)
+                        !prefixinfo.is_valid(timestamp) && from_link_prefix(prefix, hardware_addr) == Some(address)
                     }))
             }
             #[allow(unreachable_patterns)]
@@ -524,25 +524,25 @@ impl IfaceState<'_> {
         let dst_addr = IPV6_LINK_LOCAL_ALL_ROUTERS;
 
         // Router solicit: RS header (8 bytes) plus the source link-layer address
-        // option (8 bytes).
+        // option.
         let Some(mut buf) = PacketBuf::try_new() else {
             // The retry timer sends the next one.
             trace!("ndisc: no packet buffer for router solicit");
             return;
         };
-        buf.reserve(ETHERNET_HEADER_LEN + IPV6_HEADER_LEN);
-        buf.set_len(8 + 8);
+        let opt_len = crate::stack::lladdr_option_len(self.hardware_addr);
+        buf.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
+        buf.set_len(8 + opt_len);
         {
             let mut rs = Icmpv6Packet::new_unchecked(&mut buf);
             rs.set_msg_type(Icmpv6Message::RouterSolicit);
             rs.set_msg_code(0);
             rs.clear_reserved();
-            {
-                let mut opt = NdiscOption::new_unchecked(rs.payload_mut());
-                opt.set_option_type(NdiscOptionType::SourceLinkLayerAddr);
-                opt.set_data_len(1);
-                opt.set_link_layer_addr(RawHardwareAddress::from(self.ethernet_addr()));
-            }
+            crate::stack::write_lladdr_option(
+                rs.payload_mut(),
+                NdiscOptionType::SourceLinkLayerAddr,
+                self.hardware_addr,
+            );
             rs.fill_checksum(&src_addr, &dst_addr);
         }
         // The all-routers destination is multicast, so this never waits on neighbor

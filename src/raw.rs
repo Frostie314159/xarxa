@@ -680,6 +680,8 @@ mod test {
                 match medium {
                     Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
                     Medium::Ip => HardwareAddress::Ip,
+                    #[cfg(feature = "medium-ieee802154")]
+                    Medium::Ieee802154 => unreachable!(),
                 },
             )
             .unwrap();

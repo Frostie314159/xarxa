@@ -1,27 +1,70 @@
-//! IPv4 fragmentation (feature `ipv4-fragmentation`).
+//! Fragmentation of outgoing packets: IPv4 (feature `ipv4-fragmentation`) and
+//! 6LoWPAN (feature `sixlowpan-fragmentation`).
 //!
 //! The packet is built whole first, then kept in the interface's [`Fragmenter`]
-//! while its fragments are copied out into fresh buffers, one per fragment, with
-//! the IP header byte-copied and patched. Fragmentation pays one extra copy, on
-//! purpose: it is a fallback path.
+//! while its fragments are copied out into fresh buffers, one per fragment. For
+//! IPv4 the IP header is byte-copied and patched onto each; for 6LoWPAN the
+//! compressed packet is cut into pieces behind fragment headers. Fragmentation
+//! pays one extra copy, on purpose: it is a fallback path.
 
 use crate::buf::PacketBuf;
+#[cfg(feature = "ipv4-fragmentation")]
 use crate::rand::Rand;
 use crate::stack::{IfaceState, StackInner};
 use crate::wire::*;
 
 pub(crate) struct Fragmenter {
-    /// The packet being fragmented, IP header included. `None` when there is nothing
-    /// to transmit.
+    /// The packet being fragmented: the IP packet, header included, or the
+    /// compressed 6LoWPAN packet. `None` when there is nothing to transmit.
     pub buffer: Option<PacketBuf>,
-    /// The size of the packet, IP header included.
+    /// The size of the packet.
     pub packet_len: usize,
     /// The amount of bytes that already have been transmitted.
     pub sent_bytes: usize,
 
+    #[cfg(feature = "ipv4-fragmentation")]
     pub ipv4: Ipv4Fragmenter,
+    #[cfg(feature = "sixlowpan-fragmentation")]
+    pub sixlowpan: SixlowpanFragmenter,
 }
 
+#[cfg(feature = "sixlowpan-fragmentation")]
+pub(crate) struct SixlowpanFragmenter {
+    /// The size of the whole IPv6 datagram.
+    pub datagram_size: u16,
+    /// The tag every fragment of the datagram carries.
+    pub datagram_tag: u16,
+    /// The offset of the next fragment, in bytes of the uncompressed datagram.
+    pub datagram_offset: usize,
+    /// The payload size of the first fragment.
+    pub frag1_size: usize,
+    /// The payload size of every fragment but the first (the last may be shorter).
+    pub fragn_size: usize,
+    /// The bytes compression took off the header chain.
+    pub header_diff: usize,
+    /// The link-layer destination address.
+    pub ll_dst_addr: Ieee802154Address,
+    /// The link-layer source address.
+    pub ll_src_addr: Ieee802154Address,
+}
+
+#[cfg(feature = "sixlowpan-fragmentation")]
+impl SixlowpanFragmenter {
+    const fn new() -> Self {
+        Self {
+            datagram_size: 0,
+            datagram_tag: 0,
+            datagram_offset: 0,
+            frag1_size: 0,
+            fragn_size: 0,
+            header_diff: 0,
+            ll_dst_addr: Ieee802154Address::Absent,
+            ll_src_addr: Ieee802154Address::Absent,
+        }
+    }
+}
+
+#[cfg(feature = "ipv4-fragmentation")]
 pub(crate) struct Ipv4Fragmenter {
     /// The destination address.
     pub dst_addr: IpAddress,
@@ -40,12 +83,15 @@ impl Fragmenter {
             packet_len: 0,
             sent_bytes: 0,
 
+            #[cfg(feature = "ipv4-fragmentation")]
             ipv4: Ipv4Fragmenter {
                 dst_addr: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
                 next_hop: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
                 frag_offset: 0,
                 ident: 0,
             },
+            #[cfg(feature = "sixlowpan-fragmentation")]
+            sixlowpan: SixlowpanFragmenter::new(),
         }
     }
 
@@ -67,14 +113,43 @@ impl Fragmenter {
         self.packet_len = 0;
         self.sent_bytes = 0;
 
-        self.ipv4.dst_addr = IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
-        self.ipv4.next_hop = IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
-        self.ipv4.frag_offset = 0;
-        self.ipv4.ident = 0;
+        #[cfg(feature = "ipv4-fragmentation")]
+        {
+            self.ipv4.dst_addr = IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
+            self.ipv4.next_hop = IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
+            self.ipv4.frag_offset = 0;
+            self.ipv4.ident = 0;
+        }
+        #[cfg(feature = "sixlowpan-fragmentation")]
+        {
+            self.sixlowpan = SixlowpanFragmenter::new();
+        }
+    }
+}
+
+impl StackInner {
+    /// Transmit the fragments still waiting in the interface's fragmenter.
+    ///
+    /// An IEEE 802.15.4 interface's fragmenter holds a 6LoWPAN packet, any
+    /// other's an IPv4 packet.
+    pub(crate) fn fragment_egress(&mut self, iface: &mut IfaceState<'_>) {
+        match iface.medium() {
+            #[cfg(feature = "medium-ieee802154")]
+            crate::iface::Medium::Ieee802154 => {
+                #[cfg(feature = "sixlowpan-fragmentation")]
+                self.sixlowpan_egress(iface);
+            }
+            #[allow(unreachable_patterns)]
+            _ => {
+                #[cfg(feature = "ipv4-fragmentation")]
+                self.ipv4_egress(iface);
+            }
+        }
     }
 }
 
 /// The first IPv4 fragment identifier, drawn from the PRNG.
+#[cfg(feature = "ipv4-fragmentation")]
 pub(crate) fn initial_ipv4_id(rand: &mut Rand) -> u16 {
     loop {
         let ipv4_id = rand.rand_u16();
@@ -84,6 +159,7 @@ pub(crate) fn initial_ipv4_id(rand: &mut Rand) -> u16 {
     }
 }
 
+#[cfg(feature = "ipv4-fragmentation")]
 impl StackInner {
     /// Get the next IPv4 fragment identifier.
     pub(crate) fn next_ipv4_frag_ident(&mut self) -> u16 {
@@ -211,6 +287,7 @@ impl StackInner {
     }
 }
 
+#[cfg(feature = "ipv4-fragmentation")]
 impl IfaceState<'_> {
     /// The maximum IPv4 payload fragment size, aligned per spec.
     pub(crate) fn max_ipv4_fragment_size(&self, ip_header_len: usize) -> usize {

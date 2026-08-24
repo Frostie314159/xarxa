@@ -113,6 +113,13 @@ impl TunTapInterface {
             Medium::Ip => IFF_TUN,
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => IFF_TAP,
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "TUN/TAP interfaces do not carry IEEE 802.15.4 frames",
+                ));
+            }
         };
         ifr.ifr_data = mode | IFF_NO_PI;
         ifreq_ioctl(lower, ifr, TUNSETIFF).map(|_| ())
@@ -143,6 +150,8 @@ impl TunTapInterface {
             Medium::Ip => ip_mtu,
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => ip_mtu + ETHERNET_HEADER_LEN,
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => unreachable!(),
         };
 
         Ok(mtu)

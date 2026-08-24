@@ -41,6 +41,8 @@ mod ethernet;
 mod icmpv4;
 #[cfg(feature = "ipv6")]
 mod icmpv6;
+#[cfg(feature = "medium-ieee802154")]
+mod ieee802154;
 #[cfg(all(feature = "ipv4", feature = "multicast"))]
 mod igmp;
 pub(crate) mod ip;
@@ -52,13 +54,15 @@ pub(crate) mod ipv6;
 mod ipv6ext;
 #[cfg(all(feature = "ipv6", feature = "multicast"))]
 mod mld;
-#[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
+#[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 mod ndisc;
-#[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
+#[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 mod ndiscoption;
+#[cfg(feature = "medium-ieee802154")]
+pub mod sixlowpan;
 #[cfg(feature = "tcp")]
 mod tcp;
-#[cfg(any(feature = "udp", feature = "dhcpv4"))]
+#[cfg(any(feature = "udp", feature = "dhcpv4", feature = "medium-ieee802154"))]
 mod udp;
 
 use core::fmt;
@@ -152,18 +156,41 @@ pub use self::mld::{
     ADDRESS_RECORD_LEN as MLD_ADDRESS_RECORD_LEN, AddressRecord as MldAddressRecord, RecordType as MldRecordType,
 };
 
-#[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
+#[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 pub use self::ndisc::{NeighborFlags as NdiscNeighborFlags, RouterFlags as NdiscRouterFlags};
 
-#[cfg(all(feature = "medium-ethernet", feature = "ipv6"))]
+#[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 pub use self::ndiscoption::{NdiscOption, PrefixInfoFlags as NdiscPrefixInfoFlags, Type as NdiscOptionType};
+
+#[cfg(feature = "medium-ieee802154")]
+pub use self::ieee802154::{
+    Address as Ieee802154Address, AddressingMode as Ieee802154AddressingMode, Frame as Ieee802154Frame,
+    FrameType as Ieee802154FrameType, FrameVersion as Ieee802154FrameVersion,
+    MAX_HEADER_LEN as IEEE802154_MAX_HEADER_LEN, Pan as Ieee802154Pan, Repr as Ieee802154Repr,
+};
+
+#[cfg(feature = "medium-ieee802154")]
+pub use self::sixlowpan::{
+    AddressContext as SixlowpanAddressContext, NextHeader as SixlowpanNextHeader, SixlowpanPacket,
+    frag::{
+        FIRST_FRAGMENT_HEADER_SIZE as SIXLOWPAN_FIRST_FRAGMENT_HEADER_SIZE, Key as SixlowpanFragKey,
+        NEXT_FRAGMENT_HEADER_SIZE as SIXLOWPAN_NEXT_FRAGMENT_HEADER_SIZE, Packet as SixlowpanFragPacket,
+        Repr as SixlowpanFragRepr,
+    },
+    iphc::{MAX_HEADER_LEN as SIXLOWPAN_IPHC_MAX_HEADER_LEN, Packet as SixlowpanIphcPacket, Repr as SixlowpanIphcRepr},
+    nhc::{
+        ExtHeaderId as SixlowpanExtHeaderId, ExtHeaderPacket as SixlowpanExtHeaderPacket,
+        ExtHeaderRepr as SixlowpanExtHeaderRepr, NhcPacket as SixlowpanNhcPacket,
+        UdpNhcPacket as SixlowpanUdpNhcPacket, UdpNhcRepr as SixlowpanUdpNhcRepr,
+    },
+};
 
 #[cfg(feature = "tcp")]
 pub use self::tcp::{
     Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, Packet as TcpPacket, SeqNumber as TcpSeqNumber, TcpOption,
 };
 
-#[cfg(any(feature = "udp", feature = "dhcpv4"))]
+#[cfg(any(feature = "udp", feature = "dhcpv4", feature = "medium-ieee802154"))]
 pub use self::udp::{HEADER_LEN as UDP_HEADER_LEN, Packet as UdpPacket};
 
 #[cfg(feature = "dns")]
@@ -204,6 +231,9 @@ pub enum HardwareAddress {
     /// Requires the `medium-ip` feature.
     #[cfg(feature = "medium-ip")]
     Ip,
+    /// An IEEE 802.15.4 address. Requires the `medium-ieee802154` feature.
+    #[cfg(feature = "medium-ieee802154")]
+    Ieee802154(Ieee802154Address),
 }
 
 impl HardwareAddress {
@@ -214,6 +244,81 @@ impl HardwareAddress {
             HardwareAddress::Ethernet(_) => Medium::Ethernet,
             #[cfg(feature = "medium-ip")]
             HardwareAddress::Ip => Medium::Ip,
+            #[cfg(feature = "medium-ieee802154")]
+            HardwareAddress::Ieee802154(_) => Medium::Ieee802154,
+        }
+    }
+
+    /// The address as bytes. Empty for [`Ip`](Self::Ip).
+    pub const fn as_bytes(&self) -> &[u8] {
+        match self {
+            #[cfg(feature = "medium-ethernet")]
+            HardwareAddress::Ethernet(addr) => addr.as_bytes(),
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => &[],
+            #[cfg(feature = "medium-ieee802154")]
+            HardwareAddress::Ieee802154(addr) => addr.as_bytes(),
+        }
+    }
+
+    /// Query whether the address is an unicast address.
+    ///
+    /// `false` for [`Ip`](Self::Ip).
+    pub fn is_unicast(&self) -> bool {
+        match self {
+            #[cfg(feature = "medium-ethernet")]
+            HardwareAddress::Ethernet(addr) => addr.is_unicast(),
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => false,
+            #[cfg(feature = "medium-ieee802154")]
+            HardwareAddress::Ieee802154(addr) => addr.is_unicast(),
+        }
+    }
+
+    /// Query whether the address is the broadcast address of its medium.
+    ///
+    /// `false` for [`Ip`](Self::Ip).
+    pub fn is_broadcast(&self) -> bool {
+        match self {
+            #[cfg(feature = "medium-ethernet")]
+            HardwareAddress::Ethernet(addr) => addr.is_broadcast(),
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => false,
+            #[cfg(feature = "medium-ieee802154")]
+            HardwareAddress::Ieee802154(addr) => addr.is_broadcast(),
+        }
+    }
+
+    /// Convert the address to a modified EUI-64 interface identifier.
+    ///
+    /// `None` for [`Ip`](Self::Ip), and for a short or absent 802.15.4 address.
+    pub fn as_eui_64(&self) -> Option<[u8; 8]> {
+        match self {
+            #[cfg(feature = "medium-ethernet")]
+            HardwareAddress::Ethernet(addr) => Some(addr.as_eui_64()),
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => None,
+            #[cfg(feature = "medium-ieee802154")]
+            HardwareAddress::Ieee802154(addr) => addr.as_eui_64(),
+        }
+    }
+
+    /// The IEEE 802.15.4 address, or `None` if this is not one.
+    #[cfg(feature = "medium-ieee802154")]
+    pub const fn ieee802154(&self) -> Option<Ieee802154Address> {
+        match self {
+            HardwareAddress::Ieee802154(addr) => Some(*addr),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    #[cfg(feature = "medium-ieee802154")]
+    pub(crate) fn ieee802154_or_panic(&self) -> Ieee802154Address {
+        match self {
+            HardwareAddress::Ieee802154(addr) => *addr,
+            #[allow(unreachable_patterns)]
+            _ => panic!("hardware address is not an IEEE 802.15.4 address"),
         }
     }
 
@@ -244,7 +349,16 @@ impl fmt::Display for HardwareAddress {
             HardwareAddress::Ethernet(addr) => write!(f, "{addr}"),
             #[cfg(feature = "medium-ip")]
             HardwareAddress::Ip => write!(f, "none"),
+            #[cfg(feature = "medium-ieee802154")]
+            HardwareAddress::Ieee802154(addr) => write!(f, "{addr}"),
         }
+    }
+}
+
+#[cfg(feature = "medium-ieee802154")]
+impl From<Ieee802154Address> for HardwareAddress {
+    fn from(addr: Ieee802154Address) -> Self {
+        HardwareAddress::Ieee802154(addr)
     }
 }
 
@@ -255,7 +369,14 @@ impl From<EthernetAddress> for HardwareAddress {
     }
 }
 
+/// The longest hardware address of any enabled medium: 8 with
+/// `medium-ieee802154`, 6 otherwise.
+#[cfg(not(feature = "medium-ieee802154"))]
 pub const MAX_HARDWARE_ADDRESS_LEN: usize = 6;
+/// The longest hardware address of any enabled medium: 8 with
+/// `medium-ieee802154`, 6 otherwise.
+#[cfg(feature = "medium-ieee802154")]
+pub const MAX_HARDWARE_ADDRESS_LEN: usize = 8;
 
 /// Unparsed hardware address.
 ///
@@ -294,12 +415,33 @@ impl RawHardwareAddress {
         self.len == 0
     }
 
-    /// Parse the address as an Ethernet address, if it has the right length.
-    pub fn parse_ethernet(&self) -> Result<EthernetAddress> {
-        if self.len() != 6 {
-            return Err(Error);
+    /// Parse the address as an address of the given medium.
+    ///
+    /// Errors:
+    /// - `Error` if the length is wrong for the medium: 6 bytes for Ethernet,
+    ///   8 (an extended address) for IEEE 802.15.4, or if the medium has no
+    ///   addresses.
+    pub fn parse(&self, medium: Medium) -> Result<HardwareAddress> {
+        match medium {
+            #[cfg(feature = "medium-ethernet")]
+            Medium::Ethernet => {
+                if self.len() != 6 {
+                    return Err(Error);
+                }
+                Ok(HardwareAddress::Ethernet(EthernetAddress::from_bytes(self.as_bytes())))
+            }
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => {
+                if self.len() != 8 {
+                    return Err(Error);
+                }
+                Ok(HardwareAddress::Ieee802154(Ieee802154Address::from_bytes(
+                    self.as_bytes(),
+                )))
+            }
+            #[cfg(feature = "medium-ip")]
+            Medium::Ip => Err(Error),
         }
-        Ok(EthernetAddress::from_bytes(self.as_bytes()))
     }
 }
 
@@ -315,18 +457,65 @@ impl core::fmt::Display for RawHardwareAddress {
     }
 }
 
+#[cfg(feature = "medium-ethernet")]
 impl From<EthernetAddress> for RawHardwareAddress {
     fn from(addr: EthernetAddress) -> Self {
         Self::from_bytes(addr.as_bytes())
     }
 }
 
+#[cfg(feature = "medium-ieee802154")]
+impl From<Ieee802154Address> for RawHardwareAddress {
+    fn from(addr: Ieee802154Address) -> Self {
+        Self::from_bytes(addr.as_bytes())
+    }
+}
+
+impl From<HardwareAddress> for RawHardwareAddress {
+    fn from(addr: HardwareAddress) -> Self {
+        Self::from_bytes(addr.as_bytes())
+    }
+}
+
 #[cfg(test)]
 mod test {
+    #[allow(unused_imports)]
+    use super::*;
+
     /// A build that only drives IP interfaces pays nothing for hardware addresses.
     #[test]
-    #[cfg(all(feature = "medium-ip", not(feature = "medium-ethernet")))]
+    #[cfg(all(
+        feature = "medium-ip",
+        not(feature = "medium-ethernet"),
+        not(feature = "medium-ieee802154")
+    ))]
     fn test_hardware_address_is_zero_sized() {
         assert_eq!(core::mem::size_of::<super::HardwareAddress>(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "medium-ethernet")]
+    fn test_parse_hardware_address_ethernet() {
+        let parse = |bytes: &[u8]| RawHardwareAddress::from_bytes(bytes).parse(Medium::Ethernet);
+        assert_eq!(
+            parse(&[0u8; 6]),
+            Ok(HardwareAddress::Ethernet(EthernetAddress([0, 0, 0, 0, 0, 0])))
+        );
+        assert_eq!(parse(&[1u8; 5]), Err(Error));
+        // A 7-byte address only fits `RawHardwareAddress` with `medium-ieee802154`.
+        #[cfg(feature = "medium-ieee802154")]
+        assert_eq!(parse(&[1u8; 7]), Err(Error));
+    }
+
+    #[test]
+    #[cfg(feature = "medium-ieee802154")]
+    fn test_parse_hardware_address_ieee802154() {
+        let parse = |bytes: &[u8]| RawHardwareAddress::from_bytes(bytes).parse(Medium::Ieee802154);
+        assert_eq!(
+            parse(&[0u8; 8]),
+            Ok(HardwareAddress::Ieee802154(Ieee802154Address::Extended([0; 8])))
+        );
+        assert_eq!(parse(&[1u8; 2]), Err(Error));
+        assert_eq!(parse(&[1u8; 1]), Err(Error));
     }
 }
