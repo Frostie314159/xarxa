@@ -133,6 +133,13 @@ packet-buf-count-1024 = []
 packet-buf-count-2048 = []
 packet-buf-count-4096 = []
 
+packet-buf-align-1 = [] # Default
+packet-buf-align-2 = []
+packet-buf-align-4 = []
+packet-buf-align-8 = []
+packet-buf-align-16 = []
+packet-buf-align-32 = []
+
 iface-count-1 = []
 iface-count-2 = [] # Default
 iface-count-3 = []
