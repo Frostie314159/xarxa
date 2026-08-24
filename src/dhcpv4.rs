@@ -875,10 +875,10 @@ mod test {
 
     /// [`test_stack`], with a device that claims to handle the given checksums itself.
     fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
-        let dev = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
-        let (rx, tx) = (dev.rx.clone(), dev.tx.clone());
+        let driver = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
+        let (rx, tx) = (driver.rx.clone(), driver.tx.clone());
         let mut stack = Stack::new(1);
-        let handle = dev.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
+        let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         assert_eq!(handle, IFACE);
         // Drain the solicited-node multicast report the link-local address triggers,
         // so the tests only see the frames DHCP provokes.

@@ -1,4 +1,4 @@
-//! The mock [`Interface`] the tests drive the stack with.
+//! The mock [`Driver`] the tests drive the stack with.
 //!
 //! One device covers every test: it hands the stack the frames pushed into its
 //! receive queue, records the ones it transmits, refuses to transmit when asked
@@ -18,7 +18,7 @@ use std::rc::Rc;
 use std::vec::Vec;
 
 use xarxa::PacketBuf;
-use xarxa::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, LinkState, Medium};
+use xarxa::iface::{ChecksumCapabilities, Driver, IfaceCapabilities, LinkState, Medium};
 #[cfg(feature = "packetmeta-id")]
 use xarxa::meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]
@@ -143,13 +143,13 @@ impl TestDevice {
     /// The stack gets its own copy, sharing this one's queues. It is leaked, so
     /// the interface lives as long as the test wants it to.
     pub fn install(&self, stack: &mut Stack<'_>, hw: HardwareAddress) -> IfaceHandle {
-        let mut dev = self.clone();
-        dev.hardware_addr = hw;
-        stack.add_iface_borrowed(Box::leak(Box::new(dev))).unwrap()
+        let mut driver = self.clone();
+        driver.hardware_addr = hw;
+        stack.add_iface_borrowed(Box::leak(Box::new(driver))).unwrap()
     }
 }
 
-impl Interface for TestDevice {
+impl Driver for TestDevice {
     fn capabilities(&self) -> IfaceCapabilities {
         let mut caps = IfaceCapabilities::default();
         caps.medium = self.medium;

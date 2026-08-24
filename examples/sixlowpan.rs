@@ -64,11 +64,11 @@ fn main() {
     let hardware_addr = HardwareAddress::Ieee802154(Ieee802154Address::Extended([
         0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
     ]));
-    let device = RawSocketInterface::new(&name, hardware_addr).unwrap();
-    let fd = device.as_raw_fd();
+    let driver = RawSocketInterface::new(&name, hardware_addr).unwrap();
+    let fd = driver.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());
-    let iface = stack.add_iface(Box::new(device)).unwrap();
+    let iface = stack.add_iface(Box::new(driver)).unwrap();
     // The link-local address is derived from the extended address:
     // fe80::180b:4242:4242:4242.
     stack.iface(iface).set_pan_id(Some(Ieee802154Pan(0xbeef)));

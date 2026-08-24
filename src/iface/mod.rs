@@ -1,13 +1,13 @@
 /*! Network interfaces.
 
-The `iface` module deals with the *network devices*. It provides the [Interface] trait, which
+The `iface` module deals with the *network devices*. It provides the [Driver] trait, which
 drivers implement to exchange owned [`PacketBuf`]s with the stack:
 
   * on receive, the driver hands a filled buffer up to the stack;
   * on transmit, the stack hands a built frame down to the driver, which owns the buffer
     until the hardware is done with it, then drops it.
 
-This module provides two implementations of [Interface] for the host OS: the
+This module provides two implementations of [Driver] for the host OS: the
 [TunTapInterface], a virtual TUN/TAP interface, and the [RawSocketInterface], a
 packet socket bound to an existing interface (Ethernet or IEEE 802.15.4).
 */
@@ -190,8 +190,8 @@ impl Default for IfaceCapabilities {
     }
 }
 
-/// An interface for sending and receiving raw network frames.
-pub trait Interface {
+/// A network device driver, sending and receiving raw network frames.
+pub trait Driver {
     /// Get a description of iface capabilities.
     fn capabilities(&self) -> IfaceCapabilities;
 
@@ -278,7 +278,7 @@ pub trait Interface {
     }
 }
 
-impl<T: Interface + ?Sized> Interface for &mut T {
+impl<T: Driver + ?Sized> Driver for &mut T {
     fn capabilities(&self) -> IfaceCapabilities {
         T::capabilities(self)
     }

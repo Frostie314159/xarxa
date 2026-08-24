@@ -13,7 +13,7 @@
 //!   contains the time the packet was received, measured by the interface driver's own clock.
 //! * **Transmit timestamping.** [`PacketMeta::request_timestamp`] asks the interface driver to
 //!   timestamp a packet as it goes out. The result comes back through
-//!   [`Interface::poll_tx_timestamp`](crate::iface::Interface::poll_tx_timestamp), as a
+//!   [`Driver::poll_tx_timestamp`](crate::iface::Driver::poll_tx_timestamp), as a
 //!   [`TxTimestamp`] tagged with the packet's `id`.
 
 /// A reading of a device's own clock.
@@ -71,7 +71,7 @@ pub struct PacketMeta {
     /// On received packets it is set by the driver. On packets to transmit it is set
     /// by the application and handed to the driver untouched. It is also used
     /// to correlates a transmit timestamp back to the packet that produced it, see
-    /// [`Interface::poll_tx_timestamp`](crate::iface::Interface::poll_tx_timestamp).
+    /// [`Driver::poll_tx_timestamp`](crate::iface::Driver::poll_tx_timestamp).
     ///
     /// Defaults to `0`.
     #[cfg(feature = "packetmeta-id")]
@@ -89,7 +89,7 @@ pub struct PacketMeta {
     /// Request that the device timestamp this packet as it is transmitted.
     ///
     /// The timestamp is reported back later, out of band, by
-    /// [`Interface::poll_tx_timestamp`](crate::iface::Interface::poll_tx_timestamp),
+    /// [`Driver::poll_tx_timestamp`](crate::iface::Driver::poll_tx_timestamp),
     /// tagged with this packet's [`id`](Self::id).
     ///
     /// Meaningful on packets to transmit only, ignored on received packets.
@@ -102,7 +102,7 @@ pub struct PacketMeta {
 }
 
 /// The timestamp of a transmitted packet, reported by
-/// [`Interface::poll_tx_timestamp`](crate::iface::Interface::poll_tx_timestamp).
+/// [`Driver::poll_tx_timestamp`](crate::iface::Driver::poll_tx_timestamp).
 #[cfg(feature = "packetmeta-timestamp")]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]

@@ -4,7 +4,7 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::buf::PacketBuf;
-use crate::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, Medium};
+use crate::iface::{ChecksumCapabilities, Driver, IfaceCapabilities, Medium};
 #[cfg(feature = "medium-ethernet")]
 use crate::wire::ETHERNET_HEADER_LEN;
 use crate::wire::HardwareAddress;
@@ -204,7 +204,7 @@ impl Drop for TunTapInterface {
     }
 }
 
-impl Interface for TunTapInterface {
+impl Driver for TunTapInterface {
     fn capabilities(&self) -> IfaceCapabilities {
         IfaceCapabilities {
             medium: self.hardware_addr.medium(),

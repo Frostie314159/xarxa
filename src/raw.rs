@@ -642,9 +642,9 @@ mod test {
     };
 
     fn add_test_iface(stack: &mut Stack, medium: Medium, ip_addrs: Vec<IpCidr>) -> (IfaceHandle, Sent) {
-        let dev = TestDevice::new(medium);
-        let tx = dev.tx.clone();
-        let handle = dev.install(
+        let driver = TestDevice::new(medium);
+        let tx = driver.tx.clone();
+        let handle = driver.install(
             stack,
             match medium {
                 Medium::Ethernet => HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
@@ -909,10 +909,10 @@ mod test {
     #[cfg(feature = "packetmeta-id")]
     #[test]
     fn test_packet_meta() {
-        let dev = TestDevice::new(Medium::Ethernet);
-        let sent = dev.tx_meta.clone();
+        let driver = TestDevice::new(Medium::Ethernet);
+        let sent = driver.tx_meta.clone();
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = dev.install(
+        let iface = driver.install(
             &mut stack,
             HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
         );

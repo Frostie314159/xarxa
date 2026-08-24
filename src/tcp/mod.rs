@@ -11267,14 +11267,14 @@ mod stack_test {
     };
 
     fn stack() -> (Stack<'static>, TestDevice) {
-        let dev = TestDevice::new(Medium::Ip);
+        let driver = TestDevice::new(Medium::Ip);
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = dev.install(&mut stack, HardwareAddress::Ip);
+        let handle = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
             .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
             .unwrap();
-        (stack, dev)
+        (stack, driver)
     }
 
     /// Build a full IPv4+TCP packet from the remote to the local endpoint,
@@ -11320,19 +11320,19 @@ mod stack_test {
     #[test]
     #[cfg(feature = "tcp-listener")]
     fn test_stack_handshake_data_and_close() {
-        let (mut stack, dev) = stack();
+        let (mut stack, driver) = stack();
         let lh = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(lh).listen(LOCAL_PORT).unwrap();
 
         // A SYN is recorded in the accept queue, nothing is transmitted until
         // the connection is accepted.
-        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(0));
-        assert!(dev.tx.borrow().is_empty());
+        assert!(driver.tx.borrow().is_empty());
         assert!(stack.tcp_listener(lh).can_accept());
 
         // Accept allocates the actual socket, and the next poll sends the
@@ -11344,34 +11344,34 @@ mod stack_test {
         stack.tcp_socket(h).set_ack_delay(None);
         assert_eq!(stack.tcp_socket(h).state(), State::SynReceived);
         stack.poll(Instant::from_millis(0));
-        let mut frame = dev.tx.borrow_mut().remove(0);
+        let mut frame = driver.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.syn() && tcp.ack());
             assert_eq!(tcp.seq_number(), LOCAL_SEQ);
             assert_eq!(tcp.ack_number(), REMOTE_SEQ + 1);
             assert_eq!(tcp.window_len(), 64);
         });
-        assert!(dev.tx.borrow().is_empty());
+        assert!(driver.tx.borrow().is_empty());
 
         // ACK of the SYN|ACK in: established.
-        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(1));
         assert_eq!(stack.tcp_socket(h).state(), State::Established);
-        assert!(dev.tx.borrow().is_empty());
+        assert!(driver.tx.borrow().is_empty());
 
         // Data in, ACK out, and the data is readable from the socket.
-        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
             payload: b"hello",
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(2));
-        let mut frame = dev.tx.borrow_mut().remove(0);
+        let mut frame = driver.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert_eq!(tcp.ack_number(), REMOTE_SEQ + 1 + 5);
         });
@@ -11382,7 +11382,7 @@ mod stack_test {
         // Data out: enqueued by send, transmitted by the next poll.
         assert_eq!(stack.tcp_socket(h).send_slice(b"world"), Ok(5));
         stack.poll(Instant::from_millis(3));
-        let mut frame = dev.tx.borrow_mut().remove(0);
+        let mut frame = driver.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.psh());
             assert_eq!(tcp.seq_number(), LOCAL_SEQ + 1);
@@ -11390,19 +11390,19 @@ mod stack_test {
         });
 
         // ACK of the data in.
-        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             seq_number: REMOTE_SEQ + 1 + 5,
             ack_number: Some(LOCAL_SEQ + 1 + 5),
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(3));
-        assert!(dev.tx.borrow().is_empty());
+        assert!(driver.tx.borrow().is_empty());
 
         // Close: the FIN is transmitted by the next poll.
         stack.tcp_socket(h).close();
         assert_eq!(stack.tcp_socket(h).state(), State::FinWait1);
         stack.poll(Instant::from_millis(4));
-        let mut frame = dev.tx.borrow_mut().remove(0);
+        let mut frame = driver.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.fin());
             assert_eq!(tcp.seq_number(), LOCAL_SEQ + 1 + 5);
@@ -11411,39 +11411,39 @@ mod stack_test {
 
     #[test]
     fn test_stack_rst_on_closed_port() {
-        let (mut stack, dev) = stack();
+        let (mut stack, driver) = stack();
 
-        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(0));
 
-        let mut frame = dev.tx.borrow_mut().remove(0);
+        let mut frame = driver.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.rst());
             assert_eq!(tcp.ack_number(), REMOTE_SEQ + 1);
         });
 
         // An incoming RST to a closed port is not answered.
-        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Rst,
             seq_number: REMOTE_SEQ,
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(1));
-        assert!(dev.tx.borrow().is_empty());
+        assert!(driver.tx.borrow().is_empty());
     }
 
     #[test]
     #[cfg(feature = "tcp-listener")]
     fn test_stack_established_socket_beats_listener() {
         // Set up an established connection through the listener.
-        let (mut stack, dev) = stack();
+        let (mut stack, driver) = stack();
         let lh = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(lh).listen(LOCAL_PORT).unwrap();
-        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ..SEND_TEMPL
@@ -11454,8 +11454,8 @@ mod stack_test {
             .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
         stack.poll(Instant::from_millis(0));
-        dev.tx.borrow_mut().remove(0); // the SYN|ACK
-        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+        driver.tx.borrow_mut().remove(0); // the SYN|ACK
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
@@ -11466,17 +11466,17 @@ mod stack_test {
         // A SYN matching the established connection's exact 4-tuple goes to
         // the connected socket (which discards it: it carries no ACK) and
         // never reaches the listener, so no new connection attempt is queued.
-        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ + 100,
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(2));
         assert!(!stack.tcp_listener(lh).can_accept());
-        assert!(dev.tx.borrow().is_empty());
+        assert!(driver.tx.borrow().is_empty());
 
         // A SYN from a different source port reaches the listener.
-        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
+        driver.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             src_port: REMOTE_PORT + 1,
@@ -11488,7 +11488,7 @@ mod stack_test {
 
     #[test]
     fn test_stack_retransmission_timer() {
-        let (mut stack, dev) = stack();
+        let (mut stack, driver) = stack();
         let h = stack
             .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
@@ -11501,15 +11501,15 @@ mod stack_test {
         // The SYN is transmitted by the next poll, which returns the
         // retransmission deadline.
         let deadline = stack.poll(Instant::from_millis(0));
-        let mut frame = dev.tx.borrow_mut().remove(0);
+        let mut frame = driver.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.syn() && !tcp.ack());
         });
-        assert!(dev.tx.borrow().is_empty());
+        assert!(driver.tx.borrow().is_empty());
 
         // No answer: polling past the deadline retransmits the SYN.
         stack.poll(deadline);
-        let mut frame = dev.tx.borrow_mut().remove(0);
+        let mut frame = driver.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.syn() && !tcp.ack());
         });

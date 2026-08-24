@@ -30,11 +30,11 @@ fn main() {
     let name = std::env::args().nth(1).unwrap_or_else(|| "tap0".to_string());
 
     let hardware_addr = HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]));
-    let device = TunTapInterface::new(&name, hardware_addr).unwrap();
-    let fd = device.as_raw_fd();
+    let driver = TunTapInterface::new(&name, hardware_addr).unwrap();
+    let fd = driver.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());
-    let iface = stack.add_iface(Box::new(device)).unwrap();
+    let iface = stack.add_iface(Box::new(driver)).unwrap();
 
     // That's all it takes: the stack installs the address and default route
     // itself once a lease comes in, and keeps it renewed. The parameter request

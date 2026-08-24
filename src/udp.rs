@@ -1385,10 +1385,10 @@ mod test {
     #[cfg(feature = "packetmeta-id")]
     #[test]
     fn test_packet_meta() {
-        let dev = TestDevice::new(Medium::Ip);
-        let sent = dev.tx_meta.clone();
+        let driver = TestDevice::new(Medium::Ip);
+        let sent = driver.tx_meta.clone();
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = dev.install(&mut stack, HardwareAddress::Ip);
+        let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
             .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))

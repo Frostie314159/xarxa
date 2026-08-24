@@ -638,7 +638,7 @@ impl StackInner {
 
         let total_size = buf.len();
         let ieee_len = ieee_repr.buffer_len();
-        let mtu = iface.dev.capabilities().max_transmission_unit;
+        let mtu = iface.driver.capabilities().max_transmission_unit;
 
         if total_size + ieee_len > mtu {
             #[cfg(feature = "sixlowpan-fragmentation")]
@@ -794,7 +794,7 @@ impl StackInner {
 
         let total_size = buf.len();
         let ieee_len = ieee_repr.buffer_len();
-        let mtu = iface.dev.capabilities().max_transmission_unit;
+        let mtu = iface.driver.capabilities().max_transmission_unit;
 
         // We calculate how much data we can send in the first fragment and the other
         // fragments. The eventual IPv6 sizes of these fragments need to be a multiple of eight
@@ -986,10 +986,10 @@ mod test {
         hw: Ieee802154Address,
         pan_id: Option<Ieee802154Pan>,
     ) -> (Stack<'static>, IfaceHandle, Queue, Sent, Room) {
-        let dev = TestDevice::new(Medium::Ieee802154).with_mtu(MTU);
-        let (rx, tx, room) = (dev.rx.clone(), dev.tx.clone(), dev.room.clone());
+        let driver = TestDevice::new(Medium::Ieee802154).with_mtu(MTU);
+        let (rx, tx, room) = (driver.rx.clone(), driver.tx.clone(), driver.room.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = dev.install(&mut stack, HardwareAddress::Ieee802154(hw));
+        let handle = driver.install(&mut stack, HardwareAddress::Ieee802154(hw));
         stack.iface(handle).set_pan_id(pan_id);
         // Drain the solicited-node multicast reports the link-local address
         // triggers, so the tests only see the frames they provoke.

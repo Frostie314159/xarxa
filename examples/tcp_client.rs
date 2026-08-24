@@ -49,16 +49,16 @@ fn main() {
         .unwrap()
         .into();
 
-    // The device and the socket buffers are lent to the stack by reference
+    // The driver and the socket buffers are lent to the stack by reference
     // rather than boxed, as a no-alloc program would. They must be declared
     // before the stack, which holds them until it is dropped.
-    let mut device = TunTapInterface::new(name, hardware_addr).unwrap();
-    let fd = device.as_raw_fd();
+    let mut driver = TunTapInterface::new(name, hardware_addr).unwrap();
+    let fd = driver.as_raw_fd();
     let mut rx_buffer = [0u8; 4096];
     let mut tx_buffer = [0u8; 4096];
 
     let mut stack = Stack::new(random_seed());
-    let iface = stack.add_iface_borrowed(&mut device).unwrap();
+    let iface = stack.add_iface_borrowed(&mut driver).unwrap();
     stack
         .iface(iface)
         .set_ip_addrs([

@@ -14,7 +14,7 @@ use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
 use crate::fragmentation::Fragmenter;
 #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
 use crate::icmp_error::{IcmpError, parse_quoted_packet};
-use crate::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, LinkState, Medium};
+use crate::iface::{ChecksumCapabilities, Driver, IfaceCapabilities, LinkState, Medium};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, Key as NeighborKey, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
@@ -136,7 +136,7 @@ fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAddr> {
 /// An interface added to the stack, with its configuration.
 pub(crate) struct IfaceState<'d> {
     pub(crate) handle: IfaceHandle,
-    pub(crate) dev: MaybeBox<'d, dyn Interface + 'd>,
+    pub(crate) driver: MaybeBox<'d, dyn Driver + 'd>,
     pub(crate) hardware_addr: HardwareAddress,
     pub(crate) ip_addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT>,
     /// Bumped whenever the interface's addresses or routes change.
@@ -179,12 +179,12 @@ impl<'d> Iface<'_, 'd> {
 
     /// The capabilities reported by the device.
     pub fn capabilities(&self) -> IfaceCapabilities {
-        self.state().dev.capabilities()
+        self.state().driver.capabilities()
     }
 
     /// The link state reported by the device.
     pub fn link_state(&mut self) -> LinkState {
-        self.state_mut().dev.link_state()
+        self.state_mut().driver.link_state()
     }
 
     /// The interface's IP-layer MTU: the device MTU minus the link-layer header,
@@ -198,12 +198,12 @@ impl<'d> Iface<'_, 'd> {
     ///
     /// Returns `None` if no timestamp is available right now, which is also all a
     /// device without transmit timestamping support ever returns. See
-    /// [`Interface::poll_tx_timestamp`] for what a caller must tolerate: timestamps
+    /// [`Driver::poll_tx_timestamp`] for what a caller must tolerate: timestamps
     /// arrive an arbitrary time after the packet was sent, possibly out of order, and
     /// possibly never.
     #[cfg(feature = "packetmeta-timestamp")]
     pub fn poll_tx_timestamp(&mut self) -> Option<crate::meta::TxTimestamp> {
-        self.state_mut().dev.poll_tx_timestamp()
+        self.state_mut().driver.poll_tx_timestamp()
     }
 
     /// The hardware address of the interface.
@@ -228,7 +228,7 @@ impl<'d> Iface<'_, 'd> {
     /// # Panics
     /// Panics if the address is not of the kind the device's medium uses.
     pub fn set_hardware_addr(&mut self, addr: HardwareAddress) {
-        let medium = self.state().dev.capabilities().medium;
+        let medium = self.state().driver.capabilities().medium;
         assert_eq!(
             addr.medium(),
             medium,
@@ -782,9 +782,9 @@ impl<'d> Stack<'d> {
     /// add an IP address to it.
     ///
     /// ```no_run
-    /// # use xarxa::{Stack, iface::Interface, wire::{IpCidr, Ipv4Address}};
-    /// # fn configure(stack: &mut Stack, dev: Box<dyn Interface>) {
-    /// let handle = stack.add_iface(dev).unwrap();
+    /// # use xarxa::{Stack, iface::Driver, wire::{IpCidr, Ipv4Address}};
+    /// # fn configure(stack: &mut Stack, driver: Box<dyn Driver>) {
+    /// let handle = stack.add_iface(driver).unwrap();
     /// stack
     ///     .iface(handle)
     ///     .add_ip_addr(IpCidr::new(Ipv4Address::new(192, 168, 1, 1).into(), 24))
@@ -800,8 +800,8 @@ impl<'d> Stack<'d> {
     /// - `Full` if the stack has no room for another interface. Only possible
     ///   without the `alloc` feature, where the `iface-count-N` feature sets the limit.
     #[cfg(feature = "alloc")]
-    pub fn add_iface(&mut self, dev: alloc::boxed::Box<dyn Interface + 'd>) -> core::result::Result<IfaceHandle, Full> {
-        self.add_iface_inner(dev.into())
+    pub fn add_iface(&mut self, driver: alloc::boxed::Box<dyn Driver + 'd>) -> core::result::Result<IfaceHandle, Full> {
+        self.add_iface_inner(driver.into())
     }
 
     /// Add an interface to the stack, lending it the device, and returning a
@@ -818,15 +818,15 @@ impl<'d> Stack<'d> {
     /// Errors:
     /// - `Full` if the stack has no room for another interface. Only possible
     ///   without the `alloc` feature, where the `iface-count-N` feature sets the limit.
-    pub fn add_iface_borrowed(&mut self, dev: &'d mut dyn Interface) -> core::result::Result<IfaceHandle, Full> {
-        self.add_iface_inner(dev.into())
+    pub fn add_iface_borrowed(&mut self, driver: &'d mut dyn Driver) -> core::result::Result<IfaceHandle, Full> {
+        self.add_iface_inner(driver.into())
     }
 
-    fn add_iface_inner(&mut self, dev: MaybeBox<'d, dyn Interface + 'd>) -> core::result::Result<IfaceHandle, Full> {
-        let hardware_addr = dev.hardware_address();
+    fn add_iface_inner(&mut self, driver: MaybeBox<'d, dyn Driver + 'd>) -> core::result::Result<IfaceHandle, Full> {
+        let hardware_addr = driver.hardware_address();
         assert_eq!(
             hardware_addr.medium(),
-            dev.capabilities().medium,
+            driver.capabilities().medium,
             "the device's hardware address does not match its medium"
         );
         #[cfg(feature = "medium-ieee802154")]
@@ -840,7 +840,7 @@ impl<'d> Stack<'d> {
         }
         let index = self.ifaces.add_with(|index| IfaceState {
             handle: IfaceHandle::new(index),
-            dev,
+            driver,
             hardware_addr,
             ip_addrs,
             config_generation: 0,
@@ -1179,11 +1179,11 @@ impl<'d> Stack<'d> {
             self.poll_neighbor_timers(handle);
 
             #[allow(unused_mut)]
-            while let Some(mut buf) = self.ifaces.get_mut(index).dev.receive() {
+            while let Some(mut buf) = self.ifaces.get_mut(index).driver.receive() {
                 #[cfg(feature = "packet-log")]
                 {
                     trace!("received on iface {}", index);
-                    let medium = self.ifaces.get(index).dev.capabilities().medium;
+                    let medium = self.ifaces.get(index).driver.capabilities().medium;
                     crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
                 }
                 self.process(handle, buf);
@@ -1460,7 +1460,7 @@ impl<'d> TcpListenerIter<'_, 'd> {
 
 impl<'d> Stack<'d> {
     fn process(&mut self, iface: IfaceHandle, buf: PacketBuf) {
-        match self.ifaces.get(iface.index()).dev.capabilities().medium {
+        match self.ifaces.get(iface.index()).driver.capabilities().medium {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => self.process_ethernet(iface, buf),
             #[cfg(feature = "medium-ip")]
@@ -2878,7 +2878,7 @@ impl StackInner {
         #[cfg(not(feature = "medium-ethernet"))]
         let _ = ethertype;
 
-        match iface.dev.capabilities().medium {
+        match iface.driver.capabilities().medium {
             #[cfg(feature = "medium-ip")]
             Medium::Ip => self.transmit_raw(iface, buf),
             #[cfg(feature = "medium-ethernet")]
@@ -2932,10 +2932,10 @@ impl StackInner {
         #[cfg(feature = "packet-log")]
         {
             trace!("sent on iface {}", iface.handle.index());
-            let medium = iface.dev.capabilities().medium;
+            let medium = iface.driver.capabilities().medium;
             crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
         }
-        if iface.dev.transmit(buf).is_err() {
+        if iface.driver.transmit(buf).is_err() {
             warn!("iface {}: device refused a frame, dropping it", iface.handle.index());
         }
     }
@@ -3138,14 +3138,14 @@ impl IfaceState<'_> {
     /// The interface's medium.
     #[allow(dead_code)]
     pub(crate) fn medium(&self) -> Medium {
-        self.dev.capabilities().medium
+        self.driver.capabilities().medium
     }
 
     /// Which checksums the device computes and verifies itself, so the stack
     /// doesn't do it in software.
     #[allow(dead_code)] // unused depending on which protocols are enabled
     pub(crate) fn checksum_caps(&self) -> ChecksumCapabilities {
-        self.dev.capabilities().checksum
+        self.driver.capabilities().checksum
     }
 
     /// Whether the interface's medium has link-layer addresses, and so does
@@ -3203,7 +3203,7 @@ impl IfaceState<'_> {
     /// Ethernet mediums, clamped to what a `PacketBuf` can carry once the
     /// link-layer headroom egress reserves ([`LINK_HEADER_LEN`]) is taken out.
     pub(crate) fn ip_mtu(&self) -> usize {
-        let caps = self.dev.capabilities();
+        let caps = self.driver.capabilities();
         let mtu = match caps.medium {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => caps.max_transmission_unit - ETHERNET_HEADER_LEN,
@@ -3226,7 +3226,7 @@ impl IfaceState<'_> {
         feature = "medium-ieee802154"
     ))]
     pub(crate) fn can_transmit(&mut self) -> bool {
-        self.dev.can_transmit()
+        self.driver.can_transmit()
     }
 
     /// Whether a new packet can be handed to the interface right now.
@@ -3658,10 +3658,10 @@ pub(crate) mod test {
         mtu: usize,
         checksum: ChecksumCapabilities,
     ) -> (Stack<'static>, Queue, Sent, Room) {
-        let dev = TestDevice::new(medium).with_mtu(mtu).with_checksum(checksum);
-        let (rx, tx, room) = (dev.rx.clone(), dev.tx.clone(), dev.room.clone());
+        let driver = TestDevice::new(medium).with_mtu(mtu).with_checksum(checksum);
+        let (rx, tx, room) = (driver.rx.clone(), driver.tx.clone(), driver.room.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = dev.install(
+        let handle = driver.install(
             &mut stack,
             match medium {
                 Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),
@@ -3688,10 +3688,10 @@ pub(crate) mod test {
     #[test]
     #[cfg(feature = "medium-ethernet")]
     fn test_iface_reports_device_state() {
-        let dev = TestDevice::new(Medium::Ethernet);
-        let link = dev.link.clone();
+        let driver = TestDevice::new(Medium::Ethernet);
+        let link = driver.link.clone();
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = dev.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
+        let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
 
         // The hardware address is read from the device at add time.
         assert_eq!(stack.iface(handle).hardware_addr(), HardwareAddress::Ethernet(OUR_HW));
@@ -4347,9 +4347,9 @@ pub(crate) mod test {
         let mut rxs = Vec::new();
         let mut txs = Vec::new();
         for addr in [IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V4_B.into(), 24)] {
-            let dev = TestDevice::new(Medium::Ip);
-            let (rx, tx) = (dev.rx.clone(), dev.tx.clone());
-            let handle = dev.install(&mut stack, HardwareAddress::Ip);
+            let driver = TestDevice::new(Medium::Ip);
+            let (rx, tx) = (driver.rx.clone(), driver.tx.clone());
+            let handle = driver.install(&mut stack, HardwareAddress::Ip);
             stack
                 .iface(handle)
                 .set_ip_addrs([addr, IpCidr::new(LINK_LOCAL_V6.into(), 64)])
@@ -4782,12 +4782,12 @@ pub(crate) mod test {
         let mut rx_meta = PacketMeta::default();
         rx_meta.id = 0x1111;
         rx_meta.timestamp = Some(RX_STAMP);
-        let dev = TestDevice::new(Medium::Ip)
+        let driver = TestDevice::new(Medium::Ip)
             .with_rx_meta(rx_meta)
             .with_tx_stamp(TX_STAMP);
-        let (rx, sent) = (dev.rx.clone(), dev.tx_meta.clone());
+        let (rx, sent) = (driver.rx.clone(), driver.tx_meta.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = dev.install(&mut stack, HardwareAddress::Ip);
+        let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
 
         let handle = stack.add_udp_socket().unwrap();

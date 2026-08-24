@@ -42,11 +42,11 @@ fn main() {
     };
     let name = args.first().map(String::as_str).unwrap_or("tap0");
 
-    let device = TunTapInterface::new(name, hardware_addr).unwrap();
-    let fd = device.as_raw_fd();
+    let driver = TunTapInterface::new(name, hardware_addr).unwrap();
+    let fd = driver.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());
-    let iface = stack.add_iface(Box::new(device)).unwrap();
+    let iface = stack.add_iface(Box::new(driver)).unwrap();
     stack
         .iface(iface)
         .set_ip_addrs([

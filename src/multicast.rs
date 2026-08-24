@@ -716,10 +716,10 @@ mod test {
 
     /// [`test_stack`], with a device that claims to handle the given checksums itself.
     fn test_stack_with_checksum(medium: Medium, checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
-        let dev = TestDevice::new(medium).with_checksum(checksum);
-        let (rx, tx) = (dev.rx.clone(), dev.tx.clone());
+        let driver = TestDevice::new(medium).with_checksum(checksum);
+        let (rx, tx) = (driver.rx.clone(), driver.tx.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = dev.install(
+        let handle = driver.install(
             &mut stack,
             match medium {
                 Medium::Ethernet => HardwareAddress::Ethernet(OUR_HW),

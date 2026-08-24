@@ -178,7 +178,7 @@ impl PacketBuf {
     ///
     /// On a received packet this is what the driver attached to it. On a packet being
     /// sent it is what the application attached, and what the driver will see in
-    /// [`Interface::transmit`](crate::iface::Interface::transmit). It travels with the
+    /// [`Driver::transmit`](crate::iface::Driver::transmit). It travels with the
     /// buffer through the whole stack, unaffected by header pushes and pulls.
     pub fn meta(&self) -> PacketMeta {
         self.inner().meta

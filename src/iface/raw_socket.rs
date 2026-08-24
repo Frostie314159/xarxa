@@ -5,7 +5,7 @@ use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::buf::PacketBuf;
-use crate::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, Medium};
+use crate::iface::{ChecksumCapabilities, Driver, IfaceCapabilities, Medium};
 use crate::wire::HardwareAddress;
 
 const SIOCGIFMTU: libc::c_ulong = 0x8921;
@@ -183,7 +183,7 @@ impl Drop for RawSocketInterface {
     }
 }
 
-impl Interface for RawSocketInterface {
+impl Driver for RawSocketInterface {
     fn capabilities(&self) -> IfaceCapabilities {
         IfaceCapabilities {
             medium: self.hardware_addr.medium(),
