@@ -10,6 +10,8 @@ use crate::config::TCP_SOCKET_COUNT;
 #[cfg(feature = "udp")]
 use crate::config::UDP_SOCKET_COUNT;
 use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
+#[cfg(feature = "ipv4-fragmentation")]
+use crate::fragmentation::Fragmenter;
 #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
 use crate::icmp_error::{IcmpError, parse_quoted_packet};
 use crate::iface::{IfaceCapabilities, Interface, Medium};
@@ -18,6 +20,8 @@ use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, Key as N
 use crate::rand::Rand;
 #[cfg(feature = "raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketState};
+#[cfg(feature = "ipv4-reassembly")]
+use crate::reassembly::FragmentsBuffer;
 use crate::route::Routes;
 use crate::storage::{Full, MaybeBox, Slab, Vec};
 #[cfg(feature = "tcp")]
@@ -40,6 +44,8 @@ pub struct Stack<'d> {
     pub(crate) ifaces: Slab<IfaceState<'d>, IFACE_COUNT>,
     #[allow(unused)]
     pub(crate) sockets: Sockets<'d>,
+    #[cfg(feature = "ipv4-reassembly")]
+    pub(crate) fragments: FragmentsBuffer,
 }
 
 /// The stack's socket storage, one slab per socket type.
@@ -130,6 +136,8 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) slaac: Option<crate::slaac::Slaac>,
     #[cfg(feature = "multicast")]
     pub(crate) multicast: crate::multicast::State,
+    #[cfg(feature = "ipv4-fragmentation")]
+    pub(crate) fragmenter: Fragmenter,
 }
 
 /// An interface borrowed from a [`Stack`], returned by [`Stack::iface`].
@@ -413,6 +421,8 @@ pub(crate) struct StackInner {
     #[cfg(feature = "medium-ethernet")]
     pending: PendingQueue,
     pub(crate) routes: Routes,
+    #[cfg(feature = "ipv4-fragmentation")]
+    pub(crate) ipv4_id: u16,
 }
 
 impl StackInner {
@@ -498,7 +508,14 @@ impl TxContext<'_, '_> {
     /// Panics if the handle is stale (the interface was removed).
     #[cfg(any(feature = "udp", feature = "tcp", feature = "raw"))]
     pub(crate) fn can_transmit(&mut self, iface: IfaceHandle) -> bool {
-        self.ifaces.get_mut(iface.index()).dev.can_transmit()
+        let iface = self.ifaces.get_mut(iface.index());
+        // The fragments of a packet still going out have first claim on the
+        // device: a new packet would take their room, or need the fragmenter itself.
+        #[cfg(feature = "ipv4-fragmentation")]
+        if !iface.fragmenter.is_empty() {
+            return false;
+        }
+        iface.can_transmit()
     }
 
     /// Make the egress routing decision for a destination: the interface the
@@ -665,15 +682,23 @@ impl<'d> Stack<'d> {
     /// numbers and ephemeral ports. This should be random, or at least different
     /// at every boot.
     pub fn new(random_seed: u64) -> Self {
+        #[cfg_attr(not(feature = "ipv4-fragmentation"), allow(unused_mut))]
+        let mut rand = Rand::new(random_seed);
+
+        #[cfg(feature = "ipv4-fragmentation")]
+        let ipv4_id = crate::fragmentation::initial_ipv4_id(&mut rand);
+
         Self {
             inner: StackInner {
                 now: Instant::ZERO,
-                rand: Rand::new(random_seed),
+                rand,
                 #[cfg(feature = "medium-ethernet")]
                 neighbor_cache: NeighborCache::new(),
                 #[cfg(feature = "medium-ethernet")]
                 pending: PendingQueue::new(),
                 routes: Routes::new(),
+                #[cfg(feature = "ipv4-fragmentation")]
+                ipv4_id,
             },
             ifaces: Slab::new(),
             sockets: Sockets {
@@ -688,6 +713,8 @@ impl<'d> Stack<'d> {
                 #[cfg(not(feature = "tcp"))]
                 _lent: core::marker::PhantomData,
             },
+            #[cfg(feature = "ipv4-reassembly")]
+            fragments: FragmentsBuffer::new(),
         }
     }
 
@@ -780,6 +807,8 @@ impl<'d> Stack<'d> {
             slaac: None,
             #[cfg(feature = "multicast")]
             multicast: crate::multicast::State::new(),
+            #[cfg(feature = "ipv4-fragmentation")]
+            fragmenter: Fragmenter::new(),
         })?;
         // The link-local address is already assigned, so its solicited-node
         // group is joined before the first configuration change.
@@ -1088,6 +1117,9 @@ impl<'d> Stack<'d> {
         #[cfg(feature = "medium-ethernet")]
         self.inner.pending.purge_expired(timestamp);
 
+        #[cfg(feature = "ipv4-reassembly")]
+        self.fragments.assembler.remove_expired(timestamp);
+
         let mut next = 0;
         while let Some(index) = self.ifaces.next_occupied(next) {
             next = index + 1;
@@ -1109,6 +1141,9 @@ impl<'d> Stack<'d> {
 
             #[cfg(feature = "medium-ethernet")]
             self.inner.flush_resolved_pending(self.ifaces.get_mut(index));
+
+            #[cfg(feature = "ipv4-fragmentation")]
+            self.inner.ipv4_egress(self.ifaces.get_mut(index));
 
             #[cfg(feature = "dhcpv4")]
             self.ifaces.get_mut(index).dhcpv4_dispatch(&mut self.inner);
@@ -1153,6 +1188,11 @@ impl<'d> Stack<'d> {
         {
             deadline = deadline.min(self.inner.neighbor_cache.poll_at());
             deadline = deadline.min(self.inner.pending.poll_at());
+        }
+
+        #[cfg(feature = "ipv4-reassembly")]
+        {
+            deadline = deadline.min(self.fragments.assembler.poll_at());
         }
 
         #[cfg(feature = "dhcpv4")]
@@ -1432,10 +1472,21 @@ impl<'d> Stack<'d> {
             trace!("ipv4: header checksum incorrect");
             return;
         }
+        #[cfg(feature = "ipv4-reassembly")]
+        let mut buf = if ipv4_packet.more_frags() || ipv4_packet.frag_offset() != 0 {
+            let Some(buf) = self.reassemble_ipv4(buf) else {
+                return;
+            };
+            buf
+        } else {
+            buf
+        };
+        #[cfg(not(feature = "ipv4-reassembly"))]
         if ipv4_packet.more_frags() || ipv4_packet.frag_offset() != 0 {
-            trace!("ipv4: fragmented packets not supported yet");
+            trace!("ipv4: fragmented packets not supported");
             return;
         }
+        let ipv4_packet = check!(Ipv4Packet::new_checked(&mut buf));
 
         let src_addr = ipv4_packet.src_addr();
         let dst_addr = ipv4_packet.dst_addr();
@@ -2560,7 +2611,40 @@ impl StackInner {
         self.transmit_ip(iface, dst, next_hop, buf, EthernetProtocol::Ipv4);
     }
 
+    /// Transmit a fully-built IP packet on an interface, fragmenting it first if it
+    /// is larger than the interface's MTU (IPv4 only).
     pub(crate) fn transmit_ip(
+        &mut self,
+        iface: &mut IfaceState<'_>,
+        dst_addr: IpAddress,
+        next_hop: IpAddress,
+        buf: PacketBuf,
+        ethertype: EthernetProtocol,
+    ) {
+        let total_ip_len = buf.len();
+
+        if total_ip_len > iface.ip_mtu() {
+            match ethertype {
+                // If we have an IPv4 packet, then we need to check if we need to fragment it.
+                #[cfg(feature = "ipv4-fragmentation")]
+                EthernetProtocol::Ipv4 => self.fragment_ipv4(iface, dst_addr, next_hop, buf),
+                #[cfg(not(feature = "ipv4-fragmentation"))]
+                EthernetProtocol::Ipv4 => {
+                    debug!("Enable the `ipv4-fragmentation` feature for fragmentation support. Dropping");
+                }
+                // We don't support IPv6 fragmentation yet.
+                _ => {
+                    debug!("IPv6 fragmentation support is unimplemented. Dropping.");
+                }
+            }
+            return;
+        }
+
+        self.dispatch_ip(iface, dst_addr, next_hop, buf, ethertype)
+    }
+
+    /// Hand an IP packet that fits the interface's MTU to the link layer.
+    pub(crate) fn dispatch_ip(
         &mut self,
         iface: &mut IfaceState<'_>,
         dst_addr: IpAddress,
@@ -2829,6 +2913,12 @@ impl IfaceState<'_> {
             Medium::Ip => caps.max_transmission_unit,
         };
         mtu.min(PACKET_BUF_SIZE - LINK_HEADER_LEN)
+    }
+
+    /// Whether the device can take one more frame right now.
+    #[cfg(any(feature = "udp", feature = "tcp", feature = "raw", feature = "ipv4-fragmentation"))]
+    pub(crate) fn can_transmit(&mut self) -> bool {
+        self.dev.can_transmit()
     }
 
     /// The assigned addresses, without their origin.
@@ -3152,6 +3242,7 @@ mod test {
     /// `room` limits how many more frames it accepts (`None`: unlimited).
     struct TestDevice {
         medium: Medium,
+        mtu: usize,
         rx: Rc<RefCell<VecDeque<Vec<u8>>>>,
         tx: Rc<RefCell<Vec<Vec<u8>>>>,
         room: Room,
@@ -3163,7 +3254,7 @@ mod test {
         fn capabilities(&self) -> IfaceCapabilities {
             IfaceCapabilities {
                 medium: self.medium,
-                max_transmission_unit: 1500,
+                max_transmission_unit: self.mtu,
             }
         }
         fn receive(&mut self) -> Option<PacketBuf> {
@@ -3206,6 +3297,11 @@ mod test {
 
     /// [`test_stack`], also handing out the device's transmit room control.
     fn test_stack_with_room(medium: Medium) -> (Stack<'static>, Queue, Sent, Room) {
+        test_stack_with_mtu(medium, 1500)
+    }
+
+    /// [`test_stack_with_room`], with a device of the given MTU.
+    fn test_stack_with_mtu(medium: Medium, mtu: usize) -> (Stack<'static>, Queue, Sent, Room) {
         let rx = Rc::new(RefCell::new(VecDeque::new()));
         let tx = Rc::new(RefCell::new(Vec::new()));
         let room = Rc::new(Cell::new(None));
@@ -3214,6 +3310,7 @@ mod test {
             .add_iface_borrowed(
                 Box::leak(Box::new(TestDevice {
                     medium,
+                    mtu,
                     rx: rx.clone(),
                     tx: tx.clone(),
                     room: room.clone(),
@@ -3653,6 +3750,7 @@ mod test {
                 .add_iface_borrowed(
                     Box::leak(Box::new(TestDevice {
                         medium: Medium::Ip,
+                        mtu: 1500,
                         rx: rx.clone(),
                         tx: tx.clone(),
                         room: Rc::new(Cell::new(None)),
@@ -4740,5 +4838,422 @@ mod test {
         stack.udp_socket(udp).send_slice(b"hi", (REMOTE_V4, 1000)).unwrap();
         assert_eq!(tx.borrow().len(), 4);
         assert_eq!(ethertype_of(&tx.borrow()[3]), EthernetProtocol::Arp);
+    }
+
+    // ===== IPv4 fragmentation and reassembly =====
+
+    #[cfg(feature = "ipv4-fragmentation")]
+    use crate::wire::IPV4_FRAGMENT_PAYLOAD_ALIGNMENT;
+
+    #[cfg(any(feature = "ipv4-fragmentation", feature = "ipv4-reassembly"))]
+    const REMOTE_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+
+    /// The link-layer header an interface of this medium puts in front of an IP packet.
+    #[cfg(feature = "ipv4-fragmentation")]
+    fn link_header_len(medium: Medium) -> usize {
+        match medium {
+            Medium::Ethernet => ETHERNET_HEADER_LEN,
+            Medium::Ip => 0,
+        }
+    }
+
+    /// An IP packet as it arrives on an interface of this medium: as-is on an IP
+    /// medium, in an Ethernet frame from [`REMOTE_HW`] to us on Ethernet.
+    #[cfg(feature = "ipv4-reassembly")]
+    fn ingress_frame(medium: Medium, ethertype: EthernetProtocol, packet: &[u8]) -> Vec<u8> {
+        match medium {
+            Medium::Ip => packet.to_vec(),
+            Medium::Ethernet => {
+                let mut frame = vec![0; ETHERNET_HEADER_LEN + packet.len()];
+                {
+                    let mut eth = EthernetFrame::new_unchecked(&mut frame[..]);
+                    eth.set_dst_addr(OUR_HW);
+                    eth.set_src_addr(REMOTE_HW);
+                    eth.set_ethertype(ethertype);
+                }
+                frame[ETHERNET_HEADER_LEN..].copy_from_slice(packet);
+                frame
+            }
+        }
+    }
+
+    /// One fragment of an IPv4 packet as on-the-wire bytes, header checksum filled in.
+    #[cfg(feature = "ipv4-reassembly")]
+    #[allow(clippy::too_many_arguments)]
+    fn ipv4_fragment(
+        src_addr: Ipv4Address,
+        dst_addr: Ipv4Address,
+        protocol: IpProtocol,
+        ident: u16,
+        more_frags: bool,
+        frag_offset_octets: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut bytes = ipv4_packet(src_addr, dst_addr, protocol, payload);
+        {
+            let mut pkt = Ipv4Packet::new_unchecked(&mut bytes[..]);
+            pkt.set_ident(ident);
+            pkt.set_dont_frag(false);
+            pkt.set_more_frags(more_frags);
+            pkt.set_frag_offset(frag_offset_octets);
+            // Recompute checksum after changing fragmentation fields.
+            pkt.fill_checksum();
+        }
+        bytes
+    }
+
+    /// Check the frames a fragmented IPv4 packet went out as: every one fits the
+    /// device MTU, carries the same identification, and the payloads are 8-aligned
+    /// except the last one's and add up to `payload_len`. Returns the payload.
+    #[cfg(feature = "ipv4-fragmentation")]
+    fn check_fragments(frames: &[Vec<u8>], medium: Medium, mtu: usize, payload_len: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        let mut ident = None;
+        for (i, frame) in frames.iter().enumerate() {
+            assert!(
+                frame.len() <= mtu,
+                "frame of {} octets exceeds the MTU of {}",
+                frame.len(),
+                mtu
+            );
+            let mut bytes = frame[link_header_len(medium)..].to_vec();
+            let ip = Ipv4Packet::new_checked(&mut bytes[..]).unwrap();
+            assert!(ip.verify_checksum());
+            assert_eq!(ip.frag_offset() as usize, payload.len());
+            assert_eq!(ip.more_frags(), i + 1 < frames.len());
+            if frames.len() > 1 {
+                assert!(!ip.dont_frag());
+                assert_eq!(*ident.get_or_insert(ip.ident()), ip.ident());
+            }
+            // Verify the payload size is aligned.
+            if ip.more_frags() {
+                assert!(ip.payload().len().is_multiple_of(IPV4_FRAGMENT_PAYLOAD_ALIGNMENT));
+            }
+            payload.extend_from_slice(ip.payload());
+        }
+        // The fragment offset should be the complete payload length once transmission is complete.
+        assert_eq!(payload.len(), payload_len);
+        payload
+    }
+
+    /// An IPv4 packet of any size goes out in frames no larger than the device MTU.
+    #[test]
+    #[cfg(feature = "ipv4-fragmentation")]
+    fn test_packet_len() {
+        for medium in [Medium::Ip, Medium::Ethernet] {
+            let mtu = 576;
+            let (mut stack, rx, tx, _room) = test_stack_with_mtu(medium, mtu);
+            if medium == Medium::Ethernet {
+                inject(&mut stack, &rx, arp_request_from(REMOTE_HW, REMOTE_V4));
+            }
+            let ip_mtu = stack.iface(IfaceHandle::new(0)).ip_mtu();
+
+            for ip_packet_len in [100, ip_mtu, ip_mtu + 1, PACKET_BUF_SIZE - LINK_HEADER_LEN] {
+                tx.borrow_mut().clear();
+
+                let ip_packet_payload_len = ip_packet_len - IPV4_HEADER_LEN;
+                let udp_packet_payload_len = ip_packet_payload_len - UDP_HEADER_LEN;
+
+                let udp_packet_payload = vec![1; udp_packet_payload_len];
+                let datagram = udp_datagram(OUR_V4.into(), 12345, REMOTE_V4.into(), 54321, &udp_packet_payload);
+
+                let mut buf = PacketBuf::try_new().unwrap();
+                buf.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
+                buf.set_len(datagram.len());
+                buf.copy_from_slice(&datagram);
+
+                let mut cx = stack.tx_context();
+                let route = cx.route(&REMOTE_V4.into()).unwrap();
+                cx.transmit_ip(&route, buf, OUR_V4.into(), REMOTE_V4.into(), IpProtocol::Udp, 64);
+
+                let frames = tx.borrow();
+                assert!(!frames.is_empty(), "ip_packet_len: {}", ip_packet_len);
+                assert_eq!(frames.len() > 1, ip_packet_len > ip_mtu);
+                let payload = check_fragments(&frames, medium, mtu, ip_packet_payload_len);
+                assert_eq!(payload, datagram);
+            }
+        }
+    }
+
+    /// Raw IPv4 packets of any size are sent, fragmented on 8-octet boundaries when
+    /// larger than the MTU. While the fragments of one are still going out, the
+    /// device is busy for the sockets.
+    #[test]
+    #[cfg(all(feature = "raw", feature = "ipv4-fragmentation"))]
+    fn test_raw_socket_tx_fragmentation() {
+        for medium in [Medium::Ip, Medium::Ethernet] {
+            // An MTU whose IP payload is not a multiple of the fragment alignment on
+            // either medium. This check ensures a valid test in which we actually do
+            // adjust for alignment.
+            let mtu = 600;
+            let (mut stack, _rx, tx, room) = test_stack_with_mtu(medium, mtu);
+            let ip_mtu = stack.iface(IfaceHandle::new(0)).ip_mtu();
+            let unaligned_length = ip_mtu - IPV4_HEADER_LEN;
+            assert!(!unaligned_length.is_multiple_of(IPV4_FRAGMENT_PAYLOAD_ALIGNMENT));
+
+            let handle = stack.add_raw_socket().unwrap();
+            stack
+                .raw_socket(handle)
+                .bind(RawMode::Ip {
+                    version: Some(IpVersion::Ipv4),
+                    protocol: Some(IpProtocol(92)),
+                })
+                .unwrap();
+
+            let tx_packet_sizes = [
+                ip_mtu * 3 / 4, // Smaller than MTU
+                ip_mtu * 5 / 4, // Larger than MTU, requires fragmentation
+                ip_mtu * 9 / 4, // Much larger, requires two fragments
+            ];
+
+            for packet_size in tx_packet_sizes {
+                tx.borrow_mut().clear();
+                let payload_len = packet_size - IPV4_HEADER_LEN;
+                let payload = vec![0u8; payload_len];
+                let packet = ipv4_packet(
+                    Ipv4Address::new(192, 168, 1, 3),
+                    Ipv4Address::BROADCAST,
+                    IpProtocol(92),
+                    &payload,
+                );
+
+                // Let one frame out at a time, to look at the fragmenter in between.
+                room.set(Some(1));
+                stack.raw_socket(handle).send_slice(&packet).unwrap();
+                assert_eq!(tx.borrow().len(), 1);
+
+                // Perform payload size checks if fragmentation is required.
+                if packet_size <= ip_mtu {
+                    assert!(stack.ifaces.get(0).fragmenter.is_empty());
+                    assert_eq!(tx.borrow()[0].len(), link_header_len(medium) + packet_size);
+                    continue;
+                }
+
+                // Verify that the fragment offset is correct.
+                let remainder = unaligned_length % IPV4_FRAGMENT_PAYLOAD_ALIGNMENT;
+                let expected_fragment_offset = ip_mtu - IPV4_HEADER_LEN - remainder;
+                let frag_offset = stack.ifaces.get(0).fragmenter.ipv4.frag_offset;
+                assert_eq!(frag_offset as usize, expected_fragment_offset);
+
+                // The remaining fragments have first claim on the device: a socket
+                // is held back even when the device itself has room.
+                room.set(Some(1));
+                assert_eq!(
+                    stack.raw_socket(handle).send_slice(&packet),
+                    Err(crate::raw::SendError::DeviceBusy)
+                );
+                assert_eq!(tx.borrow().len(), 1);
+
+                // Check subsequent fragment sizes if applicable.
+                if packet_size / ip_mtu == 2 {
+                    // Two fragments are left. The intermediate fragment must be aligned.
+                    stack.poll(Instant::ZERO);
+                    assert_eq!(tx.borrow().len(), 2);
+                    assert!(!stack.ifaces.get(0).fragmenter.is_empty());
+                    room.set(Some(1));
+                }
+                // Process the final fragment. It is the remainder of the data and does not have to be aligned.
+                stack.poll(Instant::ZERO);
+                assert!(stack.ifaces.get(0).fragmenter.is_empty());
+                assert_eq!(tx.borrow().len(), packet_size.div_ceil(ip_mtu));
+
+                let frames = tx.borrow();
+                let sent = check_fragments(&frames, medium, mtu, payload_len);
+                assert_eq!(sent, payload);
+            }
+        }
+    }
+
+    /// The fragments of an incoming IPv4 packet are reassembled before the packet
+    /// is offered to the raw sockets, which see only the whole packet.
+    #[test]
+    #[cfg(all(feature = "raw", feature = "ipv4-reassembly"))]
+    fn test_raw_socket_rx_fragmentation() {
+        for medium in [Medium::Ip, Medium::Ethernet] {
+            let (mut stack, rx, _tx) = test_stack(medium);
+
+            // Raw socket bound to IPv4 and a custom protocol.
+            let handle = stack.add_raw_socket().unwrap();
+            stack
+                .raw_socket(handle)
+                .bind(RawMode::Ip {
+                    version: Some(IpVersion::Ipv4),
+                    protocol: Some(IpProtocol(99)),
+                })
+                .unwrap();
+
+            // Build two IPv4 fragments that together form one packet.
+            let src_addr = REMOTE_V4;
+            let dst_addr = OUR_V4;
+            let proto = IpProtocol(99);
+            let ident: u16 = 0x1234;
+
+            let total_payload_len = 30usize;
+            let first_payload_len = 24usize; // must be a multiple of 8
+            let last_payload_len = total_payload_len - first_payload_len;
+
+            let frag1_bytes = ipv4_fragment(
+                src_addr,
+                dst_addr,
+                proto,
+                ident,
+                true,
+                0,
+                &vec![0xAA; first_payload_len],
+            );
+            let frag2_bytes = ipv4_fragment(
+                src_addr,
+                dst_addr,
+                proto,
+                ident,
+                false,
+                first_payload_len as u16,
+                &vec![0xBB; last_payload_len],
+            );
+
+            // First fragment alone should not be delivered to the raw socket.
+            inject(
+                &mut stack,
+                &rx,
+                ingress_frame(medium, EthernetProtocol::Ipv4, &frag1_bytes),
+            );
+            assert!(!stack.raw_socket(handle).can_recv());
+
+            // After the last fragment, the reassembled packet should be delivered.
+            inject(
+                &mut stack,
+                &rx,
+                ingress_frame(medium, EthernetProtocol::Ipv4, &frag2_bytes),
+            );
+
+            // Validate the raw socket received one defragmented packet with correct payload.
+            assert!(stack.raw_socket(handle).can_recv());
+            let mut data = stack
+                .raw_socket(handle)
+                .recv()
+                .expect("raw socket should have a packet");
+            let packet = Ipv4Packet::new_checked(&mut data[..]).unwrap();
+            assert!(packet.verify_checksum());
+            assert_eq!(packet.src_addr(), src_addr);
+            assert_eq!(packet.dst_addr(), dst_addr);
+            assert_eq!(packet.next_header(), proto);
+            assert!(!packet.more_frags());
+            assert_eq!(packet.frag_offset(), 0);
+            assert_eq!(packet.total_len() as usize, IPV4_HEADER_LEN + total_payload_len);
+
+            let payload = packet.payload();
+            assert_eq!(payload.len(), total_payload_len);
+            assert!(payload[..first_payload_len].iter().all(|&b| b == 0xAA));
+            assert!(payload[first_payload_len..].iter().all(|&b| b == 0xBB));
+
+            assert!(!stack.raw_socket(handle).can_recv());
+        }
+    }
+
+    /// A datagram larger than the MTU goes out fragmented and, fed back in with
+    /// the fragments out of order, is reassembled and delivered to the UDP socket
+    /// whole.
+    #[test]
+    #[cfg(all(
+        feature = "raw",
+        feature = "udp",
+        feature = "ipv4-fragmentation",
+        feature = "ipv4-reassembly"
+    ))]
+    fn test_ipv4_fragmentation_roundtrip() {
+        let mtu = 576;
+        let (mut stack, rx, tx) = {
+            let (stack, rx, tx, _room) = test_stack_with_mtu(Medium::Ip, mtu);
+            (stack, rx, tx)
+        };
+
+        let udp = stack.add_udp_socket().unwrap();
+        stack.udp_socket(udp).bind(5555, IpListenEndpoint::UNSPECIFIED).unwrap();
+
+        // A raw socket can send from any source address: build the datagram as
+        // if the remote had sent it to us, so the fragments can be fed back in.
+        let raw = stack.add_raw_socket().unwrap();
+        stack
+            .raw_socket(raw)
+            .bind(RawMode::Ip {
+                version: Some(IpVersion::Ipv4),
+                protocol: None,
+            })
+            .unwrap();
+        let payload: Vec<u8> = (0..1400u32).map(|i| i as u8).collect();
+        let datagram = udp_datagram(REMOTE_V4.into(), 1000, OUR_V4.into(), 5555, &payload);
+        let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram);
+        stack.raw_socket(raw).send_slice(&packet).unwrap();
+
+        let frames = tx.borrow().clone();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(check_fragments(&frames, Medium::Ip, mtu, datagram.len()), datagram);
+
+        // Nothing arrives until the last fragment does.
+        for frame in frames.iter().rev() {
+            assert!(!stack.udp_socket(udp).can_recv());
+            inject(&mut stack, &rx, frame.clone());
+        }
+        let mut got = vec![0; 2048];
+        let (len, meta) = stack.udp_socket(udp).recv_slice(&mut got).unwrap();
+        assert_eq!(&got[..len], &payload[..]);
+        assert_eq!(meta.endpoint, IpEndpoint::new(REMOTE_V4.into(), 1000));
+        assert!(!stack.udp_socket(udp).can_recv());
+    }
+
+    /// Fragments of a packet that never completes are dropped when the reassembly
+    /// timeout expires, and `poll` asks to be called then.
+    #[test]
+    #[cfg(all(feature = "raw", feature = "ipv4-reassembly"))]
+    fn test_ipv4_reassembly_timeout() {
+        let (mut stack, rx, _tx) = test_stack(Medium::Ip);
+        let handle = stack.add_raw_socket().unwrap();
+        stack
+            .raw_socket(handle)
+            .bind(RawMode::Ip {
+                version: Some(IpVersion::Ipv4),
+                protocol: Some(IpProtocol(99)),
+            })
+            .unwrap();
+        stack.set_reassembly_timeout(Duration::from_secs(10));
+        assert_eq!(stack.reassembly_timeout(), Duration::from_secs(10));
+
+        let proto = IpProtocol(99);
+        let frag1 = ipv4_fragment(REMOTE_V4, OUR_V4, proto, 0x1234, true, 0, &[0xAA; 24]);
+        let frag2 = ipv4_fragment(REMOTE_V4, OUR_V4, proto, 0x1234, false, 24, &[0xBB; 6]);
+
+        // The first fragment starts the timeout.
+        assert_eq!(stack.poll(Instant::ZERO), Instant::MAX);
+        rx.borrow_mut().push_back(frag1.clone());
+        assert_eq!(stack.poll(Instant::from_secs(1)), Instant::from_secs(11));
+        assert!(!stack.raw_socket(handle).can_recv());
+
+        // Past the timeout the fragment is forgotten: the last fragment alone does
+        // not complete the packet, it starts a new reassembly instead.
+        assert_eq!(stack.poll(Instant::from_secs(12)), Instant::MAX);
+        rx.borrow_mut().push_back(frag2.clone());
+        assert_eq!(stack.poll(Instant::from_secs(12)), Instant::from_secs(22));
+        assert!(!stack.raw_socket(handle).can_recv());
+
+        // Within the timeout, both fragments make the packet.
+        rx.borrow_mut().push_back(frag1);
+        assert_eq!(stack.poll(Instant::from_secs(13)), Instant::MAX);
+        assert!(stack.raw_socket(handle).can_recv());
+        assert_eq!(stack.raw_socket(handle).recv().unwrap().len(), IPV4_HEADER_LEN + 30);
+    }
+
+    #[test]
+    #[cfg(feature = "ipv4-fragmentation")]
+    fn test_ipv4_fragment_size() {
+        let (stack, _, _) = test_stack(Medium::Ip);
+        for i in 0..IPV4_FRAGMENT_PAYLOAD_ALIGNMENT {
+            assert!(
+                stack
+                    .ifaces
+                    .get(0)
+                    .max_ipv4_fragment_size(IPV4_HEADER_LEN + i)
+                    .is_multiple_of(IPV4_FRAGMENT_PAYLOAD_ALIGNMENT)
+            );
+        }
     }
 }

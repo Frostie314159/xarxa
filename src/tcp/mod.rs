@@ -28,14 +28,12 @@ use crate::wire::{
     TcpSeqNumber,
 };
 
-mod assembler;
 mod congestion;
 #[cfg(feature = "tcp-listener")]
 mod listener;
 mod repr;
 mod ring_buffer;
 
-use self::assembler::Assembler;
 use self::congestion::Controller as _;
 #[cfg(feature = "tcp-listener")]
 pub use self::listener::{TcpListener, TcpListenerHandle};
@@ -45,6 +43,7 @@ pub(crate) use self::repr::TcpRepr;
 #[cfg(feature = "tcp-timestamps")]
 pub(crate) use self::repr::TcpTimestampRepr;
 use self::ring_buffer::RingBuffer;
+use crate::storage::Assembler;
 
 /// The IP MTU assumed for TCP segment sizing until the destination has been
 /// routed.

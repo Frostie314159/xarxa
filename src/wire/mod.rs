@@ -108,9 +108,9 @@ pub use self::ip::{
 
 #[cfg(feature = "ipv4")]
 pub use self::ipv4::{
-    Address as Ipv4Address, Cidr as Ipv4Cidr, HEADER_LEN as IPV4_HEADER_LEN, MIN_MTU as IPV4_MIN_MTU,
-    MULTICAST_ALL_ROUTERS as IPV4_MULTICAST_ALL_ROUTERS, MULTICAST_ALL_SYSTEMS as IPV4_MULTICAST_ALL_SYSTEMS,
-    Packet as Ipv4Packet,
+    Address as Ipv4Address, Cidr as Ipv4Cidr, FRAGMENT_PAYLOAD_ALIGNMENT as IPV4_FRAGMENT_PAYLOAD_ALIGNMENT,
+    HEADER_LEN as IPV4_HEADER_LEN, MIN_MTU as IPV4_MIN_MTU, MULTICAST_ALL_ROUTERS as IPV4_MULTICAST_ALL_ROUTERS,
+    MULTICAST_ALL_SYSTEMS as IPV4_MULTICAST_ALL_SYSTEMS, Packet as Ipv4Packet,
 };
 
 #[cfg(feature = "ipv4")]

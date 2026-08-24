@@ -23,6 +23,7 @@ static CONFIGS: &[(&str, usize)] = &[
     ("RAW_RX_QUEUE_COUNT", 4),
     ("TCP_LISTENER_BACKLOG", 4),
     ("ASSEMBLER_MAX_SEGMENT_COUNT", 4),
+    ("REASSEMBLY_BUFFER_COUNT", 1),
     ("DNS_MAX_QUERY_COUNT", 4),
     ("DNS_MAX_RESULT_COUNT", 4),
     ("DNS_MAX_SERVER_COUNT", 4),

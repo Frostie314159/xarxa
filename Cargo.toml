@@ -15,6 +15,8 @@ default = [
     "medium-ethernet",
     "medium-ip",
     "ipv4",
+    "ipv4-fragmentation",
+    "ipv4-reassembly",
     "ipv6",
     "raw",
     "udp",
@@ -51,6 +53,10 @@ medium-ethernet = []
 medium-ip = []
 ## Support IPv4 (and, with `medium-ethernet`, ARP).
 ipv4 = []
+## Fragment outgoing IPv4 packets larger than the interface MTU. Needs `ipv4`.
+ipv4-fragmentation = ["ipv4"]
+## Reassemble incoming IPv4 fragments. Needs `ipv4`.
+ipv4-reassembly = ["ipv4"]
 ## Support IPv6 (and, with `medium-ethernet`, NDISC).
 ipv6 = []
 ## Raw sockets.
@@ -316,6 +322,14 @@ assembler-max-segment-count-4 = [] # Default
 assembler-max-segment-count-8 = []
 assembler-max-segment-count-16 = []
 assembler-max-segment-count-32 = []
+
+reassembly-buffer-count-1 = [] # Default
+reassembly-buffer-count-2 = []
+reassembly-buffer-count-3 = []
+reassembly-buffer-count-4 = []
+reassembly-buffer-count-8 = []
+reassembly-buffer-count-16 = []
+reassembly-buffer-count-32 = []
 
 dns-max-query-count-1 = []
 dns-max-query-count-2 = []

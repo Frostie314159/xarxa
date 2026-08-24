@@ -35,6 +35,8 @@ pub mod buf;
 pub mod dhcpv4;
 #[cfg(feature = "dns")]
 pub mod dns;
+#[cfg(feature = "ipv4-fragmentation")]
+mod fragmentation;
 #[cfg(feature = "icmp-errors")]
 mod icmp_error;
 pub mod iface;
@@ -48,6 +50,8 @@ mod packet_log;
 mod rand;
 #[cfg(feature = "raw")]
 pub mod raw;
+#[cfg(feature = "ipv4-reassembly")]
+mod reassembly;
 pub mod route;
 #[cfg(feature = "slaac")]
 pub mod slaac;

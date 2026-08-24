@@ -85,6 +85,8 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - Pure IP interface medium (feature `medium-ip`)
 - IPv4 (feature `ipv4`)
   - DHCP client (feature `dhcpv4`)
+  - Fragmentation (feature `ipv4-fragmentation`)
+  - Reassembly (feature `ipv4-reassembly`)
 - IPv6 (feature `ipv6`)
   - Link-local address automatically derived from the MAC address (EUI-64).
   - SLAAC: addresses and default routes from router advertisements, with lifetimes. (feature `slaac`)
@@ -131,7 +133,7 @@ All of the below is planned. Please open an issue or reach out on [the Matrix ch
 - an equivalent to smoltcp's `any_ip`
 - 6LoWPAN
 - IEEE 802.15.4
-- IP fragmentation and reassembly
+- IPv6 fragmentation and reassembly
 - TCP segmentation offload
 - TCP SACK
 - Checksum offload
