@@ -36,6 +36,7 @@ struct PendingSyn {
     /// The window scale the remote offered, if any.
     remote_win_scale: Option<u8>,
     /// Whether the remote supports selective ACK.
+    #[cfg(feature = "tcp-sack")]
     remote_has_sack: bool,
     /// The MSS the remote advertised (clamped), or the default.
     remote_mss: usize,
@@ -99,6 +100,7 @@ impl TcpListenerState {
             // The window field of a SYN is never scaled.
             remote_win_len: repr.window_len as usize,
             remote_win_scale: repr.window_scale,
+            #[cfg(feature = "tcp-sack")]
             remote_has_sack: repr.sack_permitted,
             remote_mss: match repr.max_seg_size {
                 // A zero MSS is treated as if the option were absent, a tiny
@@ -417,7 +419,10 @@ impl<'d> TcpListener<'_, 'd> {
         s.local_seq_no = TcpSocketState::random_seq_no(rand);
         s.remote_seq_no = syn.remote_seq_no;
         s.remote_last_seq = s.local_seq_no;
-        s.remote_has_sack = syn.remote_has_sack;
+        #[cfg(feature = "tcp-sack")]
+        {
+            s.remote_has_sack = syn.remote_has_sack;
+        }
         s.remote_win_scale = syn.remote_win_scale;
         // Remote doesn't support window scaling, don't do it.
         if syn.remote_win_scale.is_none() {

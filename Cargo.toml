@@ -93,6 +93,8 @@ mdns = ["dns"]
 multicast = []
 ## Send and receive the TCP timestamp option (RFC 7323).
 tcp-timestamps = ["tcp"]
+## Send selective acknowledgement ranges (RFC 2018).
+tcp-sack = ["tcp"]
 ## Automatically reply to pings (ICMP echo requests).
 icmp-ping-reply = []
 ## Deliver incoming ICMP error messages (destination unreachable, packet too big, ...) to

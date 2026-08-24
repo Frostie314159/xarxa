@@ -5739,7 +5739,9 @@ pub(crate) mod test {
                 window_len: 1000,
                 window_scale: None,
                 max_seg_size: None,
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: false,
+                #[cfg(feature = "tcp-sack")]
                 sack_ranges: [None; 3],
                 #[cfg(feature = "tcp-timestamps")]
                 timestamp: None,
