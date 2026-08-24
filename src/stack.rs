@@ -423,9 +423,23 @@ pub(crate) struct StackInner {
     pub(crate) routes: Routes,
     #[cfg(feature = "ipv4-fragmentation")]
     pub(crate) ipv4_id: u16,
+    /// Set when a socket send failed for lack of a packet buffer or device room.
+    /// `Stack::poll` wakes the send wakers of every packet socket when set.
+    #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
+    pub(crate) tx_starved: bool,
 }
 
 impl StackInner {
+    /// Note that a socket send was held back for lack of a packet buffer or
+    /// device room, so `Stack::poll` wakes the packet sockets' send wakers.
+    #[cfg(any(feature = "udp", feature = "raw"))]
+    pub(crate) fn set_tx_starved(&mut self) {
+        #[cfg(feature = "async")]
+        {
+            self.tx_starved = true;
+        }
+    }
+
     /// Forget everything the link layer learned about an interface: its neighbor
     /// cache entries and the packets parked on them.
     pub(crate) fn purge_iface_link_state(&mut self, handle: IfaceHandle) {
@@ -699,6 +713,8 @@ impl<'d> Stack<'d> {
                 routes: Routes::new(),
                 #[cfg(feature = "ipv4-fragmentation")]
                 ipv4_id,
+                #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
+                tx_starved: false,
             },
             ifaces: Slab::new(),
             sockets: Sockets {
@@ -1181,6 +1197,20 @@ impl<'d> Stack<'d> {
                     Err(crate::tcp::Blocked) => socket.poll_at_blocked(),
                 };
                 deadline = deadline.min(socket_deadline);
+            }
+        }
+
+        // Sends held back for lack of a buffer or device room since the last poll
+        // may succeed now: wake their tasks so they retry.
+        #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
+        if core::mem::take(&mut self.inner.tx_starved) {
+            #[cfg(feature = "udp")]
+            for (_, socket) in self.sockets.udp.iter_mut() {
+                socket.wake_tx();
+            }
+            #[cfg(feature = "raw")]
+            for (_, socket) in self.sockets.raw.iter_mut() {
+                socket.wake_tx();
             }
         }
 

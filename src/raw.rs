@@ -157,6 +157,12 @@ pub(crate) struct RawSocketState {
 }
 
 impl RawSocketState {
+    /// Wake the task waiting to send, if any.
+    #[cfg(feature = "async")]
+    pub(crate) fn wake_tx(&mut self) {
+        self.tx_waker.wake();
+    }
+
     /// Create an unbound raw socket.
     pub(crate) fn new() -> RawSocketState {
         RawSocketState {
@@ -470,10 +476,12 @@ impl RawSocket<'_, '_> {
         if let RawMode::Ethernet { iface, .. } = mode
             && !self.tx.can_transmit(iface)
         {
+            self.tx.inner.set_tx_starved();
             return Err(SendError::DeviceBusy);
         }
 
         let Some(mut buf) = PacketBuf::try_new() else {
+            self.tx.inner.set_tx_starved();
             return Err(SendError::NoBuffer);
         };
         if max_size > buf.capacity() - headroom {
@@ -510,6 +518,7 @@ impl RawSocket<'_, '_> {
                 }
                 let route = self.tx.route(&dst_addr).ok_or(SendError::Unaddressable)?;
                 if !self.tx.can_transmit(route.iface) {
+                    self.tx.inner.set_tx_starved();
                     return Err(SendError::DeviceBusy);
                 }
                 trace!("raw: sending {} octets to {}", buf.len(), dst_addr);

@@ -207,6 +207,12 @@ pub(crate) struct UdpSocketState {
 }
 
 impl UdpSocketState {
+    /// Wake the task waiting to send, if any.
+    #[cfg(feature = "async")]
+    pub(crate) fn wake_tx(&mut self) {
+        self.tx_waker.wake();
+    }
+
     /// Create an unbound UDP socket.
     pub(crate) fn new() -> UdpSocketState {
         UdpSocketState {
@@ -793,9 +799,11 @@ impl UdpSocket<'_, '_> {
         let headroom = LINK_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
 
         if !self.tx.can_transmit(route.iface) {
+            self.tx.inner.set_tx_starved();
             return Err(SendError::DeviceBusy);
         }
         let Some(mut buf) = PacketBuf::try_new() else {
+            self.tx.inner.set_tx_starved();
             return Err(SendError::NoBuffer);
         };
         if max_size > buf.capacity() - headroom {
