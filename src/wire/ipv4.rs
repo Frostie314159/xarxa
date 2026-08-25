@@ -20,6 +20,12 @@ pub use super::IpProtocol as Protocol;
 // accept a packet of the following size.
 pub const MIN_MTU: usize = 576;
 
+/// The payload of every fragment but the last is a multiple of this, in octets.
+/// Fragment offsets are counted in units of it. See [RFC 791 § 3.1].
+///
+/// [RFC 791 § 3.1]: https://tools.ietf.org/html/rfc791#section-3.1
+pub const FRAGMENT_PAYLOAD_ALIGNMENT: usize = 8;
+
 /// Minimum IHL length 5x32 bit words or 20 bytes
 /// [RFC 791 § 3.1]: https://tools.ietf.org/html/rfc791#section-3.1
 const MINIMUM_IHL_BYTES: u8 = 20;

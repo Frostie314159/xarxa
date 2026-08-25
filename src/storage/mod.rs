@@ -17,6 +17,7 @@
 
 use core::fmt;
 
+mod assembler;
 mod bounded_deque;
 mod bounded_vec;
 mod maybe_box;
@@ -24,6 +25,8 @@ mod slab;
 mod vec;
 
 // Which containers are used depends on the enabled features.
+#[allow(unused_imports)]
+pub(crate) use assembler::Assembler;
 #[allow(unused_imports)]
 pub(crate) use bounded_deque::BoundedDeque;
 #[allow(unused_imports)]

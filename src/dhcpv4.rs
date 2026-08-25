@@ -17,6 +17,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
 
 use crate::buf::PacketBuf;
+use crate::iface::ChecksumCapabilities;
 use crate::route::{Route, RouteOrigin};
 use crate::stack::{AddrOrigin, IfaceAddr, IfaceState, StackInner};
 use crate::time::{Duration, Instant};
@@ -42,6 +43,9 @@ const DEFAULT_PARAMETER_REQUEST_LIST: &[u8] =
 
 /// The most DNS servers a client keeps from a lease. Set by the `dhcp-max-dns-server-count-N` feature.
 pub use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
+/// The size of the raw options buffer in a lease. Set by the `dhcp-options-buf-size-N` feature.
+#[cfg(feature = "dhcpv4-options")]
+pub use crate::config::DHCP_OPTIONS_BUF_SIZE;
 
 /// A lease obtained from a DHCP server.
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -55,6 +59,11 @@ pub struct DhcpLease {
     pub router: Option<Ipv4Address>,
     /// The DNS servers, if the server gave any.
     pub dns_servers: Vec<Ipv4Address, DHCP_MAX_DNS_SERVER_COUNT>,
+    /// All options received from the DHCP server.
+    ///
+    /// You may have to ask the server to send the option you're interested in with [`DhcpConfig::parameter_request_list`].
+    #[cfg(feature = "dhcpv4-options")]
+    pub options: DhcpLeaseOptions,
 }
 
 /// How to reach a DHCP server.
@@ -66,6 +75,97 @@ pub struct DhcpServerInfo {
     /// The server identifier to put in packets. Usually the same as `address`,
     /// but can differ, for example behind a DHCP relay.
     pub identifier: Ipv4Address,
+}
+
+/// The received options of a lease. See [`DhcpLease::options`].
+///
+/// Options that don't fit in the buffer are dropped. The buffer size is set by
+/// the `dhcp-options-buf-size-N` feature.
+#[cfg(feature = "dhcpv4-options")]
+#[derive(Clone)]
+pub struct DhcpLeaseOptions {
+    // Options stored back to back, each as kind, length, data.
+    buf: [u8; DHCP_OPTIONS_BUF_SIZE],
+    len: u16,
+}
+
+#[cfg(feature = "dhcpv4-options")]
+impl DhcpLeaseOptions {
+    fn new() -> Self {
+        Self {
+            buf: [0; DHCP_OPTIONS_BUF_SIZE],
+            len: 0,
+        }
+    }
+
+    // Add one option. Errors if it doesn't fit.
+    fn push(&mut self, option: DhcpOption<'_>) -> Result<(), ()> {
+        let len = self.len as usize;
+        let total = 2 + option.data.len();
+        if option.data.len() > u8::MAX as usize || self.buf.len() - len < total {
+            return Err(());
+        }
+        self.buf[len] = option.kind;
+        self.buf[len + 1] = option.data.len() as u8;
+        self.buf[len + 2..len + total].copy_from_slice(option.data);
+        self.len = (len + total) as u16;
+        Ok(())
+    }
+
+    /// The data of the first option of the given kind, if present.
+    pub fn get(&self, kind: u8) -> Option<&[u8]> {
+        self.iter().find(|opt| opt.kind == kind).map(|opt| opt.data)
+    }
+
+    /// Iterate over all options.
+    pub fn iter(&self) -> impl Iterator<Item = DhcpOption<'_>> + '_ {
+        let mut buf = &self.buf[..self.len as usize];
+        core::iter::from_fn(move || {
+            if buf.is_empty() {
+                return None;
+            }
+            let len = buf[1] as usize;
+            let opt = DhcpOption {
+                kind: buf[0],
+                data: &buf[2..2 + len],
+            };
+            buf = &buf[2 + len..];
+            Some(opt)
+        })
+    }
+}
+
+#[cfg(feature = "dhcpv4-options")]
+impl PartialEq for DhcpLeaseOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.buf[..self.len as usize] == other.buf[..other.len as usize]
+    }
+}
+
+#[cfg(feature = "dhcpv4-options")]
+impl Eq for DhcpLeaseOptions {}
+
+#[cfg(feature = "dhcpv4-options")]
+impl core::fmt::Debug for DhcpLeaseOptions {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+#[cfg(all(feature = "dhcpv4-options", feature = "defmt"))]
+impl defmt::Format for DhcpLeaseOptions {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "[");
+        let mut first = true;
+        for opt in self.iter() {
+            if !first {
+                defmt::write!(f, ", ");
+            }
+            first = false;
+            defmt::write!(f, "{}", opt);
+        }
+        defmt::write!(f, "]");
+    }
 }
 
 #[derive(Debug)]
@@ -257,11 +357,24 @@ impl Client {
                 });
         }
 
+        #[cfg(feature = "dhcpv4-options")]
+        let options = {
+            let mut options = DhcpLeaseOptions::new();
+            for opt in packet.options() {
+                if options.push(opt).is_err() {
+                    debug!("DHCP lease options buffer full, dropping option {}", opt.kind);
+                }
+            }
+            options
+        };
+
         let lease = DhcpLease {
             server,
             address: Ipv4Cidr::new(packet.your_ip(), prefix_len),
             router: packet.option(field::OPT_ROUTER).and_then(parse_ipv4),
             dns_servers,
+            #[cfg(feature = "dhcpv4-options")]
+            options,
         };
 
         // Set renew and rebind times as per RFC 2131:
@@ -346,6 +459,7 @@ impl Client {
         ip_mtu: usize,
         src_addr: Ipv4Address,
         dst_addr: Ipv4Address,
+        checksum_caps: &ChecksumCapabilities,
     ) -> Option<PacketBuf> {
         // Worst case biggest IPv4 header length.
         // 0x0f * 4 = 60 bytes.
@@ -417,7 +531,13 @@ impl Client {
         udp.set_src_port(DHCP_CLIENT_PORT);
         udp.set_dst_port(DHCP_SERVER_PORT);
         udp.set_len((UDP_HEADER_LEN + len) as u16);
-        udp.fill_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr));
+        if checksum_caps.udp.tx() {
+            udp.fill_checksum(&IpAddress::Ipv4(src_addr), &IpAddress::Ipv4(dst_addr));
+        } else {
+            // A zero checksum means "no checksum" on UDP-over-IPv4, and is what a
+            // device that computes it itself expects to find in the field.
+            udp.set_checksum(0);
+        }
 
         Some(buf)
     }
@@ -538,6 +658,7 @@ impl IfaceState<'_> {
     pub(crate) fn dhcpv4_dispatch(&mut self, inner: &mut StackInner) {
         let ethernet_addr = self.hardware_addr;
         let ip_mtu = self.ip_mtu();
+        let checksum_caps = self.checksum_caps();
         let Some(client) = &mut self.dhcpv4 else { return };
         let ethernet_addr = ethernet_addr.ethernet_or_panic();
         let now = inner.now;
@@ -562,6 +683,7 @@ impl IfaceState<'_> {
                     ip_mtu,
                     Ipv4Address::UNSPECIFIED,
                     Ipv4Address::BROADCAST,
+                    &checksum_caps,
                 );
                 if let Some(buf) = buf {
                     inner.transmit_ipv4_on(self, Ipv4Address::UNSPECIFIED, Ipv4Address::BROADCAST, buf);
@@ -593,6 +715,7 @@ impl IfaceState<'_> {
                     ip_mtu,
                     Ipv4Address::UNSPECIFIED,
                     Ipv4Address::BROADCAST,
+                    &checksum_caps,
                 );
                 if let Some(buf) = buf {
                     inner.transmit_ipv4_on(self, Ipv4Address::UNSPECIFIED, Ipv4Address::BROADCAST, buf);
@@ -646,6 +769,7 @@ impl IfaceState<'_> {
                     ip_mtu,
                     src_addr,
                     dst_addr,
+                    &checksum_caps,
                 );
                 if let Some(buf) = buf {
                     inner.transmit_ipv4_on(self, src_addr, dst_addr, buf);
@@ -725,49 +849,16 @@ fn parse_u32(data: &[u8]) -> Option<u32> {
 
 #[cfg(test)]
 mod test {
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
-    use std::rc::Rc;
     use std::vec::Vec;
 
     use super::*;
-    use crate::iface::{IfaceCapabilities, Interface, Medium};
+    use crate::iface::{Checksum, Medium};
     use crate::stack::{IfaceHandle, Stack};
+    use crate::test_device::{Queue, Sent, TestDevice};
     use crate::wire::{
         ArpPacket, DhcpOpCode, ETHERNET_HEADER_LEN, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress,
         IpProtocol, Ipv4Packet,
     };
-
-    type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
-    type Sent = Rc<RefCell<Vec<Vec<u8>>>>;
-
-    struct TestDevice {
-        rx: Queue,
-        tx: Sent,
-    }
-
-    impl Interface for TestDevice {
-        fn capabilities(&self) -> IfaceCapabilities {
-            IfaceCapabilities {
-                medium: Medium::Ethernet,
-                max_transmission_unit: 1500,
-            }
-        }
-        fn receive(&mut self) -> Option<PacketBuf> {
-            let bytes = self.rx.borrow_mut().pop_front()?;
-            let mut buf = PacketBuf::try_new().unwrap();
-            buf.set_len(bytes.len());
-            buf.copy_from_slice(&bytes);
-            Some(buf)
-        }
-        fn transmit(&mut self, buf: PacketBuf) -> core::result::Result<(), PacketBuf> {
-            self.tx.borrow_mut().push(buf.to_vec());
-            Ok(())
-        }
-        fn can_transmit(&mut self) -> bool {
-            true
-        }
-    }
 
     const OUR_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
     const SERVER_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
@@ -779,18 +870,15 @@ mod test {
 
     /// A stack with one Ethernet interface, no addresses, DHCP on.
     fn test_stack() -> (Stack<'static>, Queue, Sent) {
-        let rx = Rc::new(RefCell::new(VecDeque::new()));
-        let tx = Rc::new(RefCell::new(Vec::new()));
+        test_stack_with_checksum(ChecksumCapabilities::default())
+    }
+
+    /// [`test_stack`], with a device that claims to handle the given checksums itself.
+    fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
+        let dev = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
+        let (rx, tx) = (dev.rx.clone(), dev.tx.clone());
         let mut stack = Stack::new(1);
-        let handle = stack
-            .add_iface_borrowed(
-                Box::leak(Box::new(TestDevice {
-                    rx: rx.clone(),
-                    tx: tx.clone(),
-                })),
-                HardwareAddress::Ethernet(OUR_HW),
-            )
-            .unwrap();
+        let handle = dev.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         assert_eq!(handle, IFACE);
         // Drain the solicited-node multicast report the link-local address triggers,
         // so the tests only see the frames DHCP provokes.
@@ -1211,5 +1299,79 @@ mod test {
             packet.option(field::OPT_PARAMETER_REQUEST_LIST),
             Some(&[1, 3, 6, 42][..])
         );
+    }
+
+    #[test]
+    #[cfg(feature = "dhcpv4-options")]
+    fn test_lease_options() {
+        let (mut stack, rx, _tx) = test_stack();
+        stack.poll(at(0)); // DISCOVER
+
+        let mut options = ack_options();
+        options.push(DhcpOption {
+            kind: field::OPT_NTP_SERVERS,
+            data: &[192, 168, 1, 2],
+        });
+        rx.borrow_mut()
+            .push_back(reply(DhcpMessageType::Offer, XID, OFFERED_IP, &options));
+        stack.poll(at(1)); // REQUEST
+        rx.borrow_mut()
+            .push_back(reply(DhcpMessageType::Ack, XID, OFFERED_IP, &options));
+        stack.poll(at(2));
+
+        let lease = stack.iface(IFACE).dhcpv4_lease().cloned().unwrap();
+        assert_eq!(lease.options.get(field::OPT_NTP_SERVERS), Some(&[192, 168, 1, 2][..]));
+        assert_eq!(lease.options.get(field::OPT_SUBNET_MASK), Some(&[255, 255, 255, 0][..]));
+        assert_eq!(lease.options.get(field::OPT_HOST_NAME), None);
+
+        // Every option from the ACK is there, in order, the ones the client
+        // parses itself included.
+        let kinds: Vec<u8> = lease.options.iter().map(|o| o.kind).collect();
+        assert_eq!(
+            kinds,
+            &[
+                field::OPT_DHCP_MESSAGE_TYPE,
+                field::OPT_SERVER_IDENTIFIER,
+                field::OPT_SUBNET_MASK,
+                field::OPT_ROUTER,
+                field::OPT_DOMAIN_NAME_SERVER,
+                field::OPT_IP_LEASE_TIME,
+                field::OPT_NTP_SERVERS,
+            ]
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "dhcpv4-options")]
+    fn test_lease_options_full() {
+        let mut options = DhcpLeaseOptions::new();
+        // Never fits: the buffer can't hold its own size plus two.
+        let data = [0xaa; DHCP_OPTIONS_BUF_SIZE];
+        assert!(options.push(DhcpOption { kind: 42, data: &data }).is_err());
+        // A dropped option doesn't stop later ones.
+        assert!(options.push(DhcpOption { kind: 1, data: &[7] }).is_ok());
+        assert_eq!(options.get(1), Some(&[7][..]));
+        assert_eq!(options.get(42), None);
+    }
+
+    /// A device that computes the IPv4 and UDP checksums itself gets both fields
+    /// zeroed in the messages the client sends.
+    #[test]
+    fn test_checksum_offload() {
+        let caps = ChecksumCapabilities {
+            ipv4: Checksum::None,
+            udp: Checksum::None,
+            ..Default::default()
+        };
+        let (mut stack, _rx, tx) = test_stack_with_checksum(caps);
+        stack.poll(at(0));
+
+        let mut frame = tx.borrow()[0].clone();
+        let ip = Ipv4Packet::new_checked(&mut frame[ETHERNET_HEADER_LEN..]).unwrap();
+        assert_eq!(ip.checksum(), 0);
+        assert_eq!(ip.next_header(), IpProtocol::Udp);
+        let udp = UdpPacket::new_checked(&mut frame[ETHERNET_HEADER_LEN + IPV4_HEADER_LEN..]).unwrap();
+        assert_eq!(udp.dst_port(), DHCP_SERVER_PORT);
+        assert_eq!(udp.checksum(), 0);
     }
 }

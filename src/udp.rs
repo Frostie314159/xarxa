@@ -207,6 +207,12 @@ pub(crate) struct UdpSocketState {
 }
 
 impl UdpSocketState {
+    /// Wake the task waiting to send, if any.
+    #[cfg(feature = "async")]
+    pub(crate) fn wake_tx(&mut self) {
+        self.tx_waker.wake();
+    }
+
     /// Create an unbound UDP socket.
     pub(crate) fn new() -> UdpSocketState {
         UdpSocketState {
@@ -793,9 +799,11 @@ impl UdpSocket<'_, '_> {
         let headroom = LINK_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
 
         if !self.tx.can_transmit(route.iface) {
+            self.tx.inner.set_tx_starved();
             return Err(SendError::DeviceBusy);
         }
         let Some(mut buf) = PacketBuf::try_new() else {
+            self.tx.inner.set_tx_starved();
             return Err(SendError::NoBuffer);
         };
         if max_size > buf.capacity() - headroom {
@@ -815,7 +823,13 @@ impl UdpSocket<'_, '_> {
             udp.set_src_port(local.port);
             udp.set_dst_port(meta.endpoint.port);
             udp.set_len(udp_len as u16);
-            udp.fill_checksum(&src_addr, &meta.endpoint.addr);
+            if self.tx.checksum_caps(route.iface).udp.tx() {
+                udp.fill_checksum(&src_addr, &meta.endpoint.addr);
+            } else {
+                // A zero checksum means "no checksum" on UDP-over-IPv4, and is what a
+                // device that computes it itself expects to find in the field.
+                udp.set_checksum(0);
+            }
         }
 
         trace!("udp:{}:{}: sending {} octets", local, meta.endpoint, size);
@@ -846,7 +860,8 @@ impl Stack<'_> {
             trace!("udp: malformed packet");
             return;
         };
-        if !udp_packet.verify_checksum(&src_addr, &dst_addr) {
+        if self.ifaces.get(iface.index()).checksum_caps().udp.rx() && !udp_packet.verify_checksum(&src_addr, &dst_addr)
+        {
             trace!("udp: checksum incorrect");
             return;
         }
@@ -954,8 +969,9 @@ pub(crate) fn process_icmp_error(
 #[cfg(all(test, feature = "medium-ip", feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
-    use crate::iface::{IfaceCapabilities, Interface, Medium};
+    use crate::iface::Medium;
     use crate::stack::Stack;
+    use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
     fn stack_with_socket() -> (Stack<'static>, UdpHandle) {
@@ -973,37 +989,11 @@ mod test {
     /// The fully wildcard remote: an ordinary unconnected bind.
     const ANY: IpListenEndpoint = IpListenEndpoint::UNSPECIFIED;
 
-    /// A device that swallows every frame the stack transmits.
-    struct TestingDevice;
-
-    impl Interface for TestingDevice {
-        fn capabilities(&self) -> IfaceCapabilities {
-            IfaceCapabilities {
-                medium: Medium::Ip,
-                max_transmission_unit: 1500,
-            }
-        }
-
-        fn receive(&mut self) -> Option<PacketBuf> {
-            None
-        }
-
-        fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
-            Ok(())
-        }
-
-        fn can_transmit(&mut self) -> bool {
-            true
-        }
-    }
-
     /// A stack with one interface owning `LOCAL_ADDR`, so that binds with a
     /// specified remote can resolve their local address.
     fn stack_with_iface() -> Stack<'static> {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack
-            .add_iface_borrowed(Box::leak(Box::new(TestingDevice)), HardwareAddress::Ip)
-            .unwrap();
+        let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
             .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
@@ -1395,36 +1385,10 @@ mod test {
     #[cfg(feature = "packetmeta-id")]
     #[test]
     fn test_packet_meta() {
-        use std::cell::RefCell;
-        use std::rc::Rc;
-
-        /// A device that records the metadata of every frame it is handed.
-        struct MetaDevice(Rc<RefCell<Vec<PacketMeta>>>);
-
-        impl Interface for MetaDevice {
-            fn capabilities(&self) -> IfaceCapabilities {
-                IfaceCapabilities {
-                    medium: Medium::Ip,
-                    max_transmission_unit: 1500,
-                }
-            }
-            fn receive(&mut self) -> Option<PacketBuf> {
-                None
-            }
-            fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
-                self.0.borrow_mut().push(buf.meta());
-                Ok(())
-            }
-            fn can_transmit(&mut self) -> bool {
-                true
-            }
-        }
-
-        let sent = Rc::new(RefCell::new(Vec::new()));
+        let dev = TestDevice::new(Medium::Ip);
+        let sent = dev.tx_meta.clone();
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let iface = stack
-            .add_iface_borrowed(Box::leak(Box::new(MetaDevice(sent.clone()))), HardwareAddress::Ip)
-            .unwrap();
+        let iface = dev.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
             .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))

@@ -15,11 +15,17 @@ use portable_atomic::{AtomicU32, Ordering};
 
 use crate::meta::PacketMeta;
 
+/// Alignment of the buffer in a [`PacketBuf`], in bytes.
+///
+/// Set with the `packet-buf-align-N` cargo features or the `XARXA_PACKET_BUF_ALIGN` environment variable.
+pub const PACKET_BUF_ALIGN: usize = crate::config::PACKET_BUF_ALIGN;
+
 /// Size of the buffer in a [`PacketBuf`].
 ///
 /// Currently hardcoded to 1514 (max size of an Ethernet frame without FCS)
-/// rounded up to nearest 4 multiple.
-pub const PACKET_BUF_SIZE: usize = 1516;
+/// rounded up to [`PACKET_BUF_ALIGN`].
+/// TODO: make configurable
+pub const PACKET_BUF_SIZE: usize = 1514usize.next_multiple_of(PACKET_BUF_ALIGN);
 
 /// Number of buffers in the pool.
 #[cfg(not(test))]
@@ -35,9 +41,27 @@ const PACKET_BUF_COUNT: usize = if crate::config::PACKET_BUF_COUNT > 1024 {
 
 const BITMAP_WORDS: usize = PACKET_BUF_COUNT.div_ceil(32);
 
-// Align is needed by some DMA engines.
-// TODO: find a more generic way to do this. Maybe let the user set a custom packet pool impl.
-#[repr(C, align(4))]
+#[cfg_attr(packet_buf_align = "1", repr(C, align(1)))]
+#[cfg_attr(packet_buf_align = "2", repr(C, align(2)))]
+#[cfg_attr(packet_buf_align = "4", repr(C, align(4)))]
+#[cfg_attr(packet_buf_align = "8", repr(C, align(8)))]
+#[cfg_attr(packet_buf_align = "16", repr(C, align(16)))]
+#[cfg_attr(packet_buf_align = "32", repr(C, align(32)))]
+struct Data([u8; PACKET_BUF_SIZE]);
+
+impl Deref for Data {
+    type Target = [u8; PACKET_BUF_SIZE];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Data {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
 struct PacketBufInner {
     /// Offset of the first valid byte within `data`.
     headroom: u16,
@@ -46,7 +70,7 @@ struct PacketBufInner {
     // invariant: headroom + len <= PACKET_BUF_SIZE
     /// Per-packet metadata. Zero-sized unless a `packetmeta-*` feature is enabled.
     meta: PacketMeta,
-    data: [u8; PACKET_BUF_SIZE],
+    data: Data,
 }
 
 struct Pool {
@@ -227,6 +251,26 @@ impl PacketBuf {
         inner.len -= n as u16;
     }
 
+    /// Make room for `headroom` bytes in front of the payload, moving the payload
+    /// back if there isn't enough already.
+    ///
+    /// Returns `false` if the buffer can't fit `headroom` plus the payload, leaving
+    /// it unchanged.
+    pub fn ensure_headroom(&mut self, headroom: usize) -> bool {
+        if self.headroom() >= headroom {
+            return true;
+        }
+        let inner = self.inner_mut();
+        let len = inner.len as usize;
+        if headroom + len > PACKET_BUF_SIZE {
+            return false;
+        }
+        let old = inner.headroom as usize;
+        inner.data.copy_within(old..old + len, headroom);
+        inner.headroom = headroom as u16;
+        true
+    }
+
     /// Set the payload length, growing or shrinking it at the back.
     ///
     /// # Panics
@@ -238,9 +282,10 @@ impl PacketBuf {
 
     /// The whole underlying storage, ignoring headroom and length.
     ///
-    /// The returned slice is guaranteed to be 4-byte aligned.
+    /// The returned slice is aligned to [`PACKET_BUF_ALIGN`], and its length
+    /// ([`PACKET_BUF_SIZE`]) is a multiple of it.
     pub fn storage_mut(&mut self) -> &mut [u8] {
-        &mut self.inner_mut().data
+        &mut self.inner_mut().data[..]
     }
 }
 
@@ -317,19 +362,50 @@ mod tests {
     }
 
     #[test]
+    fn ensure_headroom() {
+        let mut buf = PacketBuf::try_new().unwrap();
+        buf.reserve(10);
+        buf.set_len(4);
+        buf.copy_from_slice(&[1, 2, 3, 4]);
+
+        // Already enough: nothing moves.
+        assert!(buf.ensure_headroom(4));
+        assert_eq!(buf.headroom(), 10);
+        assert_eq!(&*buf, &[1, 2, 3, 4]);
+
+        // Not enough: the payload moves back, unchanged.
+        assert!(buf.ensure_headroom(20));
+        assert_eq!(buf.headroom(), 20);
+        assert_eq!(buf.len(), 4);
+        assert_eq!(&*buf, &[1, 2, 3, 4]);
+
+        // The headroom overlapping the payload is fine, it's a move not a copy.
+        assert!(buf.ensure_headroom(22));
+        assert_eq!(&*buf, &[1, 2, 3, 4]);
+
+        // Doesn't fit: the buffer is left alone.
+        assert!(!buf.ensure_headroom(PACKET_BUF_SIZE - 3));
+        assert_eq!(buf.headroom(), 22);
+        assert_eq!(&*buf, &[1, 2, 3, 4]);
+        assert!(buf.ensure_headroom(PACKET_BUF_SIZE - 4));
+        assert_eq!(&*buf, &[1, 2, 3, 4]);
+    }
+
+    #[test]
     #[should_panic]
     fn push_beyond_headroom() {
         let mut buf = PacketBuf::try_new().unwrap();
         buf.push_front(1);
     }
 
-    /// The storage a driver DMAs into must stay 4-byte aligned and a multiple of 4
-    /// long, whatever the metadata in front of it does to the layout.
+    /// The storage a driver DMAs into must stay aligned to `PACKET_BUF_ALIGN` and
+    /// a multiple of it long, whatever the metadata in front of it does to the
+    /// layout.
     #[test]
     fn storage_is_dma_shaped() {
         let mut buf = PacketBuf::try_new().unwrap();
-        assert_eq!(buf.storage_mut().as_ptr() as usize % 4, 0);
-        assert_eq!(buf.storage_mut().len() % 4, 0);
+        assert_eq!(buf.storage_mut().as_ptr() as usize % PACKET_BUF_ALIGN, 0);
+        assert_eq!(buf.storage_mut().len() % PACKET_BUF_ALIGN, 0);
         assert!(buf.storage_mut().len() >= PACKET_BUF_SIZE);
     }
 

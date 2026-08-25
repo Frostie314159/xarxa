@@ -13,6 +13,7 @@ use crate::config::TCP_LISTENER_BACKLOG;
 use crate::config::TCP_SOCKET_COUNT;
 #[cfg(feature = "icmp-errors")]
 use crate::icmp_error::IcmpError;
+use crate::iface::ChecksumCapabilities;
 use crate::rand::Rand;
 use crate::stack::{EgressRoute, TxContext, alloc_ephemeral_port};
 use crate::storage::Slab;
@@ -28,14 +29,12 @@ use crate::wire::{
     TcpSeqNumber,
 };
 
-mod assembler;
 mod congestion;
 #[cfg(feature = "tcp-listener")]
 mod listener;
 mod repr;
 mod ring_buffer;
 
-use self::assembler::Assembler;
 use self::congestion::Controller as _;
 #[cfg(feature = "tcp-listener")]
 pub use self::listener::{TcpListener, TcpListenerHandle};
@@ -45,6 +44,7 @@ pub(crate) use self::repr::TcpRepr;
 #[cfg(feature = "tcp-timestamps")]
 pub(crate) use self::repr::TcpTimestampRepr;
 use self::ring_buffer::RingBuffer;
+use crate::storage::Assembler;
 
 /// The IP MTU assumed for TCP segment sizing until the destination has been
 /// routed.
@@ -2167,7 +2167,12 @@ impl<'d> TcpSocketState<'d> {
 /// Copy a TCP segment out of the socket state into a fresh packet buffer, with
 /// headroom reserved for the IP and Ethernet headers below it. `None` if the
 /// pool is empty.
-pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_addr: &IpAddress) -> Option<PacketBuf> {
+pub(crate) fn build_tcp_packet(
+    repr: &TcpRepr<'_>,
+    src_addr: &IpAddress,
+    dst_addr: &IpAddress,
+    checksum_caps: &ChecksumCapabilities,
+) -> Option<PacketBuf> {
     let ip_header_len = match dst_addr {
         #[cfg(feature = "ipv4")]
         IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
@@ -2178,7 +2183,7 @@ pub(crate) fn build_tcp_packet(repr: &TcpRepr<'_>, src_addr: &IpAddress, dst_add
     buf.reserve(LINK_HEADER_LEN + ip_header_len);
     buf.set_len(repr.buffer_len());
     let mut packet = TcpPacket::new_unchecked(&mut buf);
-    repr.emit(&mut packet, src_addr, dst_addr);
+    repr.emit(&mut packet, src_addr, dst_addr, checksum_caps);
     Some(buf)
 }
 
@@ -2240,7 +2245,7 @@ pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) 
                 trace!("device has no room for segment to {}, holding it back", dst_addr);
                 return Err(Blocked);
             }
-            let Some(buf) = build_tcp_packet(&repr, &src_addr, &dst_addr) else {
+            let Some(buf) = build_tcp_packet(&repr, &src_addr, &dst_addr, &cx.checksum_caps(route.iface)) else {
                 trace!("no packet buffer for segment to {}, holding it back", dst_addr);
                 return Err(Blocked);
             };
@@ -2873,8 +2878,9 @@ impl fmt::Write for TcpSocket<'_, '_> {
 #[cfg(all(test, feature = "medium-ip", feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
-    use crate::iface::{IfaceCapabilities, Interface, Medium};
+    use crate::iface::Medium;
     use crate::stack::Stack;
+    use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
     use std::ops::{Deref, DerefMut};
     use std::vec::Vec;
@@ -2947,30 +2953,6 @@ mod test {
     // =========================================================================================//
     // Helper functions
     // =========================================================================================//
-
-    /// A device that swallows every frame the stack transmits.
-    struct TestingDevice;
-
-    impl Interface for TestingDevice {
-        fn capabilities(&self) -> IfaceCapabilities {
-            IfaceCapabilities {
-                medium: Medium::Ip,
-                max_transmission_unit: 1500,
-            }
-        }
-
-        fn receive(&mut self) -> Option<PacketBuf> {
-            None
-        }
-
-        fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
-            Ok(())
-        }
-
-        fn can_transmit(&mut self) -> bool {
-            true
-        }
-    }
 
     struct TestSocket {
         sockets: Slab<TcpSocketState<'static>, TCP_SOCKET_COUNT>,
@@ -3130,9 +3112,7 @@ mod test {
     /// A stack with one interface owning `LOCAL_ADDR`.
     fn test_stack() -> Stack<'static> {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack
-            .add_iface_borrowed(Box::leak(Box::new(TestingDevice)), HardwareAddress::Ip)
-            .unwrap();
+        let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
             .set_ip_addrs([
@@ -5397,38 +5377,15 @@ mod test {
 
     #[test]
     fn test_mss_derived_from_iface_mtu() {
-        /// A device with an MTU smaller than a packet buffer.
-        struct SmallMtuDevice;
-
-        impl Interface for SmallMtuDevice {
-            fn capabilities(&self) -> IfaceCapabilities {
-                IfaceCapabilities {
-                    medium: Medium::Ip,
-                    max_transmission_unit: 576,
-                }
-            }
-
-            fn receive(&mut self) -> Option<PacketBuf> {
-                None
-            }
-
-            fn transmit(&mut self, _buf: PacketBuf) -> Result<(), PacketBuf> {
-                Ok(())
-            }
-
-            fn can_transmit(&mut self) -> bool {
-                true
-            }
-        }
-
-        const MTU_MSS: usize = 576 - IPV4_HEADER_LEN - TCP_HEADER_LEN;
+        // A device with an MTU smaller than a packet buffer.
+        const MTU: usize = 576;
+        const MTU_MSS: usize = MTU - IPV4_HEADER_LEN - TCP_HEADER_LEN;
 
         let mut s = socket_with_buffer_sizes(2048, 64);
         s.stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = s
-            .stack
-            .add_iface_borrowed(Box::leak(Box::new(SmallMtuDevice)), HardwareAddress::Ip)
-            .unwrap();
+        let handle = TestDevice::new(Medium::Ip)
+            .with_mtu(MTU)
+            .install(&mut s.stack, HardwareAddress::Ip);
         s.stack
             .iface(handle)
             .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
@@ -9943,12 +9900,10 @@ mod stack_test {
     //! included.
 
     use super::*;
-    use crate::iface::{IfaceCapabilities, Interface, Medium};
+    use crate::iface::Medium;
     use crate::stack::Stack;
+    use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv4Packet};
-    use std::cell::RefCell;
-    use std::collections::VecDeque;
-    use std::rc::Rc;
 
     const LOCAL_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
     const REMOTE_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
@@ -9977,56 +9932,36 @@ mod stack_test {
         payload2: &[],
     };
 
-    #[derive(Default)]
-    struct Queues {
-        rx: VecDeque<PacketBuf>,
-        tx: VecDeque<Vec<u8>>,
-    }
-
-    /// A device backed by shared queues, so tests can inject and inspect frames.
-    struct QueueDevice(Rc<RefCell<Queues>>);
-
-    impl Interface for QueueDevice {
-        fn capabilities(&self) -> IfaceCapabilities {
-            IfaceCapabilities {
-                medium: Medium::Ip,
-                max_transmission_unit: 1500,
-            }
-        }
-
-        fn receive(&mut self) -> Option<PacketBuf> {
-            self.0.borrow_mut().rx.pop_front()
-        }
-
-        fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf> {
-            self.0.borrow_mut().tx.push_back(buf[..].to_vec());
-            Ok(())
-        }
-
-        fn can_transmit(&mut self) -> bool {
-            true
-        }
-    }
-
-    fn stack() -> (Stack<'static>, Rc<RefCell<Queues>>) {
-        let queues = Rc::new(RefCell::new(Queues::default()));
+    fn stack() -> (Stack<'static>, TestDevice) {
+        let dev = TestDevice::new(Medium::Ip);
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let handle = stack
-            .add_iface_borrowed(Box::leak(Box::new(QueueDevice(queues.clone()))), HardwareAddress::Ip)
-            .unwrap();
+        let handle = dev.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
             .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
             .unwrap();
-        (stack, queues)
+        (stack, dev)
     }
 
     /// Build a full IPv4+TCP packet from the remote to the local endpoint,
     /// checksums filled, ready for injection into the device RX queue.
-    fn tcp_packet(repr: &TcpRepr) -> PacketBuf {
-        let mut buf = build_tcp_packet(repr, &REMOTE_ADDR.into(), &LOCAL_ADDR.into()).unwrap();
-        crate::stack::push_ipv4_header(&mut buf, REMOTE_ADDR, LOCAL_ADDR, IpProtocol::Tcp, 64);
-        buf
+    fn tcp_packet(repr: &TcpRepr) -> Vec<u8> {
+        let mut buf = build_tcp_packet(
+            repr,
+            &REMOTE_ADDR.into(),
+            &LOCAL_ADDR.into(),
+            &ChecksumCapabilities::default(),
+        )
+        .unwrap();
+        crate::stack::push_ipv4_header(
+            &mut buf,
+            REMOTE_ADDR,
+            LOCAL_ADDR,
+            IpProtocol::Tcp,
+            64,
+            &ChecksumCapabilities::default(),
+        );
+        buf.to_vec()
     }
 
     /// Parse a transmitted frame: verify the IP header, the TCP checksum, and the
@@ -10051,19 +9986,19 @@ mod stack_test {
     #[test]
     #[cfg(feature = "tcp-listener")]
     fn test_stack_handshake_data_and_close() {
-        let (mut stack, queues) = stack();
+        let (mut stack, dev) = stack();
         let lh = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(lh).listen(LOCAL_PORT).unwrap();
 
         // A SYN is recorded in the accept queue, nothing is transmitted until
         // the connection is accepted.
-        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(0));
-        assert!(queues.borrow().tx.is_empty());
+        assert!(dev.tx.borrow().is_empty());
         assert!(stack.tcp_listener(lh).can_accept());
 
         // Accept allocates the actual socket, and the next poll sends the
@@ -10075,34 +10010,34 @@ mod stack_test {
         stack.tcp_socket(h).set_ack_delay(None);
         assert_eq!(stack.tcp_socket(h).state(), State::SynReceived);
         stack.poll(Instant::from_millis(0));
-        let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
+        let mut frame = dev.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.syn() && tcp.ack());
             assert_eq!(tcp.seq_number(), LOCAL_SEQ);
             assert_eq!(tcp.ack_number(), REMOTE_SEQ + 1);
             assert_eq!(tcp.window_len(), 64);
         });
-        assert!(queues.borrow().tx.is_empty());
+        assert!(dev.tx.borrow().is_empty());
 
         // ACK of the SYN|ACK in: established.
-        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(1));
         assert_eq!(stack.tcp_socket(h).state(), State::Established);
-        assert!(queues.borrow().tx.is_empty());
+        assert!(dev.tx.borrow().is_empty());
 
         // Data in, ACK out, and the data is readable from the socket.
-        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
             payload: b"hello",
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(2));
-        let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
+        let mut frame = dev.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert_eq!(tcp.ack_number(), REMOTE_SEQ + 1 + 5);
         });
@@ -10113,7 +10048,7 @@ mod stack_test {
         // Data out: enqueued by send, transmitted by the next poll.
         assert_eq!(stack.tcp_socket(h).send_slice(b"world"), Ok(5));
         stack.poll(Instant::from_millis(3));
-        let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
+        let mut frame = dev.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.psh());
             assert_eq!(tcp.seq_number(), LOCAL_SEQ + 1);
@@ -10121,19 +10056,19 @@ mod stack_test {
         });
 
         // ACK of the data in.
-        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             seq_number: REMOTE_SEQ + 1 + 5,
             ack_number: Some(LOCAL_SEQ + 1 + 5),
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(3));
-        assert!(queues.borrow().tx.is_empty());
+        assert!(dev.tx.borrow().is_empty());
 
         // Close: the FIN is transmitted by the next poll.
         stack.tcp_socket(h).close();
         assert_eq!(stack.tcp_socket(h).state(), State::FinWait1);
         stack.poll(Instant::from_millis(4));
-        let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
+        let mut frame = dev.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.fin());
             assert_eq!(tcp.seq_number(), LOCAL_SEQ + 1 + 5);
@@ -10142,39 +10077,39 @@ mod stack_test {
 
     #[test]
     fn test_stack_rst_on_closed_port() {
-        let (mut stack, queues) = stack();
+        let (mut stack, dev) = stack();
 
-        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(0));
 
-        let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
+        let mut frame = dev.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.rst());
             assert_eq!(tcp.ack_number(), REMOTE_SEQ + 1);
         });
 
         // An incoming RST to a closed port is not answered.
-        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Rst,
             seq_number: REMOTE_SEQ,
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(1));
-        assert!(queues.borrow().tx.is_empty());
+        assert!(dev.tx.borrow().is_empty());
     }
 
     #[test]
     #[cfg(feature = "tcp-listener")]
     fn test_stack_established_socket_beats_listener() {
         // Set up an established connection through the listener.
-        let (mut stack, queues) = stack();
+        let (mut stack, dev) = stack();
         let lh = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(lh).listen(LOCAL_PORT).unwrap();
-        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             ..SEND_TEMPL
@@ -10185,8 +10120,8 @@ mod stack_test {
             .accept_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
         stack.poll(Instant::from_millis(0));
-        queues.borrow_mut().tx.pop_front().unwrap(); // the SYN|ACK
-        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+        dev.tx.borrow_mut().remove(0); // the SYN|ACK
+        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             seq_number: REMOTE_SEQ + 1,
             ack_number: Some(LOCAL_SEQ + 1),
             ..SEND_TEMPL
@@ -10197,17 +10132,17 @@ mod stack_test {
         // A SYN matching the established connection's exact 4-tuple goes to
         // the connected socket (which discards it: it carries no ACK) and
         // never reaches the listener, so no new connection attempt is queued.
-        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ + 100,
             ..SEND_TEMPL
         }));
         stack.poll(Instant::from_millis(2));
         assert!(!stack.tcp_listener(lh).can_accept());
-        assert!(queues.borrow().tx.is_empty());
+        assert!(dev.tx.borrow().is_empty());
 
         // A SYN from a different source port reaches the listener.
-        queues.borrow_mut().rx.push_back(tcp_packet(&TcpRepr {
+        dev.rx.borrow_mut().push_back(tcp_packet(&TcpRepr {
             control: TcpControl::Syn,
             seq_number: REMOTE_SEQ,
             src_port: REMOTE_PORT + 1,
@@ -10219,7 +10154,7 @@ mod stack_test {
 
     #[test]
     fn test_stack_retransmission_timer() {
-        let (mut stack, queues) = stack();
+        let (mut stack, dev) = stack();
         let h = stack
             .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
@@ -10232,15 +10167,15 @@ mod stack_test {
         // The SYN is transmitted by the next poll, which returns the
         // retransmission deadline.
         let deadline = stack.poll(Instant::from_millis(0));
-        let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
+        let mut frame = dev.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.syn() && !tcp.ack());
         });
-        assert!(queues.borrow().tx.is_empty());
+        assert!(dev.tx.borrow().is_empty());
 
         // No answer: polling past the deadline retransmits the SYN.
         stack.poll(deadline);
-        let mut frame = queues.borrow_mut().tx.pop_front().unwrap();
+        let mut frame = dev.tx.borrow_mut().remove(0);
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.syn() && !tcp.ack());
         });

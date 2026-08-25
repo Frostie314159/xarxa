@@ -4,9 +4,10 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::buf::PacketBuf;
-use crate::iface::{IfaceCapabilities, Interface, Medium};
+use crate::iface::{ChecksumCapabilities, IfaceCapabilities, Interface, Medium};
 #[cfg(feature = "medium-ethernet")]
 use crate::wire::ETHERNET_HEADER_LEN;
+use crate::wire::HardwareAddress;
 
 const SIOCGIFMTU: libc::c_ulong = 0x8921;
 
@@ -68,7 +69,7 @@ fn ifreq_ioctl(lower: libc::c_int, ifreq: &mut ifreq, cmd: libc::c_ulong) -> io:
 pub struct TunTapInterface {
     lower: libc::c_int,
     mtu: usize,
-    medium: Medium,
+    hardware_addr: HardwareAddress,
 }
 
 impl AsRawFd for TunTapInterface {
@@ -80,10 +81,16 @@ impl AsRawFd for TunTapInterface {
 impl TunTapInterface {
     /// Attaches to a TUN/TAP interface called `name`, or creates it if it does not exist.
     ///
+    /// `hardware_addr` is the address the interface reports to the stack, and picks the
+    /// medium: [`HardwareAddress::Ip`] opens a TUN interface, an Ethernet address opens a
+    /// TAP one.
+    ///
     /// If `name` is a persistent interface configured with UID of the current user,
     /// no special privileges are needed. Otherwise, this requires superuser privileges
     /// or a corresponding capability set on the executable.
-    pub fn new(name: &str, medium: Medium) -> io::Result<TunTapInterface> {
+    pub fn new(name: &str, hardware_addr: HardwareAddress) -> io::Result<TunTapInterface> {
+        let medium = hardware_addr.medium();
+
         let lower = unsafe {
             let lower = libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_NONBLOCK);
             if lower == -1 {
@@ -96,15 +103,26 @@ impl TunTapInterface {
         Self::attach_interface_ifreq(lower, medium, &mut ifreq)?;
         let mtu = Self::mtu_ifreq(medium, &mut ifreq)?;
 
-        Ok(TunTapInterface { lower, mtu, medium })
+        Ok(TunTapInterface {
+            lower,
+            mtu,
+            hardware_addr,
+        })
     }
 
     /// Attaches to a TUN/TAP interface specified by file descriptor `fd`.
     ///
     /// On platforms like Android, a file descriptor to a tun interface is exposed.
     /// On these platforms, a TunTapInterface cannot be instantiated with a name.
-    pub fn from_fd(fd: RawFd, medium: Medium, mtu: usize) -> io::Result<TunTapInterface> {
-        Ok(TunTapInterface { lower: fd, mtu, medium })
+    ///
+    /// `hardware_addr` is the address the interface reports to the stack, and picks the
+    /// medium, as in [`new`](Self::new).
+    pub fn from_fd(fd: RawFd, hardware_addr: HardwareAddress, mtu: usize) -> io::Result<TunTapInterface> {
+        Ok(TunTapInterface {
+            lower: fd,
+            mtu,
+            hardware_addr,
+        })
     }
 
     fn attach_interface_ifreq(lower: libc::c_int, medium: Medium, ifr: &mut ifreq) -> io::Result<()> {
@@ -113,6 +131,13 @@ impl TunTapInterface {
             Medium::Ip => IFF_TUN,
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => IFF_TAP,
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "TUN/TAP interfaces do not carry IEEE 802.15.4 frames",
+                ));
+            }
         };
         ifr.ifr_data = mode | IFF_NO_PI;
         ifreq_ioctl(lower, ifr, TUNSETIFF).map(|_| ())
@@ -143,6 +168,8 @@ impl TunTapInterface {
             Medium::Ip => ip_mtu,
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => ip_mtu + ETHERNET_HEADER_LEN,
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => unreachable!(),
         };
 
         Ok(mtu)
@@ -180,9 +207,14 @@ impl Drop for TunTapInterface {
 impl Interface for TunTapInterface {
     fn capabilities(&self) -> IfaceCapabilities {
         IfaceCapabilities {
-            medium: self.medium,
+            medium: self.hardware_addr.medium(),
             max_transmission_unit: self.mtu,
+            checksum: ChecksumCapabilities::default(),
         }
+    }
+
+    fn hardware_address(&self) -> HardwareAddress {
+        self.hardware_addr
     }
 
     fn receive(&mut self) -> Option<PacketBuf> {

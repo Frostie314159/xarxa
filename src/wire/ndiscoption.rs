@@ -364,6 +364,28 @@ mod test {
         assert_eq!(opt.prefix(), Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
     }
 
+    /// A 16-byte link-layer address option (data length 2) carries an
+    /// extended 802.15.4 address, padded with zeros.
+    #[test]
+    #[cfg(feature = "medium-ieee802154")]
+    fn test_link_layer_addr_ieee802154() {
+        use crate::iface::Medium;
+        use crate::wire::{HardwareAddress, Ieee802154Address};
+        let mut bytes = [
+            0x01, 0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let opt = NdiscOption::new_checked(&mut bytes[..]).unwrap();
+        assert_eq!(opt.option_type(), Type::SourceLinkLayerAddr);
+        assert_eq!(opt.data_len(), 2);
+        let addr = Ieee802154Address::Extended([0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        assert_eq!(
+            opt.link_layer_addr().parse(Medium::Ieee802154),
+            Ok(HardwareAddress::Ieee802154(addr))
+        );
+        #[cfg(feature = "medium-ethernet")]
+        assert!(opt.link_layer_addr().parse(Medium::Ethernet).is_err());
+    }
+
     #[test]
     fn test_short_packet() {
         assert_eq!(NdiscOption::new_checked(&mut [0x00, 0x00]), Err(Error));

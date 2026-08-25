@@ -4,6 +4,7 @@
 //! - Source ports for TCP and UDP.
 //! - TCP initial sequence numbers.
 //! - TCP timestamp random offsets.
+//! - IP fragmentation IDs
 
 // In test builds the TCP initial sequence number is a fixed value, and without
 // sockets nothing needs random numbers at all, leaving the PRNG unused.
@@ -32,7 +33,7 @@ impl Rand {
         (s >> shift) as u32
     }
 
-    #[cfg(all(feature = "ipv6", feature = "multicast"))]
+    #[allow(unused)]
     pub(crate) fn rand_u16(&mut self) -> u16 {
         let n = self.rand_u32();
         (n ^ (n >> 16)) as u16
