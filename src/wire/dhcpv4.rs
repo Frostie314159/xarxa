@@ -16,6 +16,9 @@ pub const CLIENT_PORT: u16 = 68;
 /// The magic cookie that starts the options field of every DHCP packet.
 pub const MAGIC_NUMBER: u32 = 0x63825363;
 
+/// DHCP Hostname option code.
+const OPTION_KIND_HOSTNAME: u8 = 12;
+
 open_enum! {
     /// The opcode of a DHCP packet.
     pub enum OpCode(u8) {
@@ -131,6 +134,25 @@ pub struct DhcpOption<'a> {
     pub kind: u8,
     /// The option data.
     pub data: &'a [u8],
+}
+
+impl<'a> DhcpOption<'a> {
+    /// Constructs a DHCP Hostname option.
+    ///
+    /// The maximum length of the hostname slice must be at most 255 bytes.
+    ///
+    /// # Usage
+    ///
+    /// ```no_run
+    /// # use xarxa::wire::DhcpOption;
+    /// let opt = DhcpOption::hostname(b"my_device");
+    /// ```
+    pub fn hostname(hostname: &'a [u8]) -> Self {
+        Self {
+            kind: OPTION_KIND_HOSTNAME,
+            data: hostname,
+        }
+    }
 }
 
 /// A read/write wrapper around a Dynamic Host Configuration Protocol packet buffer.
@@ -720,5 +742,36 @@ mod test {
     fn test_too_short() {
         let mut bytes = [0u8; HEADER_LEN - 1];
         assert!(Packet::new_checked(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn test_dhcp_option_hostname() {
+        let mut bytes = [0u8; 256];
+        let mut writer = OptionWriter::new(&mut bytes);
+        let hostname = b"this_is_my_host.name";
+        let hostname_opt = DhcpOption::hostname(hostname);
+
+        assert_eq!(writer.emit(hostname_opt), Ok(()));
+        assert_eq!(writer.end(), Ok(()));
+        assert_eq!(writer.written(), 23);
+
+        let mut expected = [
+            12, // Option code
+            20, // Len of option
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,   // hostname
+            255, // End code
+        ];
+
+        expected[2..22].copy_from_slice(b"this_is_my_host.name");
+        assert_eq!(bytes[..23], expected);
+    }
+
+    #[test]
+    fn test_dhcp_hostname_too_long() {
+        let mut bytes = [0u8; 1024];
+        let mut writer = OptionWriter::new(&mut bytes);
+        let hostname: [u8; 256] = ['a' as u8; 256];
+        let hostname_opt = DhcpOption::hostname(&hostname);
+        assert_eq!(writer.emit(hostname_opt), Err(Error));
     }
 }
