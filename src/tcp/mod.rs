@@ -915,8 +915,6 @@ impl<'d> TcpSocketState<'d> {
         // segment.
         #[cfg(feature = "tcp-sack")]
         if self.remote_has_sack {
-            debug!("sending sACK option with current assembler ranges");
-
             let ack = reply_repr.ack_number.unwrap_or(TcpSeqNumber(0));
             reply_repr.sack_ranges = self.generate_sack_ranges(ack);
         }
@@ -1769,6 +1767,8 @@ impl<'d> TcpSocketState<'d> {
             self.local_sack_history = [None, None, None];
             return [None, None, None];
         }
+
+        debug!("sending SACK option with current assembler ranges");
 
         let mut blocks = [None, None, None];
         let mut n = 0;
