@@ -3577,6 +3577,12 @@ mod test {
         // Exactly the address SLAAC forms from `prefix` on this interface.
         let our_addr = IpCidr::new(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0xff, 0xfe00, 0x1).into(), 64);
 
+        // Without `alloc` the address table is bounded (`iface-addr-count-N`, four by
+        // default) and `test_stack` already assigns two addresses. Clear them so the
+        // prefixes below have room; the link-local address is kept regardless.
+        let no_addrs: [IpCidr; 0] = [];
+        stack.iface(iface).set_ip_addrs(no_addrs).unwrap();
+
         stack.iface(iface).add_ip_addr(our_addr).unwrap();
         stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
 
@@ -3657,6 +3663,12 @@ mod test {
         let incoming_addr = Ipv6Address::new(0x2001, 0xdb9, 0, 0, 0, 0xff, 0xfe00, 0x1);
         // On the outgoing prefix, so rule 8 on its own always answers `outgoing_addr`.
         let dst = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x2);
+
+        // Without `alloc` the address table is bounded (`iface-addr-count-N`, four by
+        // default) and `test_stack` already assigns two addresses. Clear them so the
+        // prefixes below have room; the link-local address is kept regardless.
+        let no_addrs: [IpCidr; 0] = [];
+        stack.iface(iface).set_ip_addrs(no_addrs).unwrap();
 
         stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
 
