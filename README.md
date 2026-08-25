@@ -120,6 +120,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Delayed ACK (defaults to enabled, can be turned off)
   - Zero-window probes
   - TCP Timestamps (feature `tcp-timestamps`)
+  - TCP SACK, sending ranges only (feature `tcp-sack`)
 - DNS client (feature `dns`)
   - Multiple servers, retransmission with backoff.
   - Multicast DNS for `.local` names (feature `mdns`)
@@ -143,7 +144,7 @@ All of the below is planned. Please open an issue or reach out on [the Matrix ch
 - an equivalent to smoltcp's `any_ip`
 - IPv6 fragmentation and reassembly
 - TCP segmentation offload
-- TCP SACK
+- TCP SACK, acting on ranges received from the peer.
 - Store sockets on a hashmap so packet dispatch is O(1) instead of O(n). (would be optional with a Cargo feature, it's only worth if you have thousands of sockets, i.e. not on embedded)
 - Maybe multithreading. Would require per-socket mutexes etc. (again, optional, would require std)
 

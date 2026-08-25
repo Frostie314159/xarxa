@@ -554,6 +554,7 @@ pub(crate) struct TcpSocketState<'d> {
     /// The receive window scaling factor for remotes which support RFC 1323, None if unsupported.
     remote_win_scale: Option<u8>,
     /// Whether or not the remote supports selective ACK as described in RFC 2018.
+    #[cfg(feature = "tcp-sack")]
     remote_has_sack: bool,
     /// The maximum number of data octets that the remote side may receive.
     remote_mss: usize,
@@ -565,6 +566,7 @@ pub(crate) struct TcpSocketState<'d> {
     /// The timestamp of the last packet received.
     remote_last_ts: Option<Instant>,
     /// The sequence number of the last packet received, used for sACK
+    #[cfg(feature = "tcp-sack")]
     local_rx_last_seq: Option<TcpSeqNumber>,
     /// The ACK number of the last packet received.
     local_rx_last_ack: Option<TcpSeqNumber>,
@@ -585,6 +587,10 @@ pub(crate) struct TcpSocketState<'d> {
 
     /// Nagle's Algorithm enabled.
     nagle: bool,
+
+    /// The last three SACK ranges that were sent to the remote.
+    #[cfg(feature = "tcp-sack")]
+    local_sack_history: [Option<(TcpSeqNumber, TcpSeqNumber)>; 3],
 
     /// The congestion control algorithm.
     congestion_controller: congestion::Congestion,
@@ -618,9 +624,6 @@ const DEFAULT_MSS: usize = 536;
 /// Without it, a peer advertising a tiny MSS could force segments to carry little
 /// or no payload once the TCP options length is subtracted from the effective MSS,
 /// stalling the connection in an endless stream of empty segments.
-///
-/// Must exceed the maximum possible length of the TCP options (currently 12, for
-/// timestamps) so that every segment carries some payload.
 const MIN_REMOTE_MSS: usize = 48;
 
 impl<'d> TcpSocketState<'d> {
@@ -661,11 +664,13 @@ impl<'d> TcpSocketState<'d> {
             remote_win_len: 0,
             remote_win_shift: rx_cap_log2.saturating_sub(16) as u8,
             remote_win_scale: None,
+            #[cfg(feature = "tcp-sack")]
             remote_has_sack: false,
             remote_mss: DEFAULT_MSS,
             ip_mtu: DEFAULT_IP_MTU,
             remote_last_ts: None,
             local_rx_last_ack: None,
+            #[cfg(feature = "tcp-sack")]
             local_rx_last_seq: None,
             local_rx_dup_acks: 0,
             pending_fast_retransmit: false,
@@ -673,6 +678,8 @@ impl<'d> TcpSocketState<'d> {
             ack_delay_timer: AckDelayTimer::Idle,
             challenge_ack_timer: Instant::from_secs(0),
             nagle: true,
+            #[cfg(feature = "tcp-sack")]
+            local_sack_history: [None, None, None],
             #[cfg(feature = "tcp-timestamps")]
             timestamps: false,
             #[cfg(feature = "tcp-timestamps")]
@@ -744,24 +751,38 @@ impl<'d> TcpSocketState<'d> {
             self.icmp_error = None;
         }
         self.local_seq_no = TcpSeqNumber::default();
+        #[cfg(feature = "tcp-sack")]
+        {
+            self.local_rx_last_seq = None;
+        }
+        self.local_rx_last_ack = None;
+        self.local_rx_dup_acks = 0;
+        self.pending_fast_retransmit = false;
         self.remote_seq_no = TcpSeqNumber::default();
         self.remote_last_seq = TcpSeqNumber::default();
         self.remote_last_ack = None;
         self.remote_last_win = 0;
         self.remote_win_len = 0;
         self.remote_win_scale = None;
+        #[cfg(feature = "tcp-sack")]
+        {
+            self.remote_has_sack = false;
+        }
         self.remote_win_shift = rx_cap_log2.saturating_sub(16) as u8;
-        self.remote_has_sack = false;
         self.remote_mss = DEFAULT_MSS;
         self.ip_mtu = DEFAULT_IP_MTU;
         self.remote_last_ts = None;
-        self.local_rx_last_ack = None;
-        self.local_rx_last_seq = None;
-        self.local_rx_dup_acks = 0;
-        self.pending_fast_retransmit = false;
+        #[cfg(feature = "tcp-timestamps")]
+        {
+            self.last_remote_tsval = 0;
+        }
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
         self.congestion_controller = congestion::Congestion::new();
+        #[cfg(feature = "tcp-sack")]
+        {
+            self.local_sack_history = [None, None, None];
+        }
 
         #[cfg(feature = "async")]
         {
@@ -826,7 +847,9 @@ impl<'d> TcpSocketState<'d> {
             window_len: 0,
             window_scale: None,
             max_seg_size: None,
+            #[cfg(feature = "tcp-sack")]
             sack_permitted: false,
+            #[cfg(feature = "tcp-sack")]
             sack_ranges: [None, None, None],
             #[cfg(feature = "tcp-timestamps")]
             timestamp: None,
@@ -890,41 +913,10 @@ impl<'d> TcpSocketState<'d> {
 
         // If the remote supports selective acknowledgement, add the option to the outgoing
         // segment.
+        #[cfg(feature = "tcp-sack")]
         if self.remote_has_sack {
-            debug!("sending sACK option with current assembler ranges");
-
-            // RFC 2018: The first SACK block (i.e., the one immediately following the kind and
-            // length fields in the option) MUST specify the contiguous block of data containing
-            // the segment which triggered this ACK, unless that segment advanced the
-            // Acknowledgment Number field in the header.
-            reply_repr.sack_ranges[0] = None;
-
             let ack = reply_repr.ack_number.unwrap_or(TcpSeqNumber(0));
-
-            if let Some(last_seg_seq) = self.local_rx_last_seq {
-                reply_repr.sack_ranges[0] = self
-                    .assembler
-                    .iter_data()
-                    .map(|(left, right)| (ack + left, ack + right))
-                    .find(|&(left, right)| left <= last_seg_seq && right >= last_seg_seq)
-                    .map(|(left, right)| (left.0 as u32, right.0 as u32));
-            }
-
-            if reply_repr.sack_ranges[0].is_none() {
-                // The matching segment was removed from the assembler, meaning the acknowledgement
-                // number has advanced, or there was no previous sACK.
-                //
-                // While the RFC says we SHOULD keep a list of reported sACK ranges, and iterate
-                // through those, that is currently infeasible. Instead, we offer the range with
-                // the lowest sequence number (if one exists) to hint at what segments would
-                // most quickly advance the acknowledgement number.
-                reply_repr.sack_ranges[0] = self
-                    .assembler
-                    .iter_data()
-                    .map(|(left, right)| (ack + left, ack + right))
-                    .next()
-                    .map(|(left, right)| (left.0 as u32, right.0 as u32));
-            }
+            reply_repr.sack_ranges = self.generate_sack_ranges(ack);
         }
 
         reply_repr
@@ -1156,8 +1148,6 @@ impl<'d> TcpSocketState<'d> {
                     // the checks done above imply this.
                     debug_assert!(overlap_start <= overlap_end);
 
-                    self.local_rx_last_seq = Some(repr.seq_number);
-
                     (
                         &repr.payload[overlap_start - segment_start..overlap_end - segment_start],
                         overlap_start - window_start,
@@ -1294,7 +1284,10 @@ impl<'d> TcpSocketState<'d> {
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no + 1;
                 self.remote_last_ack = Some(repr.seq_number);
-                self.remote_has_sack = repr.sack_permitted;
+                #[cfg(feature = "tcp-sack")]
+                {
+                    self.remote_has_sack = repr.sack_permitted;
+                }
                 self.remote_win_scale = repr.window_scale;
                 // Remote doesn't support window scaling, don't do it.
                 if self.remote_win_scale.is_none() {
@@ -1530,6 +1523,12 @@ impl<'d> TcpSocketState<'d> {
             return None;
         };
 
+        // assembler accepted segment, track sequence number for SACK generation
+        #[cfg(feature = "tcp-sack")]
+        {
+            self.local_rx_last_seq = Some(repr.seq_number);
+        }
+
         // Place payload octets into the buffer.
         trace!(
             "rx buffer: receiving {} octets at offset {}",
@@ -1615,13 +1614,26 @@ impl<'d> TcpSocketState<'d> {
             IpAddress::Ipv6(_) => crate::wire::IPV6_HEADER_LEN,
         };
 
-        // The effective max segment size, taking into account the options and the local and remote limits.
-        #[cfg(feature = "tcp-timestamps")]
-        let options_len = if self.timestamps { 12 } else { 0 };
-        #[cfg(not(feature = "tcp-timestamps"))]
-        let options_len = 0;
-
+        // The effective max segment size, taking into account our and remote's limits.
+        // Per RFC 6691 §2 the advertised MSS counts payload only and excludes TCP options, so
+        // subtract the options a data segment carries.
         let local_mss = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
+
+        #[cfg(feature = "tcp-timestamps")]
+        let mut options_len: usize = if self.timestamps { 10 } else { 0 };
+        #[cfg(not(feature = "tcp-timestamps"))]
+        let mut options_len: usize = 0;
+
+        #[cfg(feature = "tcp-sack")]
+        {
+            let sack_blocks = self.sack_range_count();
+            if sack_blocks > 0 {
+                options_len += sack_blocks * 8 + 2;
+            }
+        }
+        // Options are padded to a multiple of four bytes on the wire.
+        options_len = options_len.next_multiple_of(4);
+
         let effective_mss = local_mss.min(self.remote_mss).saturating_sub(options_len);
 
         // Have we sent data that hasn't been ACKed yet?
@@ -1728,6 +1740,88 @@ impl<'d> TcpSocketState<'d> {
             }
             _ => false,
         }
+    }
+
+    /// The number of SACK blocks the next emitted ACK will carry.
+    ///
+    /// Matches count of what `generate_sack_ranges()` generates, as SACK ranges
+    ///  are filled with extra ranges from assembler if history is small.
+    #[cfg(feature = "tcp-sack")]
+    fn sack_range_count(&self) -> usize {
+        if self.remote_has_sack {
+            self.assembler.iter_data().take(3).count()
+        } else {
+            0
+        }
+    }
+
+    /// Build the SACK blocks for an outgoing ACK, per RFC 2018, and record
+    /// what was reported in `local_sack_history`.
+    ///
+    /// First block contains the triggering island (if it forms an island).
+    /// Subsequent blocks are filled from history, and then from the assembler.
+    /// Blocks are mapped into the current islands before reporting them.
+    #[cfg(feature = "tcp-sack")]
+    fn generate_sack_ranges(&mut self, ack: TcpSeqNumber) -> [Option<(u32, u32)>; 3] {
+        if self.assembler.is_empty() {
+            self.local_sack_history = [None, None, None];
+            return [None, None, None];
+        }
+
+        debug!("sending SACK option with current assembler ranges");
+
+        let mut blocks = [None, None, None];
+        let mut n = 0;
+
+        let find_block = |seq: TcpSeqNumber| {
+            self.assembler
+                .iter_data()
+                .map(|(l, r)| (ack + l, ack + r))
+                .find(|&(l, r)| l <= seq && seq < r)
+        };
+
+        // RFC 2018: the first SACK block MUST specify the contiguous block of
+        // data containing the segment which triggered this ACK, unless that
+        // segment advanced the Acknowledgment Number field in the header.
+        if let Some(seq) = self.local_rx_last_seq
+            && let Some(block) = find_block(seq)
+        {
+            blocks[0] = Some(block);
+            n = 1;
+        }
+
+        // RFC 2018: The SACK option SHOULD be filled out by repeating the most
+        // recently reported SACK blocks that are not subsets of a SACK block
+        // already included in the SACK option being constructed.
+        //
+        // Maps each old block onto its current island, ensuring no duplicates.
+        for block in self.local_sack_history.iter().flatten() {
+            if n == blocks.len() {
+                break;
+            }
+            if let Some(island) = find_block(block.0)
+                && !blocks[..n].contains(&Some(island))
+            {
+                blocks[n] = Some(island);
+                n += 1;
+            }
+        }
+
+        // Remaining holes are filled from the assembler, lowest island first.
+        for island in self.assembler.iter_data().map(|(l, r)| (ack + l, ack + r)) {
+            if n == blocks.len() {
+                break;
+            }
+            if !blocks[..n].contains(&Some(island)) {
+                blocks[n] = Some(island);
+                n += 1;
+            }
+        }
+
+        self.local_sack_history = blocks;
+
+        // convert blocks to wire representation
+        blocks.map(|block| block.map(|(l, r)| (l.0 as u32, r.0 as u32)))
     }
 
     pub(crate) fn dispatch<F, E>(&mut self, cx: &mut TxContext<'_, '_>, emit: F) -> Result<(), E>
@@ -1868,13 +1962,29 @@ impl<'d> TcpSocketState<'d> {
             window_len: self.scaled_window(),
             window_scale: None,
             max_seg_size: None,
+            #[cfg(feature = "tcp-sack")]
             sack_permitted: false,
+            #[cfg(feature = "tcp-sack")]
             sack_ranges: [None, None, None],
             #[cfg(feature = "tcp-timestamps")]
             timestamp: self.timestamp_repr(cx.now(), self.last_remote_tsval),
             payload: &[],
             payload2: &[],
         };
+
+        // We fill blocks before payload sizing to ensure the options header length
+        // is taken into account.
+        #[cfg(feature = "tcp-sack")]
+        match self.state {
+            State::Closed | State::SynSent | State::SynReceived => {}
+            _ => {
+                if self.remote_has_sack
+                    && let Some(ack) = repr.ack_number
+                {
+                    repr.sack_ranges = self.generate_sack_ranges(ack);
+                }
+            }
+        }
 
         let mut is_zero_window_probe = false;
 
@@ -1895,9 +2005,15 @@ impl<'d> TcpSocketState<'d> {
                 if self.state == State::SynSent {
                     repr.ack_number = None;
                     repr.window_scale = Some(self.remote_win_shift);
-                    repr.sack_permitted = true;
+                    #[cfg(feature = "tcp-sack")]
+                    {
+                        repr.sack_permitted = true;
+                    }
                 } else {
-                    repr.sack_permitted = self.remote_has_sack;
+                    #[cfg(feature = "tcp-sack")]
+                    {
+                        repr.sack_permitted = self.remote_has_sack;
+                    }
                     repr.window_scale = self.remote_win_scale.map(|_| self.remote_win_shift);
                 }
             }
@@ -2926,7 +3042,9 @@ mod test {
         window_len: 256,
         window_scale: None,
         max_seg_size: None,
+        #[cfg(feature = "tcp-sack")]
         sack_permitted: false,
+        #[cfg(feature = "tcp-sack")]
         sack_ranges: [None, None, None],
         #[cfg(feature = "tcp-timestamps")]
         timestamp: None,
@@ -2942,7 +3060,9 @@ mod test {
         window_len: 64,
         window_scale: None,
         max_seg_size: None,
+        #[cfg(feature = "tcp-sack")]
         sack_permitted: false,
+        #[cfg(feature = "tcp-sack")]
         sack_ranges: [None, None, None],
         #[cfg(feature = "tcp-timestamps")]
         timestamp: None,
@@ -3916,6 +4036,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 #[cfg(feature = "tcp-timestamps")]
                 timestamp: Some(TcpTimestampRepr::new(0, 0)),
@@ -3949,6 +4070,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 #[cfg(feature = "tcp-timestamps")]
                 timestamp: Some(TcpTimestampRepr::new(0, 0)),
@@ -3983,6 +4105,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 #[cfg(feature = "tcp-timestamps")]
                 timestamp: Some(TcpTimestampRepr::new(0, 0)),
@@ -4002,6 +4125,128 @@ mod test {
         );
         assert_eq!(s.state, State::Established);
         assert_eq!(s.remote_mss, DEFAULT_MSS);
+    }
+
+    /// RFC 2018: If the data receiver has not received a SACK-Permitted option
+    /// for a given connection, it MUST NOT send SACK options on that connection.
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_connect_sack_not_offered_by_remote() {
+        let mut s = socket_syn_sent();
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: None,
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(0),
+                sack_permitted: true,
+                ..RECV_TEMPL
+            }]
+        );
+
+        // Ensure the remote rejecting SACK results in SACK options not being sent.
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: Some(LOCAL_SEQ + 1),
+                max_seg_size: Some(BASE_MSS - 80),
+                window_scale: Some(0),
+                sack_permitted: false,
+                ..SEND_TEMPL
+            }
+        );
+
+        assert!(!s.remote_has_sack);
+
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                ..RECV_TEMPL
+            }]
+        );
+
+        assert_eq!(s.state, State::Established);
+        sack_ranges_are_never_emitted(&mut s);
+    }
+
+    /// RFC 2018: If the data receiver has not received a SACK-Permitted option
+    /// for a given connection, it MUST NOT send SACK options on that connection.
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_syn_received_sack_not_offered_by_remote() {
+        let mut s = socket_syn_received();
+
+        // Ensure the remote not sending SACK results in SACK options not being sent.
+        assert!(!s.remote_has_sack);
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                sack_permitted: false,
+                ..RECV_TEMPL
+            }]
+        );
+
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        sack_ranges_are_never_emitted(&mut s);
+    }
+
+    // Ensure that SACK ranges are not attached to ACKs after receiving out of
+    // order segments. These segment should exist within the assembler however.
+    #[cfg(feature = "tcp-sack")]
+    fn sack_ranges_are_never_emitted(mut s: &mut TestSocket) {
+        for offset in [6, 18] {
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: b"abcdef",
+                    ..SEND_TEMPL
+                },
+                Some(TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    sack_ranges: [None, None, None],
+                    ..RECV_TEMPL
+                })
+            );
+        }
+
+        // No option space is reserved, so the MSS is not reduced.
+        assert_eq!(s.sack_range_count(), 0);
+
+        // The dispatch path is gated by the same conjunction.
+        s.view().send_slice(b"x").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                payload: b"x",
+                sack_ranges: [None, None, None],
+                ..RECV_TEMPL
+            }]
+        );
+
+        assert_eq!(s.assembler.iter_data().count(), 2);
     }
 
     #[test]
@@ -4113,6 +4358,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 ..RECV_TEMPL
             }]
@@ -4152,6 +4398,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 ..RECV_TEMPL
             }]
@@ -4224,6 +4471,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 ..RECV_TEMPL
             }]
@@ -4260,6 +4508,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 ..RECV_TEMPL
             }]
@@ -4348,6 +4597,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 ..RECV_TEMPL
             }]
@@ -4378,6 +4628,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 ..RECV_TEMPL
             }]
@@ -4414,6 +4665,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 ..RECV_TEMPL
             }]
@@ -4447,6 +4699,7 @@ mod test {
     }
 
     #[test]
+    #[cfg(feature = "tcp-sack")]
     fn test_syn_sent_sack_option() {
         let mut s = socket_syn_sent();
         recv!(
@@ -4532,6 +4785,7 @@ mod test {
                     max_seg_size: Some(BASE_MSS),
                     window_scale: Some(*shift_amt),
                     window_len: u16::try_from(*buffer_size).unwrap_or(u16::MAX),
+                    #[cfg(feature = "tcp-sack")]
                     sack_permitted: true,
                     #[cfg(feature = "tcp-timestamps")]
                     timestamp: Some(TcpTimestampRepr::new(0, 0)),
@@ -4554,6 +4808,7 @@ mod test {
                 // scaling does NOT apply to the window value in SYN packets
                 window_len: 65535,
                 window_scale: Some(5),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 ..RECV_TEMPL
             }]
@@ -4588,6 +4843,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 ..RECV_TEMPL
             }]
@@ -4684,128 +4940,52 @@ mod test {
         assert_eq!(&mut peeked_buf[..actually_peeked], &mut recv_buf[..actually_recvd]);
     }
 
-    fn setup_rfc2018_cases() -> (TestSocket, Vec<u8>) {
-        // This is a utility function used by the tests for RFC 2018 cases. It configures a socket
-        // in a particular way suitable for those cases.
-        //
-        // RFC 2018: Assume the left window edge is 5000 and that the data transmitter sends [...]
-        // segments, each containing 500 data bytes.
-        let mut s = socket_established_with_buffer_sizes(4000, 4000);
-        s.remote_has_sack = true;
-
-        // create a segment that is 500 bytes long
-        let mut segment: Vec<u8> = Vec::with_capacity(500);
-
-        // move the last ack to 5000 by sending ten of them
-        for _ in 0..50 {
-            segment.extend_from_slice(b"abcdefghij")
-        }
-        for offset in (0..5000).step_by(500) {
-            send!(
-                s,
-                TcpRepr {
-                    seq_number: REMOTE_SEQ + 1 + offset,
-                    ack_number: Some(LOCAL_SEQ + 1),
-                    payload: &segment,
-                    ..SEND_TEMPL
-                }
-            );
-            recv!(
-                s,
-                [TcpRepr {
-                    seq_number: LOCAL_SEQ + 1,
-                    ack_number: Some(REMOTE_SEQ + 1 + offset + 500),
-                    window_len: 3500,
-                    ..RECV_TEMPL
-                }]
-            );
-            s.view()
-                .recv(|data| {
-                    assert_eq!(data.len(), 500);
-                    assert_eq!(data, segment.as_slice());
-                    (500, ())
-                })
-                .unwrap();
-        }
-        assert_eq!(s.remote_last_win, 3500);
-        (s, segment)
-    }
-
+    /// Case:
+    /// The remote sequence space straddles the u32 wrap and two islands
+    /// are created. One straddling the boundary and another past it.
+    ///
+    /// Outcome:
+    /// The SACK ranges are reported correctly with no overflow.
     #[test]
-    fn test_established_rfc2018_cases() {
-        // This test case verifies the exact scenarios described on pages 8-9 of RFC 2018. Please
-        // ensure its behavior does not deviate from those scenarios.
-
-        let (mut s, segment) = setup_rfc2018_cases();
-        // RFC 2018:
-        //
-        // Case 2: The first segment is dropped but the remaining 7 are received.
-        //
-        // Upon receiving each of the last seven packets, the data receiver will return a TCP ACK
-        // segment that acknowledges sequence number 5000 and contains a SACK option specifying one
-        // block of queued data:
-        //
-        //   Triggering   ACK      Left Edge  Right Edge
-        //   Segment
-        //
-        //   5000         (lost)
-        //   5500         5000     5500       6000
-        //   6000         5000     5500       6500
-        //   6500         5000     5500       7000
-        //   7000         5000     5500       7500
-        //   7500         5000     5500       8000
-        //   8000         5000     5500       8500
-        //   8500         5000     5500       9000
-        //
-        for offset in (500..3500).step_by(500) {
-            send!(
-                s,
-                TcpRepr {
-                    seq_number: REMOTE_SEQ + 1 + offset + 5000,
-                    ack_number: Some(LOCAL_SEQ + 1),
-                    payload: &segment,
-                    ..SEND_TEMPL
-                },
-                Some(TcpRepr {
-                    seq_number: LOCAL_SEQ + 1,
-                    ack_number: Some(REMOTE_SEQ + 1 + 5000),
-                    window_len: 4000,
-                    sack_ranges: [
-                        Some((
-                            REMOTE_SEQ.0 as u32 + 1 + 5500,
-                            REMOTE_SEQ.0 as u32 + 1 + 5500 + offset as u32
-                        )),
-                        None,
-                        None
-                    ],
-                    ..RECV_TEMPL
-                })
-            );
-        }
-    }
-
-    #[test]
+    #[cfg(feature = "tcp-sack")]
     fn test_established_sack_no_overflow_on_near_max_seqnumber() {
         let mut s = socket_established();
         s.remote_has_sack = true;
         s.remote_seq_no = TcpSeqNumber(-4);
         s.remote_last_ack = Some(TcpSeqNumber(-4));
 
-        // Send an out-of-order segment 10 bytes past the expected sequence,
-        // creating a 10-byte hole at the front of the assembler.
+        // Create first island - [-2..2) - and SACK reports it
         send!(
             s,
             TcpRepr {
-                seq_number: TcpSeqNumber(-4 + 10),
+                seq_number: TcpSeqNumber(-2),
                 ack_number: Some(LOCAL_SEQ + 1),
-                payload: &b"AAAAAAAAAA"[..],
+                payload: &b"AAAA"[..],
                 ..SEND_TEMPL
             },
             Some(TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
                 ack_number: Some(TcpSeqNumber(-4)),
                 window_len: 64,
-                sack_ranges: [Some(((-4_i32 + 10) as u32, (-4_i32 + 20) as u32,)), None, None,],
+                sack_ranges: [Some((u32::MAX - 1, 2)), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Create second island - [6..10) - and SACK reports both
+        send!(
+            s,
+            TcpRepr {
+                seq_number: TcpSeqNumber(6),
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"BBBB"[..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(TcpSeqNumber(-4)),
+                window_len: 64,
+                sack_ranges: [Some((6, 10)), Some((u32::MAX - 1, 2)), None],
                 ..RECV_TEMPL
             })
         );
@@ -5404,6 +5584,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(MTU_MSS as u16),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 ..RECV_TEMPL
             }]
@@ -5471,6 +5652,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
@@ -6574,6 +6756,38 @@ mod test {
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
+    }
+
+    #[test]
+    fn test_reset_clears_connection_state() {
+        let mut s = socket_established();
+        #[cfg(feature = "tcp-sack")]
+        {
+            s.remote_has_sack = true;
+            s.local_rx_last_seq = Some(TcpSeqNumber(42));
+        }
+        s.local_rx_last_ack = Some(TcpSeqNumber(42));
+        s.local_rx_dup_acks = 2;
+        s.pending_fast_retransmit = true;
+        #[cfg(feature = "tcp-timestamps")]
+        {
+            s.last_remote_tsval = 7;
+        }
+
+        s.reset();
+
+        #[cfg(feature = "tcp-sack")]
+        {
+            assert!(!s.remote_has_sack);
+            assert_eq!(s.local_rx_last_seq, None);
+        }
+        assert_eq!(s.local_rx_last_ack, None);
+        assert_eq!(s.local_rx_dup_acks, 0);
+        assert!(!s.pending_fast_retransmit);
+        #[cfg(feature = "tcp-timestamps")]
+        {
+            assert_eq!(s.last_remote_tsval, 0);
+        }
     }
 
     #[cfg(feature = "tcp-reno")]
@@ -8602,6 +8816,7 @@ mod test {
             ack_number: None,
             max_seg_size: Some(BASE_MSS),
             window_scale: Some(0),
+            #[cfg(feature = "tcp-sack")]
             sack_permitted: true,
             #[cfg(feature = "tcp-timestamps")]
             timestamp: Some(TcpTimestampRepr::new(150, 0)),
@@ -9741,6 +9956,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
@@ -9788,6 +10004,7 @@ mod test {
                 ack_number: None,
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(0),
+                #[cfg(feature = "tcp-sack")]
                 sack_permitted: true,
                 timestamp: Some(TcpTimestampRepr::new(0, 0)),
                 ..RECV_TEMPL
@@ -9814,6 +10031,1095 @@ mod test {
                 ack_number: Some(REMOTE_SEQ + 1),
                 payload: &b"abcdef"[..],
                 timestamp: None,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    // =========================================================================================//
+    // Tests for Selective Acknowledgements
+    // =========================================================================================//
+
+    /// Creates a SACK range from segment's left and right edges.
+    #[cfg(feature = "tcp-sack")]
+    fn block(left: usize, right: usize) -> Option<(u32, u32)> {
+        Some(((REMOTE_SEQ + 1 + left).0 as u32, (REMOTE_SEQ + 1 + right).0 as u32))
+    }
+
+    /// Sets up a socket to the initial conditions used in the RFC 2018 test cases.
+    ///
+    /// RFC 2018: Assume the left window edge is 5000 and that the data transmitter sends [...]
+    /// segments, each containing 500 data bytes.
+    #[cfg(feature = "tcp-sack")]
+    fn setup_rfc2018_cases() -> (TestSocket, Vec<u8>) {
+        setup_rfc2018_cases_with_rx_buffer(4000)
+    }
+
+    /// As `setup_rfc2018_cases()`, with the receive buffer size chosen by the caller.
+    #[cfg(feature = "tcp-sack")]
+    fn setup_rfc2018_cases_with_rx_buffer(rx_len: usize) -> (TestSocket, Vec<u8>) {
+        let mut s = socket_established_with_buffer_sizes(4000, rx_len);
+        s.remote_has_sack = true;
+
+        // The window advertised while one 500 byte segment sits undrained.
+        let win = (rx_len - 500) as u16;
+
+        // create a segment that is 500 bytes long
+        let mut segment: Vec<u8> = Vec::with_capacity(500);
+
+        // move the last ack to 5000 by sending ten of them
+        for _ in 0..50 {
+            segment.extend_from_slice(b"abcdefghij")
+        }
+        for offset in (0..5000).step_by(500) {
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &segment,
+                    ..SEND_TEMPL
+                }
+            );
+            recv!(
+                s,
+                [TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + offset + 500),
+                    window_len: win,
+                    ..RECV_TEMPL
+                }]
+            );
+            s.view()
+                .recv(|data| {
+                    assert_eq!(data.len(), 500);
+                    assert_eq!(data, segment.as_slice());
+                    (500, ())
+                })
+                .unwrap();
+        }
+        assert_eq!(s.remote_last_win, win);
+        (s, segment)
+    }
+
+    /// Case:
+    /// Following RFC 2018 setup, the first segment is dropped but the
+    /// remaining 7 are received.
+    ///
+    /// Outcome:
+    /// Upon receiving each of the last seven packets, the data receiver will
+    /// return a TCP ACK segment that acknowledges sequence number 5000 and
+    /// contains a SACK option specifying one block of queued data.
+    ///
+    ///                             +---------------+----------------+
+    ///                             |          First Block           |
+    /// +-------------+-------------+---------------+----------------+
+    /// |    Segment  |     ACK     |   Left Edge   |   Right Edge   |
+    /// +-------------+-------------+---------------+----------------|
+    /// |    5000     |    (lost)   |               |                |
+    /// |    5500     |    5000     |     5500      |      6000      |
+    /// |    6000     |    5000     |     5500      |      6500      |
+    /// |    6500     |    5000     |     5500      |      7000      |
+    /// |    7000     |    5000     |     5500      |      7500      |
+    /// |    7500     |    5000     |     5500      |      8000      |
+    /// |    8000     |    5000     |     5500      |      8500      |
+    /// |    8500     |    5000     |     5500      |      9000      |
+    /// +-------------+-------------+---------------+----------------+
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_sack_rfc2018_case_2() {
+        let (mut s, segment) = setup_rfc2018_cases();
+
+        for offset in (500..3500).step_by(500) {
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset + 5000,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &segment,
+                    ..SEND_TEMPL
+                },
+                Some(TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 5000),
+                    window_len: 4000,
+                    sack_ranges: [block(5500, 5500 + offset), None, None],
+                    ..RECV_TEMPL
+                })
+            );
+        }
+    }
+
+    /// Case:
+    /// Following RFC 2018 setup, the 2nd, 4th, 6th, and 8th (last) segments
+    /// are dropped.
+    ///
+    /// Outcome:
+    /// The data receiver ACKs the first packet normally.  The third, fifth, and
+    /// seventh packets trigger SACK options.
+    ///
+    ///                          +-----------------+-----------------+-----------------+
+    ///                          |   First Block   |  Second Block   |   Third Block   |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |   Segment  |    ACK   |  Left  |  Right |  Left  |  Right |  Left  |  Right |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |    5000    |   5500   |        |        |        |        |        |        |
+    /// |    5500    |   (lost) |        |        |        |        |        |        |
+    /// |    6000    |   5500   |  6000  |  6500  |        |        |        |        |
+    /// |    6500    |   (lost) |        |        |        |        |        |        |
+    /// |    7000    |   5500   |  7000  |  7500  |  6000  |  6500  |        |        |
+    /// |    7500    |   (lost) |        |        |        |        |        |        |
+    /// |    8000    |   5500   |  8000  |  8500  |  7000  |  7500  |  6000  |  6500  |
+    /// |    8500    |   (lost) |        |        |        |        |        |        |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    ///
+    /// Now, the 4th, 2nd and 6th (not specified in RFC test case) segments are
+    /// received:
+    ///
+    ///                          +-----------------+-----------------+-----------------+
+    ///                          |   First Block   |  Second Block   |   Third Block   |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |   Segment  |    ACK   |  Left  |  Right |  Left  |  Right |  Left  |  Right |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |    6500    |   5500   |  6000  |  7500  |  8000  |  8500  |        |        |
+    /// |    5500    |   7500   |  8000  |  8500  |        |        |        |        |
+    /// |    7500    |   8500   |        |        |        |        |        |        |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_sack_rfc2018_case_3() {
+        let (mut s, segment) = setup_rfc2018_cases();
+
+        // Segment 5000 advances the left edge.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 5000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 3500,
+                sack_ranges: [None, None, None],
+                ..RECV_TEMPL
+            }]
+        );
+
+        // 5500 is lost. Segment 6000 opens an island. One SACK block should be reported.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 3500,
+                sack_ranges: [block(6000, 6500), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // 6500 is lost. Segment 7000 opens a second island. Two SACK blocks should be reported.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 7000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 3500,
+                sack_ranges: [block(7000, 7500), block(6000, 6500), None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // 7500 is lost. Segment 8000 opens a third island. Three SACK blocks should be reported.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 3500,
+                sack_ranges: [block(8000, 8500), block(7000, 7500), block(6000, 6500)],
+                ..RECV_TEMPL
+            })
+        );
+
+        // 6500 is received out of order. SACK ranges merge. Two SACK blocks should be reported.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6500,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 3500,
+                sack_ranges: [block(6000, 7500), block(8000, 8500), None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // 5500 is received out of order. Window advances. One SACK block should be reported.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 5500,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 7500),
+                window_len: 1500,
+                sack_ranges: [block(8000, 8500), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // 7500 is received. Window advances. No SACK blocks should be reported.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 7500,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 8500),
+                window_len: 500,
+                sack_ranges: [None, None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        assert_eq!(s.local_sack_history, [None, None, None]);
+    }
+
+    /// Case:
+    /// Following RFC 2018 setup, the 2nd, 4th and 6th segments are dropped. The
+    ///  network reorders the survivors and then the remote transmits a pure ACK.
+    ///
+    /// Outcome:
+    /// The data receiver ACKs the first segment normally. Each later segment
+    /// triggers a SACK option and leads with its own block.
+    ///
+    ///                          +-----------------+-----------------+-----------------+
+    ///                          |   First Block   |  Second Block   |   Third Block   |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |   Segment  |    ACK   |  Left  |  Right |  Left  |  Right |  Left  |  Right |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |    5000    |   5500   |        |        |        |        |        |        |
+    /// |    5500    |   (lost) |        |        |        |        |        |        |
+    /// |    8000    |   5500   |  8000  |  8500  |        |        |        |        |
+    /// |    8500    |   5500   |  8000  |  9000  |        |        |        |        |
+    /// |    7000    |   5500   |  7000  |  7500  |  8000  |  9000  |        |        |
+    /// |    6000    |   5500   |  6000  |  6500  |  7000  |  7500  |  8000  |  9000  |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    ///
+    /// A pure ACK from the transmitter now arrives. It carries no data and has a
+    /// sequence number of 9000, right on the edge of the data held by the assembler.
+    ///
+    ///                          +-----------------+-----------------+-----------------+
+    ///                          |   First Block   |  Second Block   |   Third Block   |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |   Segment  |    ACK   |  Left  |  Right |  Left  |  Right |  Left  |  Right |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// | (pure ACK) |   5500   |  6000  |  6500  |  7000  |  7500  |  8000  |  9000  |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_sack_not_affected_by_pure_ack() {
+        let (mut s, segment) = setup_rfc2018_cases_with_rx_buffer(5000);
+
+        // Segment 5000 advances the left edge.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 5000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                sack_ranges: [None, None, None],
+                ..RECV_TEMPL
+            }]
+        );
+
+        // Segment 8000 arrives early and opens an island.
+        // One SACK block should be reported.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                sack_ranges: [block(8000, 8500), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Segment 8500 arrives early and increases the island width.
+        // One SACK block should be reported.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8500,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                sack_ranges: [block(8000, 9000), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Segment 7000 opens a second island.
+        // Two SACK blocks should be reported.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 7000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                sack_ranges: [block(7000, 7500), block(8000, 9000), None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Segment 6000 arrives and opens an island.
+        // Three SACK blocks should be reported, with [6000, 6500) being first.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                sack_ranges: [block(6000, 6500), block(7000, 7500), block(8000, 9000)],
+                ..RECV_TEMPL
+            })
+        );
+
+        // A pure ACK carrying the transmitter's snd_nxt of 9000. No payload.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 9000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[],
+                ..SEND_TEMPL
+            }
+        );
+
+        // Transmitted data will contain the SACK ranges.
+        // SACK ordering should remain the same as before, unaffected by the pure ACK.
+        s.view().send_slice(b"x").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                payload: b"x",
+                sack_ranges: [block(6000, 6500), block(7000, 7500), block(8000, 9000)],
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    /// Case:
+    /// Following RFC 2018 setup, the 2nd, 4th and 6th segments are dropped. The
+    /// network reorders the survivors and then a reordered pure ACK (SEQ < 9000) is
+    /// delivered.
+    ///
+    ///
+    /// Outcome:
+    /// The data receiver ACKs the first segment normally. Each later segment
+    /// triggers a SACK option and leads with its own block.
+    ///
+    ///                          +-----------------+-----------------+-----------------+
+    ///                          |   First Block   |  Second Block   |   Third Block   |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |   Segment  |    ACK   |  Left  |  Right |  Left  |  Right |  Left  |  Right |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |    5000    |   5500   |        |        |        |        |        |        |
+    /// |    5500    |   (lost) |        |        |        |        |        |        |
+    /// |    8000    |   5500   |  8000  |  8500  |        |        |        |        |
+    /// |    8500    |   5500   |  8000  |  9000  |        |        |        |        |
+    /// |    7000    |   5500   |  7000  |  7500  |  8000  |  9000  |        |        |
+    /// |    6000    |   5500   |  6000  |  6500  |  7000  |  7500  |  8000  |  9000  |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    ///
+    /// A reordered pure ACK arrives, with a sequence number inside one of the ranges
+    /// held by the assembler.
+    ///
+    ///                          +-----------------+-----------------+-----------------+
+    ///                          |   First Block   |  Second Block   |   Third Block   |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |   Segment  |    ACK   |  Left  |  Right |  Left  |  Right |  Left  |  Right |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// | (pure ACK) |   5500   |  6000  |  6500  |  7000  |  7500  |  8000  |  9000  |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_sack_not_affected_by_reordered_pure_ack() {
+        let (mut s, segment) = setup_rfc2018_cases_with_rx_buffer(5000);
+
+        // Segment 5000 advances the left edge.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 5000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                sack_ranges: [None, None, None],
+                ..RECV_TEMPL
+            }]
+        );
+
+        // Segment 8000 arrives early and opens an island.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                sack_ranges: [block(8000, 8500), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Segment 8500 arrives early and increases the island width.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8500,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                sack_ranges: [block(8000, 9000), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Segment 7000 opens a second island.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 7000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                sack_ranges: [block(7000, 7500), block(8000, 9000), None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Segment 6000 opens a third island and becomes the last data segment.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                sack_ranges: [block(6000, 6500), block(7000, 7500), block(8000, 9000)],
+                ..RECV_TEMPL
+            })
+        );
+
+        // The reordered pure ACK, carrying the snd_nxt of 8500 it was sent with.
+        // No payload.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 8500,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[],
+                ..SEND_TEMPL
+            }
+        );
+
+        // Transmitted data will contain the SACK ranges.
+        // SACK ordering should remain the same as before, unaffected by the pure ACK.
+        s.view().send_slice(b"x").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 4500,
+                payload: b"x",
+                sack_ranges: [block(6000, 6500), block(7000, 7500), block(8000, 9000)],
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    /// Case:
+    /// One island is held, so every outgoing ACK carries one SACK block. The socket
+    /// then gets one MSS of data to send.
+    ///
+    /// Outcome:
+    /// The data should be split into two segments, due to the length of the options.
+    /// One full segment should be sent, and another carrying the remainder. One SACK
+    /// block is 10 option bytes, padded to 12 on the wire. This test does not
+    /// negotiate timestamps, so the option length is 12 and the remainder is also 12.
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_sack_emitted_on_data_segments() {
+        const REMOTE_MSS: usize = 128;
+        const ONE_BLOCK_OPTS: usize = 12;
+        const SEG: usize = REMOTE_MSS - ONE_BLOCK_OPTS;
+
+        let mut s = socket_established_with_buffer_sizes(SEG * 2, 1024);
+        s.remote_has_sack = true;
+        s.remote_mss = REMOTE_MSS;
+        s.remote_win_len = 9999;
+        s.view().set_nagle_enabled(false);
+
+        //  Open an island 100 bytes past the left edge
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 100,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[b'a'; 100],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 1024,
+                sack_ranges: [block(100, 200), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // One MSS of data should take two segments, due to effective MSS shrinkage from option length.
+        s.view().send_slice(&[b'z'; REMOTE_MSS]).unwrap();
+        recv!(
+            s,
+            [
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    window_len: 1024,
+                    payload: &[b'z'; REMOTE_MSS - ONE_BLOCK_OPTS],
+                    sack_ranges: [block(100, 200), None, None],
+                    ..RECV_TEMPL
+                },
+                TcpRepr {
+                    seq_number: LOCAL_SEQ + 1 + (REMOTE_MSS - ONE_BLOCK_OPTS),
+                    ack_number: Some(REMOTE_SEQ + 1),
+                    window_len: 1024,
+                    payload: &[b'z'; ONE_BLOCK_OPTS],
+                    sack_ranges: [block(100, 200), None, None],
+                    ..RECV_TEMPL
+                }
+            ]
+        );
+    }
+
+    /// Case:
+    /// One island is held when the remote then closes its window. Data queues at the
+    /// socket and a zero window probe is sent.
+    ///
+    /// Outcome:
+    /// The zero window probe carries the previously announced SACK range.
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_sack_emitted_on_zero_window_probe() {
+        let mut s = socket_established_with_buffer_sizes(64, 128);
+        s.remote_has_sack = true;
+
+        // A segment 20 bytes past the left edge opens one island
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 20,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[b'a'; 10],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 128,
+                sack_ranges: [block(20, 30), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Queued data plus a closed remote window arms the probe timer
+        s.view().send_slice(b"abcdef").unwrap();
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_len: 0,
+                ..SEND_TEMPL
+            }
+        );
+        assert!(s.timer.is_zero_window_probe());
+
+        // Timer triggers and ZWP triggers containing the SACK ranges
+        recv_nothing!(s, time 999);
+        recv!(
+            s,
+            time 1000,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 128,
+                payload: &b"a"[..],
+                sack_ranges: [block(20, 30), None, None],
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    /// Case:
+    /// Fill a 128 byte window with 96 contiguous bytes and a 10 byte out-of-order
+    /// segment. Then, the application drains the buffer.
+    ///
+    /// Outcome:
+    /// The buffer drain should cause a window update to be sent. This update should
+    /// contain a SACK block and the window advertised should not include the bytes
+    /// from the out-of-order segment.
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_sack_emitted_on_window_update() {
+        let mut s = socket_established_with_buffer_sizes(64, 128);
+        s.remote_has_sack = true;
+
+        // Contiguous data to advance left edge and fill the buffer
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[b'a'; 96],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 96),
+                window_len: 32,
+                sack_ranges: [None, None, None],
+                ..RECV_TEMPL
+            }]
+        );
+
+        // 10 bytes, out-of-order, to create an island in the assembler
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 106,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[b'b'; 10],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 96),
+                window_len: 32,
+                sack_ranges: [block(106, 116), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // Receiving the data should trigger a window update
+        s.view().recv(|data| (data.len(), ())).unwrap();
+
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 96),
+                window_len: 128,
+                sack_ranges: [block(106, 116), None, None],
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    /// Case:
+    /// Four islands arrive in reverse order: 8th, 6th, 4th then 2nd. Then, segment 1 is
+    /// received.
+    ///
+    ///                          +-----------------+-----------------+-----------------+
+    ///                          |   First Block   |  Second Block   |   Third Block   |
+    /// +--------------+--------+--------+--------+--------+--------+--------+--------+
+    /// |    Segment   |   ACK  |  Left  |  Right |  Left  |  Right |  Left  |  Right |
+    /// +--------------+--------+--------+--------+--------+--------+--------+--------+
+    /// |     8500     |  5000  |  8500  |  9000  |        |        |        |        |
+    /// |     7500     |  5000  |  7500  |  8000  |  8500  |  9000  |        |        |
+    /// |     6500     |  5000  |  6500  |  7000  |  7500  |  8000  |  8500  |  9000  |
+    /// |     5500     |  5000  |  5500  |  6000  |  6500  |  7000  |  7500  |  8000  |
+    /// |     5000     |  6000  |  6500  |  7000  |  7500  |  8000  |  8500  |  9000  |
+    /// +--------------+--------+--------+--------+--------+--------+--------+--------+
+    ///
+    /// Outcome:
+    /// Four islands should be held within the assembler, but only three blocks reported
+    /// in the order that they were received. When segment 1 is received and advances
+    /// the left edge, SACK ranges should now contain that fourth island.
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_sack_reports_three_of_four_islands() {
+        let (mut s, segment) = setup_rfc2018_cases_with_rx_buffer(5000);
+
+        // Four islands in reverse order
+        for (offset, expected) in [
+            (8500, [block(8500, 9000), None, None]),
+            (7500, [block(7500, 8000), block(8500, 9000), None]),
+            (6500, [block(6500, 7000), block(7500, 8000), block(8500, 9000)]),
+            (5500, [block(5500, 6000), block(6500, 7000), block(7500, 8000)]),
+        ] {
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &segment,
+                    ..SEND_TEMPL
+                },
+                Some(TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 5000),
+                    window_len: 5000,
+                    sack_ranges: expected,
+                    ..RECV_TEMPL
+                })
+            );
+        }
+
+        assert_eq!(s.assembler.iter_data().count(), 4);
+
+        // Advancing the left edge should remove one island and let another be reported
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 5000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6000),
+                window_len: 4000,
+                sack_ranges: [block(6500, 7000), block(7500, 8000), block(8500, 9000)],
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    /// RFC 2018 defines the block edges as a half-open range:
+    ///
+    /// - Left Edge of Block: the first sequence number of this block.
+    /// - Right Edge of Block: the sequence number immediately following the last
+    ///   sequence number of this block.
+    ///
+    /// So the right edge names the first byte the receiver does NOT hold.
+    ///
+    /// Case:
+    /// Two segments arrive with a gap of exactly one byte between them, at 6500.
+    /// The one byte then arrives and closes the gap.
+    ///
+    /// Outcome:
+    /// The first two arrivals must stay two separate blocks. A right edge of 6500
+    /// that meant "6500 is held" would leave no gap, and the two would report as
+    /// one block. The single byte at 6500 then merges them into one.
+    ///
+    ///                          +-----------------+-----------------+
+    ///                          |   First Block   |  Second Block   |
+    /// +--------------+--------+--------+--------+--------+--------+
+    /// |    Segment   |   ACK  |  Left  |  Right |  Left  |  Right |
+    /// +--------------+--------+--------+--------+--------+--------+
+    /// |  6000..6500  |  5000  |  6000  |  6500  |        |        |
+    /// |  6501..7001  |  5000  |  6501  |  7001  |  6000  |  6500  |
+    /// |  6500..6501  |  5000  |  6000  |  7001  |        |        |
+    /// +--------------+--------+--------+--------+--------+--------+
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_sack_is_an_exclusive_range() {
+        let (mut s, segment) = setup_rfc2018_cases();
+
+        // 500 bytes at 6000. The right edge is 6500, one past the last byte held.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5000),
+                window_len: 4000,
+                sack_ranges: [block(6000, 6500), None, None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // 500 bytes at 6501, leaving exactly one byte missing at 6500. Two blocks,
+        // so 6500 is confirmed absent from the first one.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6501,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5000),
+                window_len: 4000,
+                sack_ranges: [block(6501, 7001), block(6000, 6500), None],
+                ..RECV_TEMPL
+            })
+        );
+
+        // The one missing byte. Both islands become one, which is only possible if
+        // 6500 was the gap and not part of either block.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6500,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment[..1],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5000),
+                window_len: 4000,
+                sack_ranges: [block(6000, 7001), None, None],
+                ..RECV_TEMPL
+            })
+        );
+    }
+
+    /// Case:
+    /// Following from RFC 2018 setup, every second segment is dropped, so each
+    ///  arrival opens a new island. The assembler holds at most  `ASSEMBLER_MAX_SEGMENT_COUNT`
+    /// islands, which `src/lib.rs` pins to 4 for test builds.
+    ///
+    /// Outcome:
+    /// The data receiver ACKs the first segment normally. Each later arrival opens
+    /// an island and leads with its own block. Only three blocks fit, so the
+    /// island at 6000 stops being reported once a fourth one opens.
+    ///
+    ///                          +-----------------+-----------------+-----------------+
+    ///                          |   First Block   |  Second Block   |   Third Block   |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |   Segment  |    ACK   |  Left  |  Right |  Left  |  Right |  Left  |  Right |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |    5000    |   5500   |        |        |        |        |        |        |
+    /// |    5500    |   (lost) |        |        |        |        |        |        |
+    /// |    6000    |   5500   |  6000  |  6500  |        |        |        |        |
+    /// |    6500    |   (lost) |        |        |        |        |        |        |
+    /// |    7000    |   5500   |  7000  |  7500  |  6000  |  6500  |        |        |
+    /// |    7500    |   (lost) |        |        |        |        |        |        |
+    /// |    8000    |   5500   |  8000  |  8500  |  7000  |  7500  |  6000  |  6500  |
+    /// |    8500    |   (lost) |        |        |        |        |        |        |
+    /// |    9000    |   5500   |  9000  |  9500  |  8000  |  8500  |  7000  |  7500  |
+    /// |    9500    |   (lost) |        |        |        |        |        |        |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    ///
+    /// The assembler now holds 4 islands and is full. Segment 10000 would open a
+    /// fifth, so the assembler rejects it with `TooManyHolesError` and the payload
+    /// is discarded.
+    ///
+    ///                          +-----------------+-----------------+-----------------+
+    ///                          |   First Block   |  Second Block   |   Third Block   |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |   Segment  |    ACK   |  Left  |  Right |  Left  |  Right |  Left  |  Right |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    /// |   10000    | (no ACK) |        |        |        |        |        |        |
+    /// |  transmit  |   5500   |  9000  |  9500  |  8000  |  8500  |  7000  |  7500  |
+    /// +------------+----------+--------+--------+--------+--------+--------+--------+
+    #[test]
+    #[cfg(feature = "tcp-sack")]
+    fn test_sack_works_when_assembler_rejects_segment() {
+        // The window must stay wide enough that segment 10000 is still inside it,
+        // so the assembler turns it away rather than the window check.
+        let (mut s, segment) = setup_rfc2018_cases_with_rx_buffer(6000);
+
+        // Segment 5000 advances the left edge.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 5000,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 5500,
+                sack_ranges: [None, None, None],
+                ..RECV_TEMPL
+            }]
+        );
+
+        // Every second segment is lost, so each arrival opens a fresh island.
+        // The assembler is filled to capacity.
+        for i in 0..4 {
+            let offset = 6000 + i * 1000;
+            send!(
+                s,
+                TcpRepr {
+                    seq_number: REMOTE_SEQ + 1 + offset,
+                    ack_number: Some(LOCAL_SEQ + 1),
+                    payload: &segment,
+                    ..SEND_TEMPL
+                },
+                Some(TcpRepr {
+                    seq_number: LOCAL_SEQ + 1,
+                    ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                    window_len: 5500,
+                    sack_ranges: [
+                        block(offset, offset + 500),
+                        (i >= 1).then(|| block(offset - 1000, offset - 500)).flatten(),
+                        (i >= 2).then(|| block(offset - 2000, offset - 1500)).flatten(),
+                    ],
+                    ..RECV_TEMPL
+                })
+            );
+        }
+
+        let islands_before = s.assembler.iter_data().count();
+        assert_eq!(islands_before, 4);
+
+        let blocks_before = s.local_sack_history;
+
+        // The assembler should reject this segment with `TooManyHolesError`
+        let rejected = 10000;
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + rejected,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &segment,
+                ..SEND_TEMPL
+            }
+        );
+
+        // Assembler must not hold the segment
+        assert_eq!(s.assembler.iter_data().count(), islands_before);
+        assert!(!s.assembler.iter_data().any(|(l, _)| l == rejected - 5500));
+
+        // The SACK history should not have changed
+        assert_eq!(s.local_sack_history, blocks_before);
+
+        // Transmitted data will contain the SACK ranges.
+        // SACK ordering on the wire should remain as before, unaffected by the rejected segment.
+        s.view().send_slice(b"x").unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 5500,
+                payload: b"x",
+                sack_ranges: blocks_before.map(|b| b.map(|(l, r)| (l.0 as u32, r.0 as u32))),
                 ..RECV_TEMPL
             }]
         );
@@ -9924,7 +11230,9 @@ mod stack_test {
         window_len: 1024,
         window_scale: None,
         max_seg_size: None,
+        #[cfg(feature = "tcp-sack")]
         sack_permitted: false,
+        #[cfg(feature = "tcp-sack")]
         sack_ranges: [None, None, None],
         #[cfg(feature = "tcp-timestamps")]
         timestamp: None,

@@ -66,6 +66,8 @@ EXTRAS = [
     "packetmeta-timestamp,defmt",
     "tcp-timestamps",
     "tcp-timestamps,defmt",
+    "tcp-sack",
+    "tcp-sack,defmt",
     "tcp-reno",
     "tcp-cubic",
     "ipv4-fragmentation",
@@ -83,7 +85,7 @@ EXTRAS = [
     "multicast",
     "multicast,defmt",
     "multicast,icmp-errors,icmp-ping-reply",
-    "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,"
+    "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,tcp-sack,"
     "packet-log,dhcpv4,dhcpv4-options,multicast,ipv4-fragmentation,ipv4-reassembly,"
     "medium-ieee802154,sixlowpan-fragmentation,sixlowpan-reassembly,slaac",
 ]
@@ -92,7 +94,7 @@ EXTRAS = [
 FULL = (
     "medium-ethernet,medium-ip,medium-ieee802154,ipv4,ipv6,raw,udp,tcp,tcp-listener,"
     "std,log,async,icmp-errors,icmp-ping-reply,multicast,slaac,dhcpv4,dhcpv4-options,"
-    "dns,mdns,packetmeta-timestamp,tcp-timestamps,ipv4-fragmentation,ipv4-reassembly,"
+    "dns,mdns,packetmeta-timestamp,tcp-timestamps,tcp-sack,ipv4-fragmentation,ipv4-reassembly,"
     "sixlowpan-fragmentation,sixlowpan-reassembly"
 )
 
