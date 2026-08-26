@@ -7,10 +7,11 @@
 //! compressed packet is cut into pieces behind fragment headers. Fragmentation
 //! pays one extra copy, on purpose: it is a fallback path.
 
-use crate::buf::PacketBuf;
+use crate::driver::PacketBuf;
+use crate::iface::IfaceState;
 #[cfg(feature = "ipv4-fragmentation")]
 use crate::rand::Rand;
-use crate::stack::{IfaceState, StackInner};
+use crate::stack::StackInner;
 use crate::wire::*;
 
 pub(crate) struct Fragmenter {
@@ -135,7 +136,7 @@ impl StackInner {
     pub(crate) fn fragment_egress(&mut self, iface: &mut IfaceState<'_>) {
         match iface.medium() {
             #[cfg(feature = "medium-ieee802154")]
-            crate::stack::Medium::Ieee802154 => {
+            crate::iface::Medium::Ieee802154 => {
                 #[cfg(feature = "sixlowpan-fragmentation")]
                 self.sixlowpan_egress(iface);
             }

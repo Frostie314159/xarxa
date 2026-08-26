@@ -7,7 +7,7 @@
 //! With the `packet-log` feature, the stack calls it on every packet it receives
 //! and sends.
 
-use crate::PacketBuf;
+use crate::driver::PacketBuf;
 #[cfg(all(feature = "ipv4", feature = "multicast"))]
 use crate::wire::IgmpPacket;
 #[cfg(feature = "udp")]

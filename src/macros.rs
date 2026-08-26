@@ -153,7 +153,7 @@ mod tests {
 
     #[test]
     fn handle_sizes() {
-        check_handle!(crate::stack::IfaceHandle, crate::config::IFACE_COUNT);
+        check_handle!(crate::iface::IfaceHandle, crate::config::IFACE_COUNT);
         #[cfg(feature = "udp")]
         check_handle!(crate::udp::UdpHandle, crate::config::UDP_SOCKET_COUNT);
         #[cfg(feature = "raw")]

@@ -10,8 +10,8 @@
 use core::fmt;
 use core::result::Result;
 
-use crate::buf::{PACKET_BUF_SIZE, PacketBuf};
 use crate::config::REASSEMBLY_BUFFER_COUNT;
+use crate::driver::{PACKET_BUF_SIZE, PacketBuf};
 use crate::stack::Stack;
 use crate::storage::Assembler;
 use crate::time::{Duration, Instant};

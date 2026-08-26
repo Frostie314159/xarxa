@@ -16,7 +16,7 @@ use crate::wire::{IpAddress, IpProtocol, IpVersion};
 /// ICMP error reported against a socket.
 ///
 /// Returned by `take_icmp_error` on UDP and TCP sockets (and by
-/// [`UdpSocket::recv`](crate::UdpSocket::recv)) when an ICMP error message quoting
+/// [`UdpSocket::recv`](crate::udp::UdpSocket::recv)) when an ICMP error message quoting
 /// one of the socket's packets arrives. Requires the `icmp-errors` cargo
 /// feature.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

@@ -18,8 +18,8 @@
 
 use std::os::unix::io::AsRawFd;
 
+use xarxa::Stack;
 use xarxa::driver_impls::{TunTapDriver, wait};
-use xarxa::stack::Stack;
 use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address, Ipv6Address};
 

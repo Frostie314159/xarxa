@@ -7,15 +7,15 @@
 use core::fmt::Display;
 use core::{fmt, mem};
 
-use crate::buf::PacketBuf;
 #[cfg(all(test, feature = "tcp-listener"))]
 use crate::config::TCP_LISTENER_BACKLOG;
 use crate::config::TCP_SOCKET_COUNT;
 use crate::driver::ChecksumCapabilities;
+use crate::driver::PacketBuf;
 #[cfg(feature = "icmp-errors")]
 use crate::icmp_error::IcmpError;
 use crate::rand::Rand;
-use crate::stack::{EgressRoute, TxContext, alloc_ephemeral_port};
+use crate::stack::{EgressRoute, Stack, TxContext, alloc_ephemeral_port};
 use crate::storage::Slab;
 use crate::time::{Duration, Instant};
 #[cfg(feature = "async")]
@@ -37,7 +37,7 @@ mod ring_buffer;
 
 use self::congestion::Controller as _;
 #[cfg(feature = "tcp-listener")]
-pub use self::listener::{TcpListener, TcpListenerHandle};
+pub use self::listener::{TcpListener, TcpListenerHandle, TcpListenerIter};
 #[cfg(feature = "tcp-listener")]
 pub(crate) use self::listener::{TcpListenerState, process_listeners};
 pub(crate) use self::repr::TcpRepr;
@@ -3006,11 +3006,42 @@ impl fmt::Write for TcpSocket<'_, '_> {
         }
     }
 }
+/// Iterator over the TCP sockets of a [`Stack`], returned by [`Stack::tcp_sockets`].
+///
+/// Each item borrows the stack, so only one can exist at a time. That is why this is
+/// not an [`Iterator`] and cannot be used in a `for` loop. Use `while let`:
+///
+/// ```no_run
+/// # use xarxa::Stack;
+/// # fn f(stack: &mut Stack) {
+/// let mut iter = stack.tcp_sockets();
+/// while let Some((handle, item)) = iter.next() {
+///     let _ = (handle, item.state());
+/// }
+/// # }
+/// ```
+pub struct TcpSocketIter<'a, 'd> {
+    pub(crate) stack: &'a mut Stack<'d>,
+    pub(crate) next: usize,
+}
+
+impl<'d> TcpSocketIter<'_, 'd> {
+    /// Get the next TCP socket, with its handle.
+    ///
+    /// Returns `None` when there are no more.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<(TcpHandle, TcpSocket<'_, 'd>)> {
+        let index = self.stack.sockets.tcp.next_occupied(self.next)?;
+        self.next = index + 1;
+        let handle = TcpHandle::new(index);
+        Some((handle, self.stack.tcp_socket(handle)))
+    }
+}
 
 #[cfg(all(test, feature = "medium-ip", feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
-    use crate::stack::Medium;
+    use crate::iface::Medium;
     use crate::stack::Stack;
     use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
@@ -11187,7 +11218,7 @@ mod test {
             .ifaces
             .get_mut(0)
             .ip_addrs
-            .push(crate::IfaceAddr::manual(IpCidr::new(OTHER_ADDR.into(), 24)))
+            .push(crate::iface::IfaceAddr::manual(IpCidr::new(OTHER_ADDR.into(), 24)))
             .unwrap();
 
         // The socket's source IP is no longer ours: dispatch treats it like a
@@ -11214,7 +11245,7 @@ mod test {
             .ifaces
             .get_mut(0)
             .ip_addrs
-            .push(crate::IfaceAddr::manual(IpCidr::new(LOCAL_ADDR.into(), 24)))
+            .push(crate::iface::IfaceAddr::manual(IpCidr::new(LOCAL_ADDR.into(), 24)))
             .unwrap();
         recv!(s, time 2000, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1 + 3,
@@ -11232,7 +11263,7 @@ mod stack_test {
     //! included.
 
     use super::*;
-    use crate::stack::Medium;
+    use crate::iface::Medium;
     use crate::stack::Stack;
     use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv4Packet};

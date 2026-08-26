@@ -3,8 +3,8 @@
 
 use crate::storage::{BoundedVec, Full};
 
-use crate::buf::PacketBuf;
-use crate::stack::IfaceHandle;
+use crate::driver::PacketBuf;
+use crate::iface::IfaceHandle;
 use crate::time::{Duration, Instant};
 use crate::wire::{HardwareAddress, IpAddress};
 
@@ -373,7 +373,7 @@ impl PendingQueue {
 #[cfg(all(test, feature = "ipv6"))]
 mod test {
     use super::*;
-    use crate::stack::IfaceHandle;
+    use crate::iface::IfaceHandle;
     use crate::wire::Ipv6Address;
     use crate::wire::ipv6::test::{MOCK_IP_ADDR_1, MOCK_IP_ADDR_2, MOCK_IP_ADDR_3, MOCK_IP_ADDR_4};
     #[allow(unused_imports)]

@@ -48,8 +48,8 @@
 
 use std::os::unix::io::AsRawFd;
 
+use xarxa::Stack;
 use xarxa::driver_impls::{RawSocketDriver, wait};
-use xarxa::stack::Stack;
 use xarxa::time::Instant;
 use xarxa::wire::{HardwareAddress, Ieee802154Address, Ieee802154Pan, IpListenEndpoint};
 

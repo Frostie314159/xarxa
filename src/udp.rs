@@ -24,11 +24,12 @@ use crate::storage::BoundedDeque;
 use core::fmt;
 use core::ops::{Deref, Range};
 
-use crate::buf::PacketBuf;
+use crate::driver::PacketBuf;
+use crate::driver::PacketMeta;
 #[cfg(feature = "icmp-errors")]
 use crate::icmp_error::IcmpError;
-use crate::meta::PacketMeta;
-use crate::stack::{IfaceHandle, Stack, TxContext, addr_score, alloc_ephemeral_port};
+use crate::iface::IfaceHandle;
+use crate::stack::{Stack, TxContext, addr_score, alloc_ephemeral_port};
 use crate::storage::Slab;
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -714,7 +715,7 @@ impl UdpSocket<'_, '_> {
     ///
     /// `meta.meta` is attached to the packet and handed to the driver with it: an id
     /// to tag the packet with, or a request to timestamp its transmission (see
-    /// [`Iface::poll_tx_timestamp`](crate::Iface::poll_tx_timestamp)).
+    /// [`Iface::poll_tx_timestamp`](crate::iface::Iface::poll_tx_timestamp)).
     ///
     /// Returns `Err(SendError::InvalidState)` if the socket is not bound.
     /// Returns `Err(SendError::Unaddressable)` if the destination address or port
@@ -966,10 +967,42 @@ pub(crate) fn process_icmp_error(
     }
 }
 
+/// Iterator over the UDP sockets of a [`Stack`], returned by [`Stack::udp_sockets`].
+///
+/// Each item borrows the stack, so only one can exist at a time. That is why this is
+/// not an [`Iterator`] and cannot be used in a `for` loop. Use `while let`:
+///
+/// ```no_run
+/// # use xarxa::Stack;
+/// # fn f(stack: &mut Stack) {
+/// let mut iter = stack.udp_sockets();
+/// while let Some((handle, item)) = iter.next() {
+///     let _ = (handle, item.can_recv());
+/// }
+/// # }
+/// ```
+pub struct UdpSocketIter<'a, 'd> {
+    pub(crate) stack: &'a mut Stack<'d>,
+    pub(crate) next: usize,
+}
+
+impl<'d> UdpSocketIter<'_, 'd> {
+    /// Get the next UDP socket, with its handle.
+    ///
+    /// Returns `None` when there are no more.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<(UdpHandle, UdpSocket<'_, 'd>)> {
+        let index = self.stack.sockets.udp.next_occupied(self.next)?;
+        self.next = index + 1;
+        let handle = UdpHandle::new(index);
+        Some((handle, self.stack.udp_socket(handle)))
+    }
+}
+
 #[cfg(all(test, feature = "medium-ip", feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
-    use crate::stack::Medium;
+    use crate::iface::Medium;
     use crate::stack::Stack;
     use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
@@ -1465,7 +1498,7 @@ mod test {
             .ifaces
             .get_mut(0)
             .ip_addrs
-            .push(crate::IfaceAddr::manual(IpCidr::new(OTHER_ADDR.into(), 24)))
+            .push(crate::iface::IfaceAddr::manual(IpCidr::new(OTHER_ADDR.into(), 24)))
             .unwrap();
         let mut socket = stack.udp_socket(handle);
         assert_eq!(socket.send_slice(b"hi", dst), Err(SendError::Unaddressable));

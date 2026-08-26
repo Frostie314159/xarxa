@@ -17,7 +17,7 @@
 use crate::config::ROUTE_COUNT;
 use crate::storage::{Full, Vec};
 
-use crate::stack::IfaceHandle;
+use crate::iface::IfaceHandle;
 use crate::time::Instant;
 use crate::wire::{IpAddress, IpCidr};
 #[cfg(feature = "ipv4")]

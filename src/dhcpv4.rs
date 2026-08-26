@@ -8,18 +8,19 @@
 //!
 //! Only Ethernet interfaces are supported.
 //!
-//! [`Iface::set_dhcpv4`]: crate::Iface::set_dhcpv4
-//! [`Iface::dhcpv4_lease`]: crate::Iface::dhcpv4_lease
-//! [`Iface::config_generation`]: crate::Iface::config_generation
+//! [`Iface::set_dhcpv4`]: crate::iface::Iface::set_dhcpv4
+//! [`Iface::dhcpv4_lease`]: crate::iface::Iface::dhcpv4_lease
+//! [`Iface::config_generation`]: crate::iface::Iface::config_generation
 //! [`Stack::poll`]: crate::Stack::poll
 
 use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
 
-use crate::buf::PacketBuf;
 use crate::driver::ChecksumCapabilities;
+use crate::driver::PacketBuf;
+use crate::iface::{AddrOrigin, IfaceAddr, IfaceState};
 use crate::route::{Route, RouteOrigin};
-use crate::stack::{AddrOrigin, IfaceAddr, IfaceState, StackInner};
+use crate::stack::StackInner;
 use crate::time::{Duration, Instant};
 use crate::wire::{
     DHCP_CLIENT_PORT, DHCP_HEADER_LEN, DHCP_MAGIC_NUMBER, DHCP_SERVER_PORT, DhcpFlags, DhcpMessageType, DhcpOption,
@@ -230,7 +231,7 @@ enum ClientState {
 ///
 /// Start from [`DhcpConfig::default`] and change the fields you need.
 ///
-/// [`Iface::set_dhcpv4`]: crate::Iface::set_dhcpv4
+/// [`Iface::set_dhcpv4`]: crate::iface::Iface::set_dhcpv4
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
@@ -853,8 +854,9 @@ mod test {
 
     use super::*;
     use crate::driver::Checksum;
-    use crate::stack::Medium;
-    use crate::stack::{IfaceHandle, Stack};
+    use crate::iface::IfaceHandle;
+    use crate::iface::Medium;
+    use crate::stack::Stack;
     use crate::test_device::{Queue, Sent, TestDevice};
     use crate::wire::{
         ArpPacket, DhcpOpCode, ETHERNET_HEADER_LEN, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress,

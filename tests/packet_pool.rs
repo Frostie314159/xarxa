@@ -1,10 +1,11 @@
 //! This is an integration test rather than a unit test because it has to own the
 //! whole pool, and unit tests run in parallel threads of one process
 
-use xarxa::Medium;
+use xarxa::Stack;
+use xarxa::driver::PacketBuf;
+use xarxa::iface::Medium;
 use xarxa::udp::SendError;
 use xarxa::wire::{HardwareAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address};
-use xarxa::{PacketBuf, Stack};
 
 use test_device::TestDevice;
 

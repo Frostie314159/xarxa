@@ -23,9 +23,9 @@ pub struct AddressContext(pub [u8; ADDRESS_CONTEXT_LENGTH]);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum SixlowpanPacket {
-    /// A fragment header, see [`frag`].
+    /// A fragment header, see [`SixlowpanFragRepr`](crate::wire::SixlowpanFragRepr).
     FragmentHeader,
-    /// A compressed IPv6 header, see [`iphc`].
+    /// A compressed IPv6 header, see [`SixlowpanIphcRepr`](crate::wire::SixlowpanIphcRepr).
     IphcHeader,
 }
 
@@ -61,7 +61,7 @@ impl SixlowpanPacket {
 /// The next header field of a compressed header.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum NextHeader {
-    /// The next header is compressed too, with [`nhc`].
+    /// The next header is compressed too, with NHC.
     Compressed,
     /// The next header is carried inline.
     Uncompressed(IpProtocol),

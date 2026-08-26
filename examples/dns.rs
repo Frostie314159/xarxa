@@ -22,11 +22,11 @@
 
 use std::os::unix::io::AsRawFd;
 
+use xarxa::Stack;
 use xarxa::dns::{DnsClient, GetQueryResultError};
 use xarxa::driver_impls::{TunTapDriver, wait};
-use xarxa::stack::Stack;
 use xarxa::time::Instant;
-use xarxa::wire::dns::Type;
+use xarxa::wire::DnsType as Type;
 use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
 fn main() {

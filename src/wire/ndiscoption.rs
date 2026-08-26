@@ -369,7 +369,7 @@ mod test {
     #[test]
     #[cfg(feature = "medium-ieee802154")]
     fn test_link_layer_addr_ieee802154() {
-        use crate::stack::Medium;
+        use crate::iface::Medium;
         use crate::wire::{HardwareAddress, Ieee802154Address};
         let mut bytes = [
             0x01, 0x02, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,

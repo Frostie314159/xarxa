@@ -4,9 +4,9 @@ use std::io;
 use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use crate::buf::PacketBuf;
+use crate::driver::PacketBuf;
 use crate::driver::{Capabilities, Driver};
-use crate::stack::Medium;
+use crate::iface::Medium;
 use crate::wire::HardwareAddress;
 
 const SIOCGIFMTU: libc::c_ulong = 0x8921;

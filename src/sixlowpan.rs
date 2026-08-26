@@ -7,10 +7,11 @@
 //! written into the space the uncompressed one occupied, and the other way
 //! around, with the headroom taking up the difference.
 
-use crate::buf::PacketBuf;
 use crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
+use crate::driver::PacketBuf;
+use crate::iface::{Iface, IfaceHandle, IfaceState};
 use crate::rand::Rand;
-use crate::stack::{Iface, IfaceHandle, IfaceState, Stack, StackInner};
+use crate::stack::{Stack, StackInner};
 use crate::storage::{Full, Vec};
 use crate::wire::ip::checksum;
 use crate::wire::*;
@@ -913,9 +914,9 @@ impl StackInner {
 )]
 mod test {
     use super::*;
-    use crate::stack::Medium;
+    use crate::iface::Medium;
+    use crate::iface::{AddrOrigin, IfaceHandle};
     use crate::stack::test::{icmpv6_echo, inject, ipv6_packet, udp_datagram};
-    use crate::stack::{AddrOrigin, IfaceHandle};
     use crate::test_device::{Queue, Room, Sent, TestDevice};
     use crate::time::{Duration, Instant};
     use crate::udp::{RecvError, SendError};

@@ -1,6 +1,6 @@
 //! IPv6 stateless address autoconfiguration (SLAAC), built into the interface.
 //!
-//! Turn it on per interface with [`Iface::set_slaac`](crate::Iface::set_slaac).
+//! Turn it on per interface with [`Iface::set_slaac`](crate::iface::Iface::set_slaac).
 //! The stack then sends router solicitations, and from the router advertisements
 //! it receives it forms addresses (EUI-64 from the hardware address) and installs
 //! default routes on the interface. Both expire with the lifetimes the router
@@ -11,9 +11,10 @@
 use crate::config::{SLAAC_PREFIX_COUNT, SLAAC_ROUTER_COUNT};
 use crate::storage::Vec;
 
-use crate::buf::PacketBuf;
+use crate::driver::PacketBuf;
+use crate::iface::{AddrOrigin, IfaceAddr, IfaceState};
 use crate::route::{Route as IfaceRoute, RouteOrigin};
-use crate::stack::{AddrOrigin, IfaceAddr, IfaceState, StackInner};
+use crate::stack::StackInner;
 use crate::time::{Duration, Instant};
 use crate::wire::{
     HardwareAddress, IPV6_HEADER_LEN, IPV6_LINK_LOCAL_ALL_ROUTERS, Icmpv6Message, Icmpv6Packet, IpCidr, Ipv6Address,
@@ -25,7 +26,7 @@ const MAX_RTR_SOLICITATIONS: u8 = 3;
 const RTR_SOLICITATION_INTERVAL: Duration = Duration::from_secs(4);
 const IPV6_DEFAULT: Ipv6Cidr = Ipv6Cidr::new(Ipv6Address::UNSPECIFIED, 0);
 
-/// SLAAC configuration, passed to [`Iface::set_slaac`](crate::Iface::set_slaac).
+/// SLAAC configuration, passed to [`Iface::set_slaac`](crate::iface::Iface::set_slaac).
 ///
 /// There are no knobs yet. Use `SlaacConfig::default()`.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -36,7 +37,7 @@ pub struct SlaacConfig {}
 /// What SLAAC has learned from the routers on the link, for the application.
 ///
 /// The addresses and routes themselves are on the interface, see
-/// [`Iface::ip_addrs`](crate::Iface::ip_addrs) and [`Stack::routes`](crate::Stack::routes).
+/// [`Iface::ip_addrs`](crate::iface::Iface::ip_addrs) and [`Stack::routes`](crate::Stack::routes).
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]

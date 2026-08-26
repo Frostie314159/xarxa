@@ -17,15 +17,16 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::vec::Vec;
 
-use xarxa::Medium;
-use xarxa::PacketBuf;
+use xarxa::Stack;
 use xarxa::driver::Capabilities;
-use xarxa::driver::{ChecksumCapabilities, Driver, LinkState};
+use xarxa::driver::PacketBuf;
 #[cfg(feature = "packetmeta-id")]
-use xarxa::meta::PacketMeta;
+use xarxa::driver::PacketMeta;
+use xarxa::driver::{ChecksumCapabilities, Driver, LinkState};
 #[cfg(feature = "packetmeta-timestamp")]
-use xarxa::meta::{Timestamp, TxTimestamp};
-use xarxa::stack::{IfaceHandle, Stack};
+use xarxa::driver::{Timestamp, TxTimestamp};
+use xarxa::iface::IfaceHandle;
+use xarxa::iface::Medium;
 use xarxa::wire::HardwareAddress;
 
 /// Frames waiting to be received, oldest first.

@@ -44,7 +44,7 @@ mod arp;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 mod dhcpv4;
 #[cfg(feature = "dns")]
-pub mod dns;
+pub(crate) mod dns;
 mod ethernet;
 #[cfg(feature = "ipv4")]
 mod icmpv4;
@@ -68,7 +68,7 @@ mod ndisc;
 #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 mod ndiscoption;
 #[cfg(feature = "medium-ieee802154")]
-pub mod sixlowpan;
+pub(crate) mod sixlowpan;
 #[cfg(feature = "tcp")]
 mod tcp;
 #[cfg(any(feature = "udp", feature = "dhcpv4", feature = "medium-ieee802154"))]
@@ -76,7 +76,7 @@ mod udp;
 
 use core::fmt;
 
-use crate::stack::Medium;
+use crate::iface::Medium;
 
 pub use self::ethernet::{
     Address as EthernetAddress, EtherType as EthernetProtocol, Frame as EthernetFrame,

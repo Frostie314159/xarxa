@@ -3,9 +3,9 @@
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use crate::buf::PacketBuf;
+use crate::driver::PacketBuf;
 use crate::driver::{Capabilities, Driver};
-use crate::stack::Medium;
+use crate::iface::Medium;
 #[cfg(feature = "medium-ethernet")]
 use crate::wire::ETHERNET_HEADER_LEN;
 use crate::wire::HardwareAddress;

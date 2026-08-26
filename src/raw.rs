@@ -13,12 +13,12 @@ use crate::config::RAW_RX_QUEUE_COUNT;
 use crate::storage::BoundedDeque;
 use core::fmt;
 
-use crate::buf::PacketBuf;
-use crate::meta::PacketMeta;
+use crate::driver::PacketBuf;
+use crate::driver::PacketMeta;
 #[cfg(feature = "medium-ethernet")]
-use crate::stack::IfaceHandle;
+use crate::iface::IfaceHandle;
 #[cfg(feature = "medium-ethernet")]
-use crate::stack::Medium;
+use crate::iface::Medium;
 use crate::stack::{Stack, TxContext};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -449,7 +449,7 @@ impl RawSocket<'_, '_> {
     ///
     /// The metadata is handed to the driver along with the frame. This is how a
     /// packet is tagged with an id, or a transmit timestamp is requested for it (see
-    /// [`Iface::poll_tx_timestamp`](crate::Iface::poll_tx_timestamp)). Everything else
+    /// [`Iface::poll_tx_timestamp`](crate::iface::Iface::poll_tx_timestamp)). Everything else
     /// is exactly [`send_with`](Self::send_with).
     pub fn send_with_meta(
         &mut self,
@@ -621,6 +621,38 @@ impl Stack<'_> {
             }
         }
         Some((buf, false))
+    }
+}
+
+/// Iterator over the raw sockets of a [`Stack`], returned by [`Stack::raw_sockets`].
+///
+/// Each item borrows the stack, so only one can exist at a time. That is why this is
+/// not an [`Iterator`] and cannot be used in a `for` loop. Use `while let`:
+///
+/// ```no_run
+/// # use xarxa::Stack;
+/// # fn f(stack: &mut Stack) {
+/// let mut iter = stack.raw_sockets();
+/// while let Some((handle, item)) = iter.next() {
+///     let _ = (handle, item.can_recv());
+/// }
+/// # }
+/// ```
+pub struct RawSocketIter<'a, 'd> {
+    pub(crate) stack: &'a mut Stack<'d>,
+    pub(crate) next: usize,
+}
+
+impl<'d> RawSocketIter<'_, 'd> {
+    /// Get the next raw socket, with its handle.
+    ///
+    /// Returns `None` when there are no more.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<(RawHandle, RawSocket<'_, 'd>)> {
+        let index = self.stack.sockets.raw.next_occupied(self.next)?;
+        self.next = index + 1;
+        let handle = RawHandle::new(index);
+        Some((handle, self.stack.raw_socket(handle)))
     }
 }
 

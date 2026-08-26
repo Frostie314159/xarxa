@@ -41,7 +41,6 @@ mod config {
     include!(concat!(env!("OUT_DIR"), "/config.rs"));
 }
 
-pub mod buf;
 #[cfg(feature = "dhcpv4")]
 pub mod dhcpv4;
 #[cfg(feature = "dns")]
@@ -52,7 +51,7 @@ pub mod driver_impls;
 mod fragmentation;
 #[cfg(feature = "icmp-errors")]
 mod icmp_error;
-pub mod meta;
+pub mod iface;
 #[cfg(feature = "multicast")]
 pub mod multicast;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
@@ -69,7 +68,7 @@ pub mod route;
 mod sixlowpan;
 #[cfg(feature = "slaac")]
 pub mod slaac;
-pub mod stack;
+mod stack;
 mod storage;
 #[cfg(feature = "tcp")]
 pub mod tcp;
@@ -85,38 +84,7 @@ pub mod wire;
 /// The driver interface, re-exported for driver crates and code that names their types.
 pub use xarxa_driver as driver;
 
-pub use buf::{PACKET_BUF_SIZE, PacketBuf};
-#[cfg(feature = "dhcpv4-options")]
-pub use dhcpv4::DhcpLeaseOptions;
-#[cfg(feature = "dhcpv4")]
-pub use dhcpv4::{DhcpConfig, DhcpLease, DhcpServerInfo};
-#[cfg(feature = "dns")]
-pub use dns::{DnsClient, DnsQueryHandle};
 #[cfg(feature = "icmp-errors")]
 pub use icmp_error::IcmpError;
-pub use meta::PacketMeta;
-#[cfg(feature = "packetmeta-timestamp")]
-pub use meta::{Timestamp, TxTimestamp};
-#[cfg(feature = "multicast")]
-pub use multicast::MulticastError;
-#[cfg(feature = "raw")]
-pub use raw::{RawHandle, RawMode, RawSocket};
-pub use route::{Route, RouteOrigin, Routes};
-#[cfg(feature = "slaac")]
-pub use slaac::{SlaacConfig, SlaacState};
-#[cfg(feature = "raw")]
-pub use stack::RawSocketIter;
-#[cfg(feature = "tcp-listener")]
-pub use stack::TcpListenerIter;
-#[cfg(feature = "tcp")]
-pub use stack::TcpSocketIter;
-#[cfg(feature = "udp")]
-pub use stack::UdpSocketIter;
-pub use stack::{AddrOrigin, Iface, IfaceAddr, IfaceHandle, IfaceIter, Medium, Stack};
+pub use stack::Stack;
 pub use storage::Full;
-#[cfg(feature = "tcp")]
-pub use tcp::{TcpHandle, TcpSocket};
-#[cfg(feature = "tcp-listener")]
-pub use tcp::{TcpListener, TcpListenerHandle};
-#[cfg(feature = "udp")]
-pub use udp::{UdpHandle, UdpSocket};

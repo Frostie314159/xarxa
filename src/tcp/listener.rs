@@ -8,7 +8,7 @@ use super::{
 };
 use crate::config::{TCP_LISTENER_BACKLOG, TCP_LISTENER_COUNT, TCP_SOCKET_COUNT};
 use crate::rand::Rand;
-use crate::stack::addr_score;
+use crate::stack::{Stack, addr_score};
 use crate::storage::{BoundedDeque, Slab};
 use crate::tcp::TcpSeqNumber;
 use crate::tcp::congestion::Controller as _;
@@ -438,5 +438,37 @@ impl<'d> TcpListener<'_, 'd> {
             s.last_remote_tsval = syn.timestamp.map_or(0, |ts| ts.tsval);
             s.tsval_offset = TcpSocketState::random_tsval_offset(rand);
         }
+    }
+}
+
+/// Iterator over the TCP listeners of a [`Stack`], returned by [`Stack::tcp_listeners`].
+///
+/// Each item borrows the stack, so only one can exist at a time. That is why this is
+/// not an [`Iterator`] and cannot be used in a `for` loop. Use `while let`:
+///
+/// ```no_run
+/// # use xarxa::Stack;
+/// # fn f(stack: &mut Stack) {
+/// let mut iter = stack.tcp_listeners();
+/// while let Some((handle, item)) = iter.next() {
+///     let _ = (handle, item.is_open());
+/// }
+/// # }
+/// ```
+pub struct TcpListenerIter<'a, 'd> {
+    pub(crate) stack: &'a mut Stack<'d>,
+    pub(crate) next: usize,
+}
+
+impl<'d> TcpListenerIter<'_, 'd> {
+    /// Get the next TCP listener, with its handle.
+    ///
+    /// Returns `None` when there are no more.
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Option<(TcpListenerHandle, TcpListener<'_, 'd>)> {
+        let index = self.stack.sockets.tcp_listeners.next_occupied(self.next)?;
+        self.next = index + 1;
+        let handle = TcpListenerHandle::new(index);
+        Some((handle, self.stack.tcp_listener(handle)))
     }
 }
