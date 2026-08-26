@@ -11,9 +11,9 @@ use crate::buf::PacketBuf;
 #[cfg(all(test, feature = "tcp-listener"))]
 use crate::config::TCP_LISTENER_BACKLOG;
 use crate::config::TCP_SOCKET_COUNT;
+use crate::driver::ChecksumCapabilities;
 #[cfg(feature = "icmp-errors")]
 use crate::icmp_error::IcmpError;
-use crate::iface::ChecksumCapabilities;
 use crate::rand::Rand;
 use crate::stack::{EgressRoute, TxContext, alloc_ephemeral_port};
 use crate::storage::Slab;
@@ -3010,7 +3010,7 @@ impl fmt::Write for TcpSocket<'_, '_> {
 #[cfg(all(test, feature = "medium-ip", feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
-    use crate::iface::Medium;
+    use crate::stack::Medium;
     use crate::stack::Stack;
     use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
@@ -11232,7 +11232,7 @@ mod stack_test {
     //! included.
 
     use super::*;
-    use crate::iface::Medium;
+    use crate::stack::Medium;
     use crate::stack::Stack;
     use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv4Packet};

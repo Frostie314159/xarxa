@@ -135,7 +135,7 @@ impl StackInner {
     pub(crate) fn fragment_egress(&mut self, iface: &mut IfaceState<'_>) {
         match iface.medium() {
             #[cfg(feature = "medium-ieee802154")]
-            crate::iface::Medium::Ieee802154 => {
+            crate::stack::Medium::Ieee802154 => {
                 #[cfg(feature = "sixlowpan-fragmentation")]
                 self.sixlowpan_egress(iface);
             }

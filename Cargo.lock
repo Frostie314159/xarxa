@@ -471,8 +471,17 @@ dependencies = [
  "heapless",
  "libc",
  "log",
- "portable-atomic",
  "rand",
+ "xarxa-driver",
+]
+
+[[package]]
+name = "xarxa-driver"
+version = "0.1.0"
+dependencies = [
+ "defmt",
+ "document-features",
+ "portable-atomic",
 ]
 
 [[package]]

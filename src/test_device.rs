@@ -17,8 +17,10 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 use std::vec::Vec;
 
+use xarxa::Medium;
 use xarxa::PacketBuf;
-use xarxa::iface::{ChecksumCapabilities, Driver, IfaceCapabilities, LinkState, Medium};
+use xarxa::driver::Capabilities;
+use xarxa::driver::{ChecksumCapabilities, Driver, LinkState};
 #[cfg(feature = "packetmeta-id")]
 use xarxa::meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]
@@ -150,16 +152,16 @@ impl TestDevice {
 }
 
 impl Driver for TestDevice {
-    fn capabilities(&self) -> IfaceCapabilities {
-        let mut caps = IfaceCapabilities::default();
-        caps.medium = self.medium;
+    fn capabilities(&self) -> Capabilities {
+        let mut caps = Capabilities::default();
+        caps.medium = self.medium.into();
         caps.max_transmission_unit = self.mtu;
         caps.checksum = self.checksum;
         caps
     }
 
-    fn hardware_address(&self) -> HardwareAddress {
-        self.hardware_addr
+    fn hardware_address(&self) -> xarxa::driver::HardwareAddress {
+        self.hardware_addr.to_driver().unwrap()
     }
 
     fn link_state(&mut self) -> LinkState {

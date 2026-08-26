@@ -10,11 +10,11 @@ use crate::config::TCP_SOCKET_COUNT;
 #[cfg(feature = "udp")]
 use crate::config::UDP_SOCKET_COUNT;
 use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
+use crate::driver::{Capabilities, ChecksumCapabilities, Driver, LinkState};
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 use crate::fragmentation::Fragmenter;
 #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
 use crate::icmp_error::{IcmpError, parse_quoted_packet};
-use crate::iface::{ChecksumCapabilities, Driver, IfaceCapabilities, LinkState, Medium};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, Key as NeighborKey, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
@@ -36,6 +36,62 @@ use crate::wire::*;
 define_handle! {
     /// A handle to an interface added to a [`Stack`].
     IfaceHandle(crate::config::iface_index)
+}
+
+/// Type of medium of an interface.
+///
+/// This is the stack's own medium type: which variants exist depends on the
+/// enabled `medium-*` features. Drivers report the feature-independent
+/// [`crate::driver::Medium`] instead; the stack converts when the interface is
+/// added, and rejects media the build does not support.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+pub enum Medium {
+    /// Ethernet medium. Devices of this type send and receive Ethernet frames.
+    #[cfg(feature = "medium-ethernet")]
+    Ethernet,
+
+    /// IP medium. Devices of this type send and receive IP frames, without an
+    /// Ethernet header. MAC addresses are not used.
+    #[cfg(feature = "medium-ip")]
+    Ip,
+
+    /// IEEE 802.15.4 medium. Devices of this type send and receive 802.15.4
+    /// MAC frames carrying 6LoWPAN.
+    ///
+    /// [`Capabilities::max_transmission_unit`] is the whole MAC frame
+    /// without the FCS: 125 for a 127-byte PHY frame with a 2-byte FCS.
+    #[cfg(feature = "medium-ieee802154")]
+    Ieee802154,
+}
+
+impl From<Medium> for crate::driver::Medium {
+    fn from(medium: Medium) -> Self {
+        match medium {
+            #[cfg(feature = "medium-ethernet")]
+            Medium::Ethernet => crate::driver::Medium::Ethernet,
+            #[cfg(feature = "medium-ip")]
+            Medium::Ip => crate::driver::Medium::Ip,
+            #[cfg(feature = "medium-ieee802154")]
+            Medium::Ieee802154 => crate::driver::Medium::Ieee802154,
+        }
+    }
+}
+
+impl Medium {
+    /// The stack's own medium for the one a driver reports, or `None` if the
+    /// build does not have its `medium-*` feature.
+    pub(crate) fn from_driver(medium: crate::driver::Medium) -> Option<Self> {
+        match medium {
+            #[cfg(feature = "medium-ethernet")]
+            crate::driver::Medium::Ethernet => Some(Medium::Ethernet),
+            #[cfg(feature = "medium-ip")]
+            crate::driver::Medium::Ip => Some(Medium::Ip),
+            #[cfg(feature = "medium-ieee802154")]
+            crate::driver::Medium::Ieee802154 => Some(Medium::Ieee802154),
+            _ => None,
+        }
+    }
 }
 
 /// A network stack.
@@ -137,6 +193,8 @@ fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAddr> {
 pub(crate) struct IfaceState<'d> {
     pub(crate) handle: IfaceHandle,
     pub(crate) driver: MaybeBox<'d, dyn Driver + 'd>,
+    /// The driver's medium, converted and checked when the interface is added.
+    pub(crate) medium: Medium,
     pub(crate) hardware_addr: HardwareAddress,
     pub(crate) ip_addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT>,
     /// Bumped whenever the interface's addresses or routes change.
@@ -178,7 +236,7 @@ impl<'d> Iface<'_, 'd> {
     }
 
     /// The capabilities reported by the device.
-    pub fn capabilities(&self) -> IfaceCapabilities {
+    pub fn capabilities(&self) -> Capabilities {
         self.state().driver.capabilities()
     }
 
@@ -228,7 +286,7 @@ impl<'d> Iface<'_, 'd> {
     /// # Panics
     /// Panics if the address is not of the kind the device's medium uses.
     pub fn set_hardware_addr(&mut self, addr: HardwareAddress) {
-        let medium = self.state().driver.capabilities().medium;
+        let medium = self.state().medium();
         assert_eq!(
             addr.medium(),
             medium,
@@ -782,7 +840,7 @@ impl<'d> Stack<'d> {
     /// add an IP address to it.
     ///
     /// ```no_run
-    /// # use xarxa::{Stack, iface::Driver, wire::{IpCidr, Ipv4Address}};
+    /// # use xarxa::{Stack, driver::Driver, wire::{IpCidr, Ipv4Address}};
     /// # fn configure(stack: &mut Stack, driver: Box<dyn Driver>) {
     /// let handle = stack.add_iface(driver).unwrap();
     /// stack
@@ -823,10 +881,13 @@ impl<'d> Stack<'d> {
     }
 
     fn add_iface_inner(&mut self, driver: MaybeBox<'d, dyn Driver + 'd>) -> core::result::Result<IfaceHandle, Full> {
-        let hardware_addr = driver.hardware_address();
+        let medium = Medium::from_driver(driver.capabilities().medium)
+            .expect("the driver's medium is not supported by this build: enable the matching medium-* cargo feature");
+        let hardware_addr = HardwareAddress::from_driver(driver.hardware_address())
+            .expect("the driver's hardware address kind is not supported by this build: enable the matching medium-* cargo feature");
         assert_eq!(
             hardware_addr.medium(),
-            driver.capabilities().medium,
+            medium,
             "the device's hardware address does not match its medium"
         );
         #[cfg(feature = "medium-ieee802154")]
@@ -841,6 +902,7 @@ impl<'d> Stack<'d> {
         let index = self.ifaces.add_with(|index| IfaceState {
             handle: IfaceHandle::new(index),
             driver,
+            medium,
             hardware_addr,
             ip_addrs,
             config_generation: 0,
@@ -1183,7 +1245,7 @@ impl<'d> Stack<'d> {
                 #[cfg(feature = "packet-log")]
                 {
                     trace!("received on iface {}", index);
-                    let medium = self.ifaces.get(index).driver.capabilities().medium;
+                    let medium = self.ifaces.get(index).medium();
                     crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
                 }
                 self.process(handle, buf);
@@ -1460,7 +1522,7 @@ impl<'d> TcpListenerIter<'_, 'd> {
 
 impl<'d> Stack<'d> {
     fn process(&mut self, iface: IfaceHandle, buf: PacketBuf) {
-        match self.ifaces.get(iface.index()).driver.capabilities().medium {
+        match self.ifaces.get(iface.index()).medium() {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => self.process_ethernet(iface, buf),
             #[cfg(feature = "medium-ip")]
@@ -2878,7 +2940,7 @@ impl StackInner {
         #[cfg(not(feature = "medium-ethernet"))]
         let _ = ethertype;
 
-        match iface.driver.capabilities().medium {
+        match iface.medium() {
             #[cfg(feature = "medium-ip")]
             Medium::Ip => self.transmit_raw(iface, buf),
             #[cfg(feature = "medium-ethernet")]
@@ -2932,7 +2994,7 @@ impl StackInner {
         #[cfg(feature = "packet-log")]
         {
             trace!("sent on iface {}", iface.handle.index());
-            let medium = iface.driver.capabilities().medium;
+            let medium = iface.medium();
             crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
         }
         if iface.driver.transmit(buf).is_err() {
@@ -3138,7 +3200,7 @@ impl IfaceState<'_> {
     /// The interface's medium.
     #[allow(dead_code)]
     pub(crate) fn medium(&self) -> Medium {
-        self.driver.capabilities().medium
+        self.medium
     }
 
     /// Which checksums the device computes and verifies itself, so the stack
@@ -3204,7 +3266,7 @@ impl IfaceState<'_> {
     /// link-layer headroom egress reserves ([`LINK_HEADER_LEN`]) is taken out.
     pub(crate) fn ip_mtu(&self) -> usize {
         let caps = self.driver.capabilities();
-        let mtu = match caps.medium {
+        let mtu = match self.medium() {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => caps.max_transmission_unit - ETHERNET_HEADER_LEN,
             #[cfg(feature = "medium-ip")]
@@ -3594,7 +3656,7 @@ fn ndisc_lladdr_option(
 pub(crate) mod test {
 
     use super::*;
-    use crate::iface::Checksum;
+    use crate::driver::Checksum;
     use crate::neighbor::MAX_MULTICAST_SOLICIT;
     use crate::raw::RawMode;
     #[cfg(feature = "slaac")]
@@ -3697,9 +3759,9 @@ pub(crate) mod test {
         assert_eq!(stack.iface(handle).hardware_addr(), HardwareAddress::Ethernet(OUR_HW));
 
         // The link state is read from the device live.
-        assert_eq!(stack.iface(handle).link_state(), crate::iface::LinkState::Up);
-        link.set(crate::iface::LinkState::Down);
-        assert_eq!(stack.iface(handle).link_state(), crate::iface::LinkState::Down);
+        assert_eq!(stack.iface(handle).link_state(), crate::driver::LinkState::Up);
+        link.set(crate::driver::LinkState::Down);
+        assert_eq!(stack.iface(handle).link_state(), crate::driver::LinkState::Down);
     }
 
     #[test]
@@ -5928,10 +5990,8 @@ pub(crate) mod test {
         let mut packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &request);
         corrupt_checksum(&mut packet, IPV4_CHECKSUM);
 
-        let caps = ChecksumCapabilities {
-            ipv4: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.ipv4 = Checksum::None;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
@@ -5948,10 +6008,8 @@ pub(crate) mod test {
         corrupt_checksum(&mut request, ICMP_CHECKSUM);
         let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &request);
 
-        let caps = ChecksumCapabilities {
-            icmpv4: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.icmpv4 = Checksum::None;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
@@ -5968,10 +6026,8 @@ pub(crate) mod test {
         corrupt_checksum(&mut request, ICMP_CHECKSUM);
         let packet = ipv6_packet(REMOTE_V6, OUR_V6, IpProtocol::Icmpv6, &request);
 
-        let caps = ChecksumCapabilities {
-            icmpv6: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.icmpv6 = Checksum::None;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
@@ -5988,10 +6044,8 @@ pub(crate) mod test {
         corrupt_checksum(&mut datagram, UDP_CHECKSUM);
         let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Udp, &datagram);
 
-        let caps = ChecksumCapabilities {
-            udp: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.udp = Checksum::None;
         let (mut stack, rx, _tx) = test_stack_with_checksum(Medium::Ip, caps);
         let handle = stack.add_udp_socket().unwrap();
         stack
@@ -6047,10 +6101,8 @@ pub(crate) mod test {
         corrupt_checksum(&mut segment, TCP_CHECKSUM);
         let packet = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Tcp, &segment);
 
-        let caps = ChecksumCapabilities {
-            tcp: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.tcp = Checksum::None;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         inject(&mut stack, &rx, packet.clone());
         assert_eq!(tx.borrow().len(), 1);
@@ -6064,10 +6116,8 @@ pub(crate) mod test {
     /// zeroed, not filled in.
     #[test]
     fn test_checksum_offload_tx_ipv4() {
-        let caps = ChecksumCapabilities {
-            ipv4: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.ipv4 = Checksum::None;
         let (mut stack, _rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         let handle = stack.add_udp_socket().unwrap();
         stack.udp_socket(handle).bind(5000, (REMOTE_V4, 5000)).unwrap();
@@ -6089,10 +6139,8 @@ pub(crate) mod test {
     /// Same for the UDP checksum.
     #[test]
     fn test_checksum_offload_tx_udp() {
-        let caps = ChecksumCapabilities {
-            udp: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.udp = Checksum::None;
         let (mut stack, _rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         let handle = stack.add_udp_socket().unwrap();
         stack.udp_socket(handle).bind(5000, (REMOTE_V4, 5000)).unwrap();
@@ -6114,10 +6162,8 @@ pub(crate) mod test {
     /// Same for the TCP checksum, on the SYN a connect sends.
     #[test]
     fn test_checksum_offload_tx_tcp() {
-        let caps = ChecksumCapabilities {
-            tcp: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.tcp = Checksum::None;
         let (mut stack, _rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         let handle = stack
             .add_tcp_socket_with_bufs(vec![0; 4096].leak(), vec![0; 4096].leak())
@@ -6134,10 +6180,8 @@ pub(crate) mod test {
     /// buffer) and on an ICMP error (built from scratch).
     #[test]
     fn test_checksum_offload_tx_icmpv4() {
-        let caps = ChecksumCapabilities {
-            icmpv4: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.icmpv4 = Checksum::None;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
 
         let request = icmpv4_echo(Icmpv4Message::EchoRequest, 0x1234, 7, b"ping");
@@ -6162,10 +6206,8 @@ pub(crate) mod test {
     /// solicitation the stack sends on its own.
     #[test]
     fn test_checksum_offload_tx_icmpv6() {
-        let caps = ChecksumCapabilities {
-            icmpv6: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.icmpv6 = Checksum::None;
         let (mut stack, rx, tx) = test_stack_with_checksum(Medium::Ip, caps);
         let request = icmpv6_echo(Icmpv6Message::EchoRequest, 0x1234, 7, b"ping", REMOTE_V6, OUR_V6);
         inject(

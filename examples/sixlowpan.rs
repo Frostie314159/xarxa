@@ -48,7 +48,7 @@
 
 use std::os::unix::io::AsRawFd;
 
-use xarxa::iface::{RawSocketInterface, wait};
+use xarxa::driver_impls::{RawSocketDriver, wait};
 use xarxa::stack::Stack;
 use xarxa::time::Instant;
 use xarxa::wire::{HardwareAddress, Ieee802154Address, Ieee802154Pan, IpListenEndpoint};
@@ -64,7 +64,7 @@ fn main() {
     let hardware_addr = HardwareAddress::Ieee802154(Ieee802154Address::Extended([
         0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
     ]));
-    let driver = RawSocketInterface::new(&name, hardware_addr).unwrap();
+    let driver = RawSocketDriver::new(&name, hardware_addr).unwrap();
     let fd = driver.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());

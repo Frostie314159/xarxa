@@ -25,7 +25,7 @@
 use std::io::Write as _;
 use std::os::unix::io::AsRawFd;
 
-use xarxa::iface::{TunTapInterface, wait};
+use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::stack::Stack;
 use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
@@ -52,7 +52,7 @@ fn main() {
     // The driver and the socket buffers are lent to the stack by reference
     // rather than boxed, as a no-alloc program would. They must be declared
     // before the stack, which holds them until it is dropped.
-    let mut driver = TunTapInterface::new(name, hardware_addr).unwrap();
+    let mut driver = TunTapDriver::new(name, hardware_addr).unwrap();
     let fd = driver.as_raw_fd();
     let mut rx_buffer = [0u8; 4096];
     let mut tx_buffer = [0u8; 4096];

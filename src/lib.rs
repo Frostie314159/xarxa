@@ -46,11 +46,12 @@ pub mod buf;
 pub mod dhcpv4;
 #[cfg(feature = "dns")]
 pub mod dns;
+#[cfg(feature = "std")]
+pub mod driver_impls;
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 mod fragmentation;
 #[cfg(feature = "icmp-errors")]
 mod icmp_error;
-pub mod iface;
 pub mod meta;
 #[cfg(feature = "multicast")]
 pub mod multicast;
@@ -81,6 +82,9 @@ pub mod udp;
 mod waker;
 pub mod wire;
 
+/// The driver interface, re-exported for driver crates and code that names their types.
+pub use xarxa_driver as driver;
+
 pub use buf::{PACKET_BUF_SIZE, PacketBuf};
 #[cfg(feature = "dhcpv4-options")]
 pub use dhcpv4::DhcpLeaseOptions;
@@ -108,7 +112,7 @@ pub use stack::TcpListenerIter;
 pub use stack::TcpSocketIter;
 #[cfg(feature = "udp")]
 pub use stack::UdpSocketIter;
-pub use stack::{AddrOrigin, Iface, IfaceAddr, IfaceHandle, IfaceIter, Stack};
+pub use stack::{AddrOrigin, Iface, IfaceAddr, IfaceHandle, IfaceIter, Medium, Stack};
 pub use storage::Full;
 #[cfg(feature = "tcp")]
 pub use tcp::{TcpHandle, TcpSocket};

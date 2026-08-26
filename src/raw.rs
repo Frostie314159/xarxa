@@ -14,11 +14,11 @@ use crate::storage::BoundedDeque;
 use core::fmt;
 
 use crate::buf::PacketBuf;
-#[cfg(feature = "medium-ethernet")]
-use crate::iface::Medium;
 use crate::meta::PacketMeta;
 #[cfg(feature = "medium-ethernet")]
 use crate::stack::IfaceHandle;
+#[cfg(feature = "medium-ethernet")]
+use crate::stack::Medium;
 use crate::stack::{Stack, TxContext};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;

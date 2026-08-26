@@ -4,7 +4,8 @@ use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::buf::PacketBuf;
-use crate::iface::{ChecksumCapabilities, Driver, IfaceCapabilities, Medium};
+use crate::driver::{Capabilities, Driver};
+use crate::stack::Medium;
 #[cfg(feature = "medium-ethernet")]
 use crate::wire::ETHERNET_HEADER_LEN;
 use crate::wire::HardwareAddress;
@@ -63,22 +64,22 @@ fn ifreq_ioctl(lower: libc::c_int, ifreq: &mut ifreq, cmd: libc::c_ulong) -> io:
     Ok(ifreq.ifr_data)
 }
 
-/// A virtual TUN (IP) or TAP (Ethernet) interface.
+/// A driver for a virtual TUN (IP) or TAP (Ethernet) interface.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
-pub struct TunTapInterface {
+pub struct TunTapDriver {
     lower: libc::c_int,
     mtu: usize,
     hardware_addr: HardwareAddress,
 }
 
-impl AsRawFd for TunTapInterface {
+impl AsRawFd for TunTapDriver {
     fn as_raw_fd(&self) -> RawFd {
         self.lower
     }
 }
 
-impl TunTapInterface {
+impl TunTapDriver {
     /// Attaches to a TUN/TAP interface called `name`, or creates it if it does not exist.
     ///
     /// `hardware_addr` is the address the interface reports to the stack, and picks the
@@ -88,7 +89,7 @@ impl TunTapInterface {
     /// If `name` is a persistent interface configured with UID of the current user,
     /// no special privileges are needed. Otherwise, this requires superuser privileges
     /// or a corresponding capability set on the executable.
-    pub fn new(name: &str, hardware_addr: HardwareAddress) -> io::Result<TunTapInterface> {
+    pub fn new(name: &str, hardware_addr: HardwareAddress) -> io::Result<TunTapDriver> {
         let medium = hardware_addr.medium();
 
         let lower = unsafe {
@@ -103,7 +104,7 @@ impl TunTapInterface {
         Self::attach_interface_ifreq(lower, medium, &mut ifreq)?;
         let mtu = Self::mtu_ifreq(medium, &mut ifreq)?;
 
-        Ok(TunTapInterface {
+        Ok(TunTapDriver {
             lower,
             mtu,
             hardware_addr,
@@ -113,12 +114,12 @@ impl TunTapInterface {
     /// Attaches to a TUN/TAP interface specified by file descriptor `fd`.
     ///
     /// On platforms like Android, a file descriptor to a tun interface is exposed.
-    /// On these platforms, a TunTapInterface cannot be instantiated with a name.
+    /// On these platforms, a TunTapDriver cannot be instantiated with a name.
     ///
     /// `hardware_addr` is the address the interface reports to the stack, and picks the
     /// medium, as in [`new`](Self::new).
-    pub fn from_fd(fd: RawFd, hardware_addr: HardwareAddress, mtu: usize) -> io::Result<TunTapInterface> {
-        Ok(TunTapInterface {
+    pub fn from_fd(fd: RawFd, hardware_addr: HardwareAddress, mtu: usize) -> io::Result<TunTapDriver> {
+        Ok(TunTapDriver {
             lower: fd,
             mtu,
             hardware_addr,
@@ -196,7 +197,7 @@ impl TunTapInterface {
     }
 }
 
-impl Drop for TunTapInterface {
+impl Drop for TunTapDriver {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.lower);
@@ -204,17 +205,16 @@ impl Drop for TunTapInterface {
     }
 }
 
-impl Driver for TunTapInterface {
-    fn capabilities(&self) -> IfaceCapabilities {
-        IfaceCapabilities {
-            medium: self.hardware_addr.medium(),
-            max_transmission_unit: self.mtu,
-            checksum: ChecksumCapabilities::default(),
-        }
+impl Driver for TunTapDriver {
+    fn capabilities(&self) -> Capabilities {
+        let mut caps = Capabilities::default();
+        caps.medium = self.hardware_addr.medium().into();
+        caps.max_transmission_unit = self.mtu;
+        caps
     }
 
-    fn hardware_address(&self) -> HardwareAddress {
-        self.hardware_addr
+    fn hardware_address(&self) -> crate::driver::HardwareAddress {
+        self.hardware_addr.to_driver().unwrap()
     }
 
     fn receive(&mut self) -> Option<PacketBuf> {

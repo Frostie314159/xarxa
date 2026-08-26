@@ -67,7 +67,7 @@ mod udp;
 
 use core::fmt;
 
-use crate::iface::Medium;
+use crate::stack::Medium;
 
 pub use self::ethernet::{
     Address as EthernetAddress, EtherType as EthernetProtocol, Frame as EthernetFrame,
@@ -338,6 +338,43 @@ impl HardwareAddress {
             HardwareAddress::Ethernet(addr) => *addr,
             #[allow(unreachable_patterns)]
             _ => panic!("hardware address is not an Ethernet address"),
+        }
+    }
+
+    /// Convert to the address type drivers report, [`crate::driver::HardwareAddress`].
+    ///
+    /// Returns `None` for an IEEE 802.15.4 address that is not an extended
+    /// address: drivers report extended addresses only.
+    pub fn to_driver(&self) -> Option<crate::driver::HardwareAddress> {
+        match self {
+            #[cfg(feature = "medium-ethernet")]
+            HardwareAddress::Ethernet(addr) => Some(crate::driver::HardwareAddress::Ethernet(addr.0)),
+            #[cfg(feature = "medium-ip")]
+            HardwareAddress::Ip => Some(crate::driver::HardwareAddress::Ip),
+            #[cfg(feature = "medium-ieee802154")]
+            HardwareAddress::Ieee802154(addr) => match addr {
+                Ieee802154Address::Extended(bytes) => Some(crate::driver::HardwareAddress::Ieee802154(*bytes)),
+                _ => None,
+            },
+        }
+    }
+
+    /// Convert from the address type drivers report, [`crate::driver::HardwareAddress`].
+    ///
+    /// Returns `None` if the build does not have the `medium-*` feature the
+    /// address kind belongs to.
+    pub fn from_driver(addr: crate::driver::HardwareAddress) -> Option<Self> {
+        match addr {
+            #[cfg(feature = "medium-ethernet")]
+            crate::driver::HardwareAddress::Ethernet(bytes) => Some(HardwareAddress::Ethernet(EthernetAddress(bytes))),
+            #[cfg(feature = "medium-ip")]
+            crate::driver::HardwareAddress::Ip => Some(HardwareAddress::Ip),
+            #[cfg(feature = "medium-ieee802154")]
+            crate::driver::HardwareAddress::Ieee802154(bytes) => {
+                Some(HardwareAddress::Ieee802154(Ieee802154Address::Extended(bytes)))
+            }
+            #[allow(unreachable_patterns)]
+            _ => None,
         }
     }
 }

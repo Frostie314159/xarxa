@@ -5,7 +5,8 @@ use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 
 use crate::buf::PacketBuf;
-use crate::iface::{ChecksumCapabilities, Driver, IfaceCapabilities, Medium};
+use crate::driver::{Capabilities, Driver};
+use crate::stack::Medium;
 use crate::wire::HardwareAddress;
 
 const SIOCGIFMTU: libc::c_ulong = 0x8921;
@@ -44,26 +45,27 @@ fn ifreq_ioctl(lower: libc::c_int, ifreq: &mut ifreq, cmd: libc::c_ulong) -> io:
     Ok(ifreq.ifr_data)
 }
 
-/// A packet socket bound to a host interface, sending and receiving whole frames.
+/// A driver over a packet socket bound to a host interface, sending and receiving
+/// whole frames.
 ///
 /// Ethernet interfaces carry Ethernet frames ([`Medium::Ethernet`]), `wpan`
 /// interfaces carry IEEE 802.15.4 frames ([`Medium::Ieee802154`]). Linux and
 /// Android only.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug)]
-pub struct RawSocketInterface {
+pub struct RawSocketDriver {
     lower: libc::c_int,
     mtu: usize,
     hardware_addr: HardwareAddress,
 }
 
-impl AsRawFd for RawSocketInterface {
+impl AsRawFd for RawSocketDriver {
     fn as_raw_fd(&self) -> RawFd {
         self.lower
     }
 }
 
-impl RawSocketInterface {
+impl RawSocketDriver {
     /// Open a packet socket bound to the interface called `name`.
     ///
     /// `hardware_addr` is the address the interface reports to the stack, and picks the
@@ -76,9 +78,16 @@ impl RawSocketInterface {
     /// Errors:
     /// - the OS error if the socket cannot be opened or bound, or the
     ///   interface does not exist.
-    /// - `Unsupported` for [`HardwareAddress::Ip`].
-    pub fn new(name: &str, hardware_addr: HardwareAddress) -> io::Result<RawSocketInterface> {
+    /// - `Unsupported` for [`HardwareAddress::Ip`], and for an IEEE 802.15.4
+    ///   address that is not an extended address.
+    pub fn new(name: &str, hardware_addr: HardwareAddress) -> io::Result<RawSocketDriver> {
         let medium = hardware_addr.medium();
+        if hardware_addr.to_driver().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "an IEEE 802.15.4 interface needs an extended hardware address",
+            ));
+        }
 
         let protocol = match medium {
             #[cfg(feature = "medium-ethernet")]
@@ -106,7 +115,7 @@ impl RawSocketInterface {
             lower
         };
 
-        let mut iface = RawSocketInterface {
+        let mut driver = RawSocketDriver {
             lower,
             mtu: 0,
             hardware_addr,
@@ -134,7 +143,7 @@ impl RawSocketInterface {
         }
 
         let mtu = ifreq_ioctl(lower, &mut ifreq, SIOCGIFMTU)? as usize;
-        iface.mtu = match medium {
+        driver.mtu = match medium {
             // SIOCGIFMTU returns the IP MTU (typically 1500 bytes.)
             // xarxa counts the entire Ethernet packet in the MTU, so add the Ethernet header size to it.
             #[cfg(feature = "medium-ethernet")]
@@ -151,7 +160,7 @@ impl RawSocketInterface {
             Medium::Ip => unreachable!(),
         };
 
-        Ok(iface)
+        Ok(driver)
     }
 
     fn recv(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
@@ -175,7 +184,7 @@ impl RawSocketInterface {
     }
 }
 
-impl Drop for RawSocketInterface {
+impl Drop for RawSocketDriver {
     fn drop(&mut self) {
         unsafe {
             libc::close(self.lower);
@@ -183,17 +192,16 @@ impl Drop for RawSocketInterface {
     }
 }
 
-impl Driver for RawSocketInterface {
-    fn capabilities(&self) -> IfaceCapabilities {
-        IfaceCapabilities {
-            medium: self.hardware_addr.medium(),
-            max_transmission_unit: self.mtu,
-            checksum: ChecksumCapabilities::default(),
-        }
+impl Driver for RawSocketDriver {
+    fn capabilities(&self) -> Capabilities {
+        let mut caps = Capabilities::default();
+        caps.medium = self.hardware_addr.medium().into();
+        caps.max_transmission_unit = self.mtu;
+        caps
     }
 
-    fn hardware_address(&self) -> HardwareAddress {
-        self.hardware_addr
+    fn hardware_address(&self) -> crate::driver::HardwareAddress {
+        self.hardware_addr.to_driver().unwrap()
     }
 
     fn receive(&mut self) -> Option<PacketBuf> {

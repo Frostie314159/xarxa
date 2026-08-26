@@ -951,7 +951,7 @@ impl StackInner {
 )]
 mod test {
     use super::*;
-    use crate::iface::Medium;
+    use crate::stack::Medium;
     use crate::stack::test::{icmpv6_echo, inject, ipv6_packet, udp_datagram};
     use crate::stack::{AddrOrigin, IfaceHandle};
     use crate::test_device::{Queue, Room, Sent, TestDevice};

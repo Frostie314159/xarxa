@@ -176,6 +176,15 @@ def collect():
                     cmds.check(join(features, alloc))
                     cmds.check(join(features, COMBO_EXTRAS, alloc))
 
+    # `xarxa-driver` on its own, every feature combination it has (it has few).
+    # The combinations above only build it with the features xarxa forwards.
+    for extra in ["", "defmt", "packetmeta-id", "packetmeta-timestamp", "packetmeta-timestamp,defmt"]:
+        args = ["check", "-p", "xarxa-driver"]
+        if extra:
+            args += ["--features", extra]
+        cmds.raw(args)
+    cmds.raw(["test", "-p", "xarxa-driver"])
+
     cmds.raw(["test"])
     # Once more without `alloc`: the bounded containers and their full-table
     # paths. Unit tests only: the examples and doc tests are written against the

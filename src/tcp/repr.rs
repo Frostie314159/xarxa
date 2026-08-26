@@ -7,7 +7,7 @@
 
 use core::fmt;
 
-use crate::iface::ChecksumCapabilities;
+use crate::driver::ChecksumCapabilities;
 use crate::wire::{Error, IpAddress, Result, TCP_HEADER_LEN, TcpControl, TcpOption, TcpPacket, TcpSeqNumber};
 
 /// A high-level representation of a Transmission Control Protocol packet.

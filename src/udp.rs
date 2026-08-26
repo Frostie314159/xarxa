@@ -969,7 +969,7 @@ pub(crate) fn process_icmp_error(
 #[cfg(all(test, feature = "medium-ip", feature = "ipv4", feature = "ipv6"))]
 mod test {
     use super::*;
-    use crate::iface::Medium;
+    use crate::stack::Medium;
     use crate::stack::Stack;
     use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};

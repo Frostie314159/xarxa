@@ -695,7 +695,8 @@ mod test {
     use std::vec::Vec;
 
     use super::*;
-    use crate::iface::{Checksum, ChecksumCapabilities, Medium};
+    use crate::driver::{Checksum, ChecksumCapabilities};
+    use crate::stack::Medium;
     use crate::stack::{IfaceHandle, Stack};
     use crate::test_device::{Queue, Sent, TestDevice};
 
@@ -1273,11 +1274,9 @@ mod test {
     #[test]
     fn test_checksum_offload() {
         let medium = Medium::Ip;
-        let caps = ChecksumCapabilities {
-            ipv4: Checksum::None,
-            icmpv6: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.ipv4 = Checksum::None;
+        caps.icmpv6 = Checksum::None;
         let (mut stack, _rx, tx) = test_stack_with_checksum(medium, caps);
         stack.poll(Instant::ZERO);
         tx.borrow_mut().clear();

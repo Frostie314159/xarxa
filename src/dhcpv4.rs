@@ -17,7 +17,7 @@ use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
 
 use crate::buf::PacketBuf;
-use crate::iface::ChecksumCapabilities;
+use crate::driver::ChecksumCapabilities;
 use crate::route::{Route, RouteOrigin};
 use crate::stack::{AddrOrigin, IfaceAddr, IfaceState, StackInner};
 use crate::time::{Duration, Instant};
@@ -852,7 +852,8 @@ mod test {
     use std::vec::Vec;
 
     use super::*;
-    use crate::iface::{Checksum, Medium};
+    use crate::driver::Checksum;
+    use crate::stack::Medium;
     use crate::stack::{IfaceHandle, Stack};
     use crate::test_device::{Queue, Sent, TestDevice};
     use crate::wire::{
@@ -1358,11 +1359,9 @@ mod test {
     /// zeroed in the messages the client sends.
     #[test]
     fn test_checksum_offload() {
-        let caps = ChecksumCapabilities {
-            ipv4: Checksum::None,
-            udp: Checksum::None,
-            ..Default::default()
-        };
+        let mut caps = ChecksumCapabilities::default();
+        caps.ipv4 = Checksum::None;
+        caps.udp = Checksum::None;
         let (mut stack, _rx, tx) = test_stack_with_checksum(caps);
         stack.poll(at(0));
 

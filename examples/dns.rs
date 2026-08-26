@@ -23,7 +23,7 @@
 use std::os::unix::io::AsRawFd;
 
 use xarxa::dns::{DnsClient, GetQueryResultError};
-use xarxa::iface::{TunTapInterface, wait};
+use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::stack::Stack;
 use xarxa::time::Instant;
 use xarxa::wire::dns::Type;
@@ -50,7 +50,7 @@ fn main() {
         })
         .unwrap_or(IpAddress::v4(8, 8, 8, 8));
 
-    let driver = TunTapInterface::new(name, hardware_addr).unwrap();
+    let driver = TunTapDriver::new(name, hardware_addr).unwrap();
     let fd = driver.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());

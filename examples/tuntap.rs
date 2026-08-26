@@ -22,7 +22,7 @@
 
 use std::os::unix::io::AsRawFd;
 
-use xarxa::iface::{TunTapInterface, wait};
+use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::stack::Stack;
 use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address};
@@ -39,7 +39,7 @@ fn main() {
     };
     let name = args.first().map(String::as_str).unwrap_or("tap0");
 
-    let driver = TunTapInterface::new(name, hardware_addr).unwrap();
+    let driver = TunTapDriver::new(name, hardware_addr).unwrap();
     let fd = driver.as_raw_fd();
 
     let mut stack = Stack::new(random_seed());
