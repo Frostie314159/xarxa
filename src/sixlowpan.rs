@@ -131,22 +131,17 @@ impl Iface<'_, '_> {
 // Ingress.
 impl Stack<'_> {
     pub(crate) fn process_ieee802154(&mut self, iface: IfaceHandle, mut buf: PacketBuf) {
-        let (ieee802154_repr, header_len) = {
-            let ieee802154_frame = check!(Ieee802154Frame::new_checked(&mut buf));
+        let (ieee802154_repr, header_len) = check!(Ieee802154Repr::parse(&buf));
 
-            if ieee802154_frame.frame_type() != Ieee802154FrameType::Data {
-                return;
-            }
+        if ieee802154_repr.frame_type != Ieee802154FrameType::Data {
+            return;
+        }
 
-            // Link-layer security is not supported: the payload is ciphertext.
-            if ieee802154_frame.security_enabled() {
-                trace!("IEEE802.15.4: dropping frame with security enabled");
-                return;
-            }
-
-            let ieee802154_repr = check!(Ieee802154Repr::parse(&ieee802154_frame));
-            (ieee802154_repr, ieee802154_frame.header_len())
-        };
+        // Link-layer security is not supported: the payload is ciphertext.
+        if ieee802154_repr.security_enabled {
+            trace!("IEEE802.15.4: dropping frame with security enabled");
+            return;
+        }
 
         // Drop frames when the user has set a PAN id and the PAN id from frame is not equal to this
         // When the user didn't set a PAN id (so it is None), then we accept all PAN id's.
@@ -224,15 +219,6 @@ struct ExtInfo {
     data_len: usize,
 }
 
-/// A compressed UDP header found by the parse pass of [`sixlowpan_to_ipv6`].
-#[derive(Clone, Copy)]
-struct UdpInfo {
-    src_port: u16,
-    dst_port: u16,
-    /// The checksum, `None` if the sender elided it.
-    checksum: Option<u16>,
-}
-
 /// The length of the IPv6 extension header that carries `data_len` bytes of
 /// header-specific data: the 2-byte prefix plus the data, padded to a multiple
 /// of 8 (RFC 6282 §4.2).
@@ -259,10 +245,8 @@ pub(crate) fn sixlowpan_to_ipv6(
 ) -> Result<()> {
     // Parse everything first. The write pass below overwrites the compressed
     // headers, so nothing may be read from them after it starts.
-    let iphc = SixlowpanIphcPacket::new_checked(buf)?;
-    let iphc_repr = SixlowpanIphcRepr::parse(&iphc, ll_src_addr, ll_dst_addr, address_context)?;
-    let iphc_len = iphc.header_len();
-    let first_next_header = decompress_next_header(iphc_repr.next_header, iphc.payload())?;
+    let (iphc_repr, iphc_len) = SixlowpanIphcRepr::parse(buf, ll_src_addr, ll_dst_addr, address_context)?;
+    let first_next_header = decompress_next_header(iphc_repr.next_header, &buf[iphc_len..])?;
 
     let mut exts = [ExtInfo {
         next_header: IpProtocol::Ipv6NoNxt,
@@ -278,9 +262,7 @@ pub(crate) fn sixlowpan_to_ipv6(
         match nh {
             SixlowpanNextHeader::Compressed => match SixlowpanNhcPacket::dispatch(&buf[offset..])? {
                 SixlowpanNhcPacket::ExtHeader => {
-                    let ext_hdr = SixlowpanExtHeaderPacket::new_checked(&mut buf[offset..])?;
-                    let ext_repr = SixlowpanExtHeaderRepr::parse(&ext_hdr)?;
-                    let hdr_len = ext_repr.buffer_len();
+                    let (ext_repr, hdr_len) = SixlowpanExtHeaderRepr::parse(&buf[offset..])?;
                     let data_len = ext_repr.length as usize;
                     if offset + hdr_len + data_len > buf.len() {
                         return Err(Error);
@@ -299,14 +281,9 @@ pub(crate) fn sixlowpan_to_ipv6(
                     offset += hdr_len + data_len;
                 }
                 SixlowpanNhcPacket::UdpHeader => {
-                    let udp_packet = SixlowpanUdpNhcPacket::new_checked(&mut buf[offset..])?;
-                    let udp_repr = SixlowpanUdpNhcRepr::parse(&udp_packet)?;
-                    udp = Some(UdpInfo {
-                        src_port: udp_repr.src_port,
-                        dst_port: udp_repr.dst_port,
-                        checksum: udp_packet.checksum(),
-                    });
-                    offset += udp_packet.header_len();
+                    let (udp_repr, hdr_len) = SixlowpanUdpNhcRepr::parse(&buf[offset..])?;
+                    udp = Some(udp_repr);
+                    offset += hdr_len;
                     next_header = None;
                 }
             },
@@ -421,10 +398,8 @@ fn decompress_next_header(next_header: SixlowpanNextHeader, payload: &[u8]) -> R
     match next_header {
         SixlowpanNextHeader::Compressed => match SixlowpanNhcPacket::dispatch(payload)? {
             SixlowpanNhcPacket::ExtHeader => {
-                // Only the first byte is read, which `dispatch` checked.
-                let mut dispatch = [payload[0], 0, 0];
-                let ext_hdr = SixlowpanExtHeaderPacket::new_checked(&mut dispatch[..])?;
-                Ok(ext_hdr.extension_header_id().into())
+                let (ext_repr, _) = SixlowpanExtHeaderRepr::parse(payload)?;
+                Ok(ext_repr.ext_header_id.into())
             }
             SixlowpanNhcPacket::UdpHeader => Ok(IpProtocol::Udp),
         },
@@ -496,13 +471,12 @@ pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr)
 
     let udp = if next_header == IpProtocol::Udp {
         match UdpPacket::new_checked(&mut buf[offset..]) {
-            Ok(udp) => Some((
-                SixlowpanUdpNhcRepr {
-                    src_port: udp.src_port(),
-                    dst_port: udp.dst_port(),
-                },
-                udp.checksum(),
-            )),
+            Ok(udp) => Some(SixlowpanUdpNhcRepr {
+                src_port: udp.src_port(),
+                dst_port: udp.dst_port(),
+                // The checksum covers the same payload and pseudo-header as before.
+                checksum: Some(udp.checksum()),
+            }),
             Err(_) => None,
         }
     } else {
@@ -545,8 +519,8 @@ pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr)
         };
         compressed_len += ext_reprs[i].buffer_len() + ext.header_len - 2;
     }
-    if let Some((udp_repr, _)) = &udp {
-        compressed_len += udp_repr.header_len();
+    if let Some(udp_repr) = &udp {
+        compressed_len += udp_repr.buffer_len();
     }
 
     // Make room. The compressed chain is written into the dead IPv6 header,
@@ -561,27 +535,23 @@ pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr)
     // the untouched extension headers, UDP header and payload.
     let (head, rest) = buf.split_at_mut(extra + IPV6_HEADER_LEN);
     let dest = &mut head[extra + IPV6_HEADER_LEN - compressed_len..];
-    dest.fill(0);
     let mut pos = 0;
     {
         let len = iphc_repr.buffer_len();
-        iphc_repr.emit(&mut SixlowpanIphcPacket::new_unchecked(&mut dest[pos..pos + len]));
+        iphc_repr.emit(&mut dest[pos..pos + len]);
         pos += len;
     }
     for (ext, ext_repr) in exts[..n_ext].iter().zip(&ext_reprs) {
         let len = ext_repr.buffer_len();
-        ext_repr.emit(&mut SixlowpanExtHeaderPacket::new_unchecked(&mut dest[pos..pos + len]));
+        ext_repr.emit(&mut dest[pos..pos + len]);
         pos += len;
         let data = &rest[ext.offset - IPV6_HEADER_LEN + 2..ext.offset - IPV6_HEADER_LEN + ext.header_len];
         dest[pos..pos + data.len()].copy_from_slice(data);
         pos += data.len();
     }
-    if let Some((udp_repr, udp_checksum)) = udp {
-        let len = udp_repr.header_len();
-        let mut udp_packet = SixlowpanUdpNhcPacket::new_unchecked(&mut dest[pos..pos + len]);
-        udp_repr.emit(&mut udp_packet);
-        // The checksum covers the same payload and pseudo-header as before.
-        udp_packet.set_checksum(udp_checksum);
+    if let Some(udp_repr) = udp {
+        let len = udp_repr.buffer_len();
+        udp_repr.emit(&mut dest[pos..pos + len]);
         pos += len;
     }
     debug_assert_eq!(pos, compressed_len);
@@ -652,8 +622,7 @@ impl StackInner {
                 return;
             }
             buf.push_front(ieee_len);
-            buf[..ieee_len].fill(0);
-            ieee_repr.emit(&mut Ieee802154Frame::new_unchecked(&mut buf[..ieee_len]));
+            ieee_repr.emit(&mut buf[..ieee_len]);
             self.transmit_raw(iface, buf);
         }
     }
@@ -680,32 +649,28 @@ impl Stack<'_> {
             return None;
         }
 
-        let (datagram_size, is_first_fragment, offset, key, header_len) = {
-            let frag = check!(SixlowpanFragPacket::new_checked(&mut buf));
+        let frag = check!(SixlowpanFragRepr::parse(&buf));
 
-            // From RFC 4944 § 5.3: "The value of datagram_size SHALL be 40 octets more than the value
-            // of Payload Length in the IPv6 header of the packet."
-            if frag.datagram_size() < IPV6_HEADER_LEN as u16 {
-                debug!("6LoWPAN: fragment size too small");
-                return None;
-            }
-            // An IPv6 packet over the link MTU is not valid.
-            if frag.datagram_size() as usize > IPV6_MIN_MTU {
-                debug!("6LoWPAN: fragment size too large");
-                return None;
-            }
+        // From RFC 4944 § 5.3: "The value of datagram_size SHALL be 40 octets more than the value
+        // of Payload Length in the IPv6 header of the packet."
+        if frag.size() < IPV6_HEADER_LEN as u16 {
+            debug!("6LoWPAN: fragment size too small");
+            return None;
+        }
+        // An IPv6 packet over the link MTU is not valid.
+        if frag.size() as usize > IPV6_MIN_MTU {
+            debug!("6LoWPAN: fragment size too large");
+            return None;
+        }
 
-            (
-                frag.datagram_size() as usize,
-                frag.is_first_fragment(),
-                // The offset of this fragment in increments of 8 octets.
-                frag.datagram_offset() as usize * 8,
-                // The key specifies to which 6LoWPAN fragment it belongs too.
-                // It is based on the link layer addresses, the tag and the size.
-                FragKey::Sixlowpan(frag.get_key(ieee802154_repr)),
-                frag.header_len(),
-            )
-        };
+        let datagram_size = frag.size() as usize;
+        let is_first_fragment = frag.is_first_fragment();
+        // The offset of this fragment in increments of 8 octets.
+        let offset = frag.offset() as usize * 8;
+        // The key specifies to which 6LoWPAN fragment it belongs too.
+        // It is based on the link layer addresses, the tag and the size.
+        let key = FragKey::Sixlowpan(frag.key(ieee802154_repr));
+        let header_len = frag.buffer_len();
 
         // We reserve a spot in the packet assembler set and add the required
         // information to the packet assembler.
@@ -910,11 +875,8 @@ impl StackInner {
             return false;
         };
         tx_buffer.set_len(ieee_len + frag_len + frag_size);
-        tx_buffer[..ieee_len + frag_len].fill(0);
-        ieee_repr.emit(&mut Ieee802154Frame::new_unchecked(&mut tx_buffer[..ieee_len]));
-        frag_repr.emit(&mut SixlowpanFragPacket::new_unchecked(
-            &mut tx_buffer[ieee_len..ieee_len + frag_len],
-        ));
+        ieee_repr.emit(&mut tx_buffer[..ieee_len]);
+        frag_repr.emit(&mut tx_buffer[ieee_len..ieee_len + frag_len]);
 
         // NOTE(unwrap): the fragmenter is not empty, checked by the caller.
         let buffer = unwrap!(frag.buffer.as_ref());
@@ -1026,17 +988,15 @@ mod test {
         let repr = mac_repr(src, dst, Some(pan));
         let len = repr.buffer_len();
         let mut bytes = vec![0; len + payload.len()];
-        repr.emit(&mut Ieee802154Frame::new_unchecked(&mut bytes[..len]));
+        repr.emit(&mut bytes[..len]);
         bytes[len..].copy_from_slice(payload);
         bytes
     }
 
     /// The MAC header and the payload of a transmitted frame.
     fn parse_frame(frame: &[u8]) -> (Ieee802154Repr, Vec<u8>) {
-        let mut bytes = frame.to_vec();
-        let frame = Ieee802154Frame::new_checked(&mut bytes[..]).unwrap();
-        let repr = Ieee802154Repr::parse(&frame).unwrap();
-        (repr, frame.payload().unwrap().to_vec())
+        let (repr, header_len) = Ieee802154Repr::parse(frame).unwrap();
+        (repr, frame[header_len..].to_vec())
     }
 
     /// Compress an IPv6 packet in a buffer with `headroom` bytes in front, as
@@ -1085,13 +1045,13 @@ mod test {
         let mut size_tag = None;
         for (i, frame) in frames.iter().enumerate() {
             assert!(frame.len() <= MTU, "frame of {} octets exceeds the MTU", frame.len());
-            let (_, mut payload) = parse_frame(frame);
-            let frag = SixlowpanFragPacket::new_checked(&mut payload[..]).unwrap();
+            let (_, payload) = parse_frame(frame);
+            let frag = SixlowpanFragRepr::parse(&payload).unwrap();
             assert_eq!(frag.is_first_fragment(), i == 0);
-            let st = *size_tag.get_or_insert((frag.datagram_size(), frag.datagram_tag()));
-            assert_eq!((frag.datagram_size(), frag.datagram_tag()), st);
-            offsets.push(frag.datagram_offset() as usize * 8);
-            compressed.extend_from_slice(frag.payload());
+            let st = *size_tag.get_or_insert((frag.size(), frag.tag()));
+            assert_eq!((frag.size(), frag.tag()), st);
+            offsets.push(frag.offset() as usize * 8);
+            compressed.extend_from_slice(&payload[frag.buffer_len()..]);
         }
         let (size, tag) = size_tag.unwrap();
         (size, tag, offsets, compressed)
@@ -1124,7 +1084,7 @@ mod test {
             };
             let len = len.min(compressed.len() - sent);
             let mut payload = vec![0; repr.buffer_len() + len];
-            repr.emit(&mut SixlowpanFragPacket::new_unchecked(&mut payload[..]));
+            repr.emit(&mut payload[..]);
             payload[repr.buffer_len()..].copy_from_slice(&compressed[sent..sent + len]);
             frames.push(frame(src, dst, PAN, &payload));
             offset += len + if sent == 0 { header_diff } else { 0 };
@@ -1383,16 +1343,15 @@ mod test {
         let dst = IPV6_LINK_LOCAL_ALL_NODES;
         let datagram = udp_datagram(src.into(), 67, dst.into(), 68, b"Hello");
         let packet = ipv6_packet(src, dst, IpProtocol::Udp, &datagram);
-        let (mut compressed, _) = compress(&packet, PEER_LL, Ieee802154Address::BROADCAST, 0);
+        let (compressed, _) = compress(&packet, PEER_LL, Ieee802154Address::BROADCAST, 0);
         {
-            let iphc = SixlowpanIphcPacket::new_checked(&mut compressed[..]).unwrap();
-            assert_eq!(
-                iphc.dst_addr(),
-                Ok(sixlowpan::UnresolvedAddress::WithoutContext(
-                    sixlowpan::AddressMode::Multicast8bits(&[1])
-                ))
-            );
-            assert_eq!(iphc.next_header(), SixlowpanNextHeader::Compressed);
+            let (iphc, header_len) =
+                SixlowpanIphcRepr::parse(&compressed, Some(PEER_LL), Some(Ieee802154Address::BROADCAST), &[]).unwrap();
+            assert_eq!(iphc.dst_addr, dst);
+            assert_eq!(iphc.next_header, SixlowpanNextHeader::Compressed);
+            // The base, 8 inline source bytes, and the multicast destination
+            // compressed to a single byte.
+            assert_eq!(header_len, 2 + 8 + 1);
         }
         inject(
             &mut stack,
@@ -1742,11 +1701,9 @@ mod test {
     fn test_echo_request_sixlowpan_128_bytes() {
         // The first fragment's IPHC header resolves against the frame addresses.
         {
-            let mut first = REQUEST_FIRST_PART;
-            let frag = SixlowpanFragPacket::new_checked(&mut first[..]).unwrap();
-            let mut payload = frag.payload().to_vec();
-            let iphc = SixlowpanIphcPacket::new_checked(&mut payload[..]).unwrap();
-            let repr = SixlowpanIphcRepr::parse(&iphc, Some(CONTIKI_LL), Some(VECTOR_LL), &[]).unwrap();
+            let frag = SixlowpanFragRepr::parse(&REQUEST_FIRST_PART).unwrap();
+            let payload = &REQUEST_FIRST_PART[frag.buffer_len()..];
+            let (repr, _) = SixlowpanIphcRepr::parse(payload, Some(CONTIKI_LL), Some(VECTOR_LL), &[]).unwrap();
             assert_eq!(repr.src_addr, CONTIKI_LINK_LOCAL);
             assert_eq!(repr.dst_addr, VECTOR_LINK_LOCAL);
         }

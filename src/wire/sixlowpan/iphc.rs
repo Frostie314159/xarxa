@@ -2,45 +2,41 @@
 //!
 //! [RFC 6282 § 3.1]: https://datatracker.ietf.org/doc/html/rfc6282#section-3.1
 
-use super::{AddressContext, AddressMode, DISPATCH_IPHC_HEADER, Error, NextHeader, Result, UnresolvedAddress};
+use super::{AddressContext, DISPATCH_IPHC_HEADER, Error, NextHeader, Result};
+use crate::wire::take;
 use crate::wire::{IpProtocol, ieee802154::Address as LlAddress, ipv6, ipv6::AddressExt};
-use byteorder::{ByteOrder, NetworkEndian};
-
-mod field {
-    use crate::wire::field::*;
-
-    pub const IPHC_FIELD: Field = 0..2;
-}
 
 /// The largest IPHC header: the base, a context identifier, an inline traffic
 /// class and flow label, next header, hop limit, and two full addresses.
 pub const MAX_HEADER_LEN: usize = 2 + 1 + 4 + 1 + 1 + 16 + 16;
 
-macro_rules! get_field {
-    ($name:ident, $mask:expr, $shift:expr) => {
-        fn $name(&self) -> u8 {
-            let raw = NetworkEndian::read_u16(&self.buffer[field::IPHC_FIELD]);
-            ((raw >> $shift) & $mask) as u8
-        }
-    };
+const LINK_LOCAL_PREFIX: [u8; 2] = [0xfe, 0x80];
+const EUI64_MIDDLE_VALUE: [u8; 2] = [0xff, 0xfe];
+
+/// The interface identifier an elided address takes from the link-layer
+/// address (RFC 6282 § 3.2.2).
+fn ll_iid(ll_addr: Option<LlAddress>) -> Result<[u8; 8]> {
+    match ll_addr {
+        Some(LlAddress::Short(ll)) => Ok([0, 0, 0, 0xff, 0xfe, 0, ll[0], ll[1]]),
+        Some(addr @ LlAddress::Extended(_)) => addr.as_eui_64().ok_or(Error),
+        Some(LlAddress::Absent) | None => Err(Error),
+    }
 }
 
-macro_rules! set_field {
-    ($name:ident, $mask:expr, $shift:expr) => {
-        fn $name(&mut self, val: u8) {
-            let data = &mut self.buffer[field::IPHC_FIELD];
-            let mut raw = NetworkEndian::read_u16(data);
-
-            raw = (raw & !($mask << $shift)) | ((val as u16) << $shift);
-            NetworkEndian::write_u16(data, raw);
-        }
-    };
+/// Overwrite the prefix of `bytes` with the address context `index` refers to.
+fn apply_context(addr_context: &[AddressContext], index: usize, bytes: &mut [u8; 16]) -> Result<()> {
+    let context = addr_context.get(index).ok_or(Error)?;
+    bytes[..context.0.len()].copy_from_slice(&context.0);
+    Ok(())
 }
 
-/// A read/write wrapper around a 6LoWPAN IPHC header.
-/// [RFC 6282 § 3.1] specifies the format of the header.
+/// The fields of a 6LoWPAN IPHC header.
 ///
-/// The header always start with the following base format (from [RFC 6282 § 3.1.1]):
+/// The link-layer addresses decide how much of each IPv6 address is elided,
+/// so they are part of the header's fields: [`parse`](Self::parse) restores
+/// elided bits from them and [`emit`](Self::emit) elides against them.
+///
+/// The header always starts with the following base format (from [RFC 6282 § 3.1.1]):
 /// ```txt
 ///    0                                       1
 ///    0   1   2   3   4   5   6   7   8   9   0   1   2   3   4   5
@@ -48,567 +44,9 @@ macro_rules! set_field {
 ///  | 0 | 1 | 1 |  TF   |NH | HLIM  |CID|SAC|  SAM  | M |DAC|  DAM  |
 ///  +---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+
 /// ```
-/// With:
-/// - TF: Traffic Class and Flow Label
-/// - NH: Next Header
-/// - HLIM: Hop Limit
-/// - CID: Context Identifier Extension
-/// - SAC: Source Address Compression
-/// - SAM: Source Address Mode
-/// - M: Multicast Compression
-/// - DAC: Destination Address Compression
-/// - DAM: Destination Address Mode
+/// The fields that are not fully elided follow it inline.
 ///
-/// Depending on the flags in the base format, the following fields are added to the header:
-/// - Traffic Class and Flow Label
-/// - Next Header
-/// - Hop Limit
-/// - IPv6 source address
-/// - IPv6 destination address
-///
-/// [RFC 6282 § 3.1]: https://datatracker.ietf.org/doc/html/rfc6282#section-3.1
 /// [RFC 6282 § 3.1.1]: https://datatracker.ietf.org/doc/html/rfc6282#section-3.1.1
-#[derive(Debug)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Packet<'a> {
-    buffer: &'a mut [u8],
-}
-
-impl<'a> Packet<'a> {
-    /// Imbue a raw octet buffer with a 6LoWPAN IPHC header structure.
-    pub const fn new_unchecked(buffer: &'a mut [u8]) -> Self {
-        Packet { buffer }
-    }
-
-    /// Shorthand for a combination of [new_unchecked] and [check_len].
-    ///
-    /// [new_unchecked]: #method.new_unchecked
-    /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Self> {
-        let packet = Self::new_unchecked(buffer);
-        packet.check_len()?;
-        Ok(packet)
-    }
-
-    /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
-    pub fn check_len(&self) -> Result<()> {
-        if self.buffer.len() < 2 {
-            return Err(Error);
-        }
-
-        let mut offset =
-            self.ip_fields_start() + self.traffic_class_size() + self.next_header_size() + self.hop_limit_size();
-        offset += self.src_address_size();
-        offset += self.dst_address_size();
-
-        if offset as usize > self.buffer.len() {
-            return Err(Error);
-        }
-
-        Ok(())
-    }
-
-    /// Return the Next Header field.
-    pub fn next_header(&self) -> NextHeader {
-        let nh = self.nh_field();
-
-        if nh == 1 {
-            // The next header field is compressed.
-            // It is also encoded using LOWPAN_NHC.
-            NextHeader::Compressed
-        } else {
-            // The full 8 bits for Next Header are carried in-line.
-            let start = (self.ip_fields_start() + self.traffic_class_size()) as usize;
-
-            let nh = self.buffer[start..start + 1][0];
-            NextHeader::Uncompressed(IpProtocol::from(nh))
-        }
-    }
-
-    /// Return the Hop Limit.
-    pub fn hop_limit(&self) -> u8 {
-        match self.hlim_field() {
-            0b00 => {
-                let start = (self.ip_fields_start() + self.traffic_class_size() + self.next_header_size()) as usize;
-
-                self.buffer[start..start + 1][0]
-            }
-            0b01 => 1,
-            0b10 => 64,
-            0b11 => 255,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Return the Source Context Identifier.
-    pub fn src_context_id(&self) -> Option<u8> {
-        if self.cid_field() == 1 {
-            Some(self.buffer[2] >> 4)
-        } else {
-            None
-        }
-    }
-
-    /// Return the Destination Context Identifier.
-    pub fn dst_context_id(&self) -> Option<u8> {
-        if self.cid_field() == 1 {
-            Some(self.buffer[2] & 0x0f)
-        } else {
-            None
-        }
-    }
-
-    /// Return the ECN field (when it is inlined).
-    pub fn ecn_field(&self) -> Option<u8> {
-        match self.tf_field() {
-            0b00..=0b10 => {
-                let start = self.ip_fields_start() as usize;
-                Some(self.buffer[start..][0] & 0b1100_0000)
-            }
-            0b11 => None,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Return the DSCP field (when it is inlined).
-    pub fn dscp_field(&self) -> Option<u8> {
-        match self.tf_field() {
-            0b00 | 0b10 => {
-                let start = self.ip_fields_start() as usize;
-                Some(self.buffer[start..][0] & 0b111111)
-            }
-            0b01 | 0b11 => None,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Return the flow label field (when it is inlined).
-    pub fn flow_label_field(&self) -> Option<u16> {
-        match self.tf_field() {
-            0b00 => {
-                let start = self.ip_fields_start() as usize;
-                Some(NetworkEndian::read_u16(&self.buffer[start..][2..4]))
-            }
-            0b01 => {
-                let start = self.ip_fields_start() as usize;
-                Some(NetworkEndian::read_u16(&self.buffer[start..][1..3]))
-            }
-            0b10 | 0b11 => None,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Return the Source Address.
-    pub fn src_addr(&self) -> Result<UnresolvedAddress<'_>> {
-        let start =
-            (self.ip_fields_start() + self.traffic_class_size() + self.next_header_size() + self.hop_limit_size())
-                as usize;
-
-        let data = &self.buffer;
-        match (self.sac_field(), self.sam_field()) {
-            (0, 0b00) => Ok(UnresolvedAddress::WithoutContext(AddressMode::FullInline(
-                &data[start..][..16],
-            ))),
-            (0, 0b01) => Ok(UnresolvedAddress::WithoutContext(AddressMode::InLine64bits(
-                &data[start..][..8],
-            ))),
-            (0, 0b10) => Ok(UnresolvedAddress::WithoutContext(AddressMode::InLine16bits(
-                &data[start..][..2],
-            ))),
-            (0, 0b11) => Ok(UnresolvedAddress::WithoutContext(AddressMode::FullyElided)),
-            (1, 0b00) => Ok(UnresolvedAddress::WithContext((0, AddressMode::Unspecified))),
-            (1, 0b01) => {
-                if let Some(id) = self.src_context_id() {
-                    Ok(UnresolvedAddress::WithContext((
-                        id as usize,
-                        AddressMode::InLine64bits(&data[start..][..8]),
-                    )))
-                } else {
-                    Err(Error)
-                }
-            }
-            (1, 0b10) => {
-                if let Some(id) = self.src_context_id() {
-                    Ok(UnresolvedAddress::WithContext((
-                        id as usize,
-                        AddressMode::InLine16bits(&data[start..][..2]),
-                    )))
-                } else {
-                    Err(Error)
-                }
-            }
-            (1, 0b11) => {
-                if let Some(id) = self.src_context_id() {
-                    Ok(UnresolvedAddress::WithContext((id as usize, AddressMode::FullyElided)))
-                } else {
-                    Err(Error)
-                }
-            }
-            _ => Err(Error),
-        }
-    }
-
-    /// Return the Destination Address.
-    pub fn dst_addr(&self) -> Result<UnresolvedAddress<'_>> {
-        let start = (self.ip_fields_start()
-            + self.traffic_class_size()
-            + self.next_header_size()
-            + self.hop_limit_size()
-            + self.src_address_size()) as usize;
-
-        let data = &self.buffer;
-        match (self.m_field(), self.dac_field(), self.dam_field()) {
-            (0, 0, 0b00) => Ok(UnresolvedAddress::WithoutContext(AddressMode::FullInline(
-                &data[start..][..16],
-            ))),
-            (0, 0, 0b01) => Ok(UnresolvedAddress::WithoutContext(AddressMode::InLine64bits(
-                &data[start..][..8],
-            ))),
-            (0, 0, 0b10) => Ok(UnresolvedAddress::WithoutContext(AddressMode::InLine16bits(
-                &data[start..][..2],
-            ))),
-            (0, 0, 0b11) => Ok(UnresolvedAddress::WithoutContext(AddressMode::FullyElided)),
-            (0, 1, 0b00) => Ok(UnresolvedAddress::Reserved),
-            (0, 1, 0b01) => {
-                if let Some(id) = self.dst_context_id() {
-                    Ok(UnresolvedAddress::WithContext((
-                        id as usize,
-                        AddressMode::InLine64bits(&data[start..][..8]),
-                    )))
-                } else {
-                    Err(Error)
-                }
-            }
-            (0, 1, 0b10) => {
-                if let Some(id) = self.dst_context_id() {
-                    Ok(UnresolvedAddress::WithContext((
-                        id as usize,
-                        AddressMode::InLine16bits(&data[start..][..2]),
-                    )))
-                } else {
-                    Err(Error)
-                }
-            }
-            (0, 1, 0b11) => {
-                if let Some(id) = self.dst_context_id() {
-                    Ok(UnresolvedAddress::WithContext((id as usize, AddressMode::FullyElided)))
-                } else {
-                    Err(Error)
-                }
-            }
-            (1, 0, 0b00) => Ok(UnresolvedAddress::WithoutContext(AddressMode::FullInline(
-                &data[start..][..16],
-            ))),
-            (1, 0, 0b01) => Ok(UnresolvedAddress::WithoutContext(AddressMode::Multicast48bits(
-                &data[start..][..6],
-            ))),
-            (1, 0, 0b10) => Ok(UnresolvedAddress::WithoutContext(AddressMode::Multicast32bits(
-                &data[start..][..4],
-            ))),
-            (1, 0, 0b11) => Ok(UnresolvedAddress::WithoutContext(AddressMode::Multicast8bits(
-                &data[start..][..1],
-            ))),
-            (1, 1, 0b00) => Ok(UnresolvedAddress::WithContext((0, AddressMode::NotSupported))),
-            (1, 1, 0b01..=0b11) => Ok(UnresolvedAddress::Reserved),
-            _ => Err(Error),
-        }
-    }
-
-    get_field!(dispatch_field, 0b111, 13);
-    get_field!(tf_field, 0b11, 11);
-    get_field!(nh_field, 0b1, 10);
-    get_field!(hlim_field, 0b11, 8);
-    get_field!(cid_field, 0b1, 7);
-    get_field!(sac_field, 0b1, 6);
-    get_field!(sam_field, 0b11, 4);
-    get_field!(m_field, 0b1, 3);
-    get_field!(dac_field, 0b1, 2);
-    get_field!(dam_field, 0b11, 0);
-
-    /// Return the start for the IP fields.
-    fn ip_fields_start(&self) -> u8 {
-        2 + self.cid_size()
-    }
-
-    /// Get the size in octets of the traffic class field.
-    fn traffic_class_size(&self) -> u8 {
-        match self.tf_field() {
-            0b00 => 4,
-            0b01 => 3,
-            0b10 => 1,
-            0b11 => 0,
-            _ => unreachable!(),
-        }
-    }
-
-    /// Get the size in octets of the next header field.
-    fn next_header_size(&self) -> u8 {
-        (self.nh_field() != 1) as u8
-    }
-
-    /// Get the size in octets of the hop limit field.
-    fn hop_limit_size(&self) -> u8 {
-        (self.hlim_field() == 0b00) as u8
-    }
-
-    /// Get the size in octets of the CID field.
-    fn cid_size(&self) -> u8 {
-        (self.cid_field() == 1) as u8
-    }
-
-    /// Get the size in octets of the source address.
-    fn src_address_size(&self) -> u8 {
-        match (self.sac_field(), self.sam_field()) {
-            (0, 0b00) => 16, // The full address is carried in-line.
-            (0, 0b01) => 8,  // The first 64 bits are elided.
-            (0, 0b10) => 2,  // The first 112 bits are elided.
-            (0, 0b11) => 0,  // The address is fully elided.
-            (1, 0b00) => 0,  // The UNSPECIFIED address.
-            (1, 0b01) => 8,  // Address derived using context information.
-            (1, 0b10) => 2,  // Address derived using context information.
-            (1, 0b11) => 0,  // Address derived using context information.
-            _ => unreachable!(),
-        }
-    }
-
-    /// Get the size in octets of the address address.
-    fn dst_address_size(&self) -> u8 {
-        match (self.m_field(), self.dac_field(), self.dam_field()) {
-            (0, 0, 0b00) => 16, // The full address is carried in-line.
-            (0, 0, 0b01) => 8,  // The first 64 bits are elided.
-            (0, 0, 0b10) => 2,  // The first 112 bits are elided.
-            (0, 0, 0b11) => 0,  // The address is fully elided.
-            (0, 1, 0b00) => 0,  // Reserved.
-            (0, 1, 0b01) => 8,  // Address derived using context information.
-            (0, 1, 0b10) => 2,  // Address derived using context information.
-            (0, 1, 0b11) => 0,  // Address derived using context information.
-            (1, 0, 0b00) => 16, // The full address is carried in-line.
-            (1, 0, 0b01) => 6,  // The address takes the form ffXX::00XX:XXXX:XXXX.
-            (1, 0, 0b10) => 4,  // The address takes the form ffXX::00XX:XXXX.
-            (1, 0, 0b11) => 1,  // The address takes the form ff02::00XX.
-            (1, 1, 0b00) => 6,  // Match Unicast-Prefix-based IPv6.
-            (1, 1, 0b01) => 0,  // Reserved.
-            (1, 1, 0b10) => 0,  // Reserved.
-            (1, 1, 0b11) => 0,  // Reserved.
-            _ => unreachable!(),
-        }
-    }
-
-    /// Return the length of the header.
-    pub fn header_len(&self) -> usize {
-        let mut len = self.ip_fields_start();
-        len += self.traffic_class_size();
-        len += self.next_header_size();
-        len += self.hop_limit_size();
-        len += self.src_address_size();
-        len += self.dst_address_size();
-
-        len as usize
-    }
-
-    /// Return a pointer to the payload.
-    pub fn payload(&self) -> &[u8] {
-        let len = self.header_len();
-        &self.buffer[len..]
-    }
-
-    /// Set the dispatch field to `0b011`.
-    fn set_dispatch_field(&mut self) {
-        let data = &mut self.buffer[field::IPHC_FIELD];
-        let mut raw = NetworkEndian::read_u16(data);
-
-        raw = (raw & !(0b111 << 13)) | (0b11 << 13);
-        NetworkEndian::write_u16(data, raw);
-    }
-
-    set_field!(set_tf_field, 0b11, 11);
-    set_field!(set_nh_field, 0b1, 10);
-    set_field!(set_hlim_field, 0b11, 8);
-    set_field!(set_cid_field, 0b1, 7);
-    set_field!(set_sac_field, 0b1, 6);
-    set_field!(set_sam_field, 0b11, 4);
-    set_field!(set_m_field, 0b1, 3);
-    set_field!(set_dac_field, 0b1, 2);
-    set_field!(set_dam_field, 0b11, 0);
-
-    fn set_field(&mut self, idx: usize, value: &[u8]) {
-        self.buffer[idx..idx + value.len()].copy_from_slice(value);
-    }
-
-    /// Set the Next Header.
-    ///
-    /// **NOTE**: `idx` is the offset at which the Next Header needs to be written to.
-    fn set_next_header(&mut self, nh: NextHeader, mut idx: usize) -> usize {
-        match nh {
-            NextHeader::Uncompressed(nh) => {
-                self.set_nh_field(0);
-                self.set_field(idx, &[nh.into()]);
-                idx += 1;
-            }
-            NextHeader::Compressed => self.set_nh_field(1),
-        }
-
-        idx
-    }
-
-    /// Set the Hop Limit.
-    ///
-    /// **NOTE**: `idx` is the offset at which the Next Header needs to be written to.
-    fn set_hop_limit(&mut self, hl: u8, mut idx: usize) -> usize {
-        match hl {
-            255 => self.set_hlim_field(0b11),
-            64 => self.set_hlim_field(0b10),
-            1 => self.set_hlim_field(0b01),
-            _ => {
-                self.set_hlim_field(0b00);
-                self.set_field(idx, &[hl]);
-                idx += 1;
-            }
-        }
-
-        idx
-    }
-
-    /// Set the Source Address based on the IPv6 address and the Link-Local address.
-    ///
-    /// **NOTE**: `idx` is the offset at which the Next Header needs to be written to.
-    fn set_src_address(&mut self, src_addr: ipv6::Address, ll_src_addr: Option<LlAddress>, mut idx: usize) -> usize {
-        self.set_cid_field(0);
-        self.set_sac_field(0);
-        let src = src_addr.octets();
-        if src_addr == ipv6::Address::UNSPECIFIED {
-            self.set_sac_field(1);
-            self.set_sam_field(0b00);
-        } else if src_addr.is_link_local() {
-            // We have a link local address.
-            // The remainder of the address can be elided when the context contains
-            // a 802.15.4 short address or a 802.15.4 extended address which can be
-            // converted to a eui64 address.
-            let is_eui_64 = ll_src_addr
-                .map(|addr| addr.as_eui_64().map(|addr| addr[..] == src[8..]).unwrap_or(false))
-                .unwrap_or(false);
-
-            if src[8..14] == [0, 0, 0, 0xff, 0xfe, 0] {
-                let ll = [src[14], src[15]];
-
-                if ll_src_addr == Some(LlAddress::Short(ll)) {
-                    // We have the context from the 802.15.4 frame.
-                    // The context contains the short address.
-                    // We can elide the source address.
-                    self.set_sam_field(0b11);
-                } else {
-                    // We don't have the context from the 802.15.4 frame.
-                    // We cannot elide the source address, however we can elide 112 bits.
-                    self.set_sam_field(0b10);
-
-                    self.set_field(idx, &src[14..]);
-                    idx += 2;
-                }
-            } else if is_eui_64 {
-                // We have the context from the 802.15.4 frame.
-                // The context contains the extended address.
-                // We can elide the source address.
-                self.set_sam_field(0b11);
-            } else {
-                // We cannot elide the source address, however we can elide 64 bits.
-                self.set_sam_field(0b01);
-
-                self.set_field(idx, &src[8..]);
-                idx += 8;
-            }
-        } else {
-            // We cannot elide anything.
-            self.set_sam_field(0b00);
-            self.set_field(idx, &src);
-            idx += 16;
-        }
-
-        idx
-    }
-
-    /// Set the Destination Address based on the IPv6 address and the Link-Local address.
-    ///
-    /// **NOTE**: `idx` is the offset at which the Next Header needs to be written to.
-    fn set_dst_address(&mut self, dst_addr: ipv6::Address, ll_dst_addr: Option<LlAddress>, mut idx: usize) -> usize {
-        self.set_dac_field(0);
-        self.set_dam_field(0);
-        self.set_m_field(0);
-        let dst = dst_addr.octets();
-        if dst_addr.is_multicast() {
-            self.set_m_field(1);
-
-            if dst[1] == 0x02 && dst[2..15] == [0; 13] {
-                self.set_dam_field(0b11);
-
-                self.set_field(idx, &[dst[15]]);
-                idx += 1;
-            } else if dst[2..13] == [0; 11] {
-                self.set_dam_field(0b10);
-
-                self.set_field(idx, &[dst[1]]);
-                idx += 1;
-                self.set_field(idx, &dst[13..]);
-                idx += 3;
-            } else if dst[2..11] == [0; 9] {
-                self.set_dam_field(0b01);
-
-                self.set_field(idx, &[dst[1]]);
-                idx += 1;
-                self.set_field(idx, &dst[11..]);
-                idx += 5;
-            } else {
-                self.set_dam_field(0b00);
-
-                self.set_field(idx, &dst);
-                idx += 16;
-            }
-        } else if dst_addr.is_link_local() {
-            let is_eui_64 = ll_dst_addr
-                .map(|addr| addr.as_eui_64().map(|addr| addr[..] == dst[8..]).unwrap_or(false))
-                .unwrap_or(false);
-
-            if dst[8..14] == [0, 0, 0, 0xff, 0xfe, 0] {
-                let ll = [dst[14], dst[15]];
-
-                if ll_dst_addr == Some(LlAddress::Short(ll)) {
-                    self.set_dam_field(0b11);
-                } else {
-                    self.set_dam_field(0b10);
-
-                    self.set_field(idx, &dst[14..]);
-                    idx += 2;
-                }
-            } else if is_eui_64 {
-                self.set_dam_field(0b11);
-            } else {
-                self.set_dam_field(0b01);
-
-                self.set_field(idx, &dst[8..]);
-                idx += 8;
-            }
-        } else {
-            self.set_dam_field(0b00);
-
-            self.set_field(idx, &dst);
-            idx += 16;
-        }
-
-        idx
-    }
-
-    /// Return a mutable pointer to the payload.
-    pub fn payload_mut(&mut self) -> &mut [u8] {
-        let len = self.header_len();
-        &mut self.buffer[len..]
-    }
-}
-
-/// The fields of a 6LoWPAN IPHC header.
-///
-/// The link-layer addresses decide how much of each IPv6 address is elided,
-/// so the header is built from all of its fields at once with
-/// [`emit`](Self::emit).
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct Repr {
     pub src_addr: ipv6::Address,
@@ -646,151 +84,339 @@ impl defmt::Format for Repr {
     }
 }
 
+/// How the interface identifier of a link-local address compresses against
+/// the link-layer address: the SAM/DAM bits and the bytes carried inline.
+fn compress_iid(octets: &[u8; 16], ll_addr: Option<LlAddress>) -> (u8, [u8; 16], usize) {
+    let mut inline = [0u8; 16];
+    let is_eui_64 = ll_addr
+        .map(|addr| addr.as_eui_64().map(|addr| addr[..] == octets[8..]).unwrap_or(false))
+        .unwrap_or(false);
+    if octets[8..14] == [0, 0, 0, 0xff, 0xfe, 0] {
+        if ll_addr == Some(LlAddress::Short([octets[14], octets[15]])) {
+            // The address is derived from the frame's short address: elide it.
+            (0b11, inline, 0)
+        } else {
+            // Elide everything but the short address the IID embeds.
+            inline[..2].copy_from_slice(&octets[14..]);
+            (0b10, inline, 2)
+        }
+    } else if is_eui_64 {
+        // The address is derived from the frame's extended address: elide it.
+        (0b11, inline, 0)
+    } else {
+        // Elide the link-local prefix, carry the IID.
+        inline[..8].copy_from_slice(&octets[8..]);
+        (0b01, inline, 8)
+    }
+}
+
+/// How a source address compresses: the SAC bit, the SAM bits, and the bytes
+/// carried inline.
+fn compress_src(addr: &ipv6::Address, ll_addr: Option<LlAddress>) -> (bool, u8, [u8; 16], usize) {
+    let octets = addr.octets();
+    if *addr == ipv6::Address::UNSPECIFIED {
+        (true, 0b00, octets, 0)
+    } else if addr.is_link_local() {
+        let (sam, inline, len) = compress_iid(&octets, ll_addr);
+        (false, sam, inline, len)
+    } else {
+        (false, 0b00, octets, 16)
+    }
+}
+
+/// How a destination address compresses: the M bit, the DAM bits, and the
+/// bytes carried inline. The DAC bit is always zero: contexts are never used
+/// when emitting.
+fn compress_dst(addr: &ipv6::Address, ll_addr: Option<LlAddress>) -> (bool, u8, [u8; 16], usize) {
+    let octets = addr.octets();
+    if addr.is_multicast() {
+        let mut inline = [0u8; 16];
+        if octets[1] == 0x02 && octets[2..15] == [0; 13] {
+            // ff02::00XX
+            inline[0] = octets[15];
+            (true, 0b11, inline, 1)
+        } else if octets[2..13] == [0; 11] {
+            // ffXX::00XX:XXXX
+            inline[0] = octets[1];
+            inline[1..4].copy_from_slice(&octets[13..]);
+            (true, 0b10, inline, 4)
+        } else if octets[2..11] == [0; 9] {
+            // ffXX::00XX:XXXX:XXXX
+            inline[0] = octets[1];
+            inline[1..6].copy_from_slice(&octets[11..]);
+            (true, 0b01, inline, 6)
+        } else {
+            (true, 0b00, octets, 16)
+        }
+    } else if addr.is_link_local() {
+        let (dam, inline, len) = compress_iid(&octets, ll_addr);
+        (false, dam, inline, len)
+    } else {
+        (false, 0b00, octets, 16)
+    }
+}
+
 impl Repr {
-    /// Parse a 6LoWPAN IPHC header.
+    /// Parse an IPHC header from the front of `buf`.
     ///
-    /// `ll_src_addr` and `ll_dst_addr` are the link-layer addresses of the
-    /// frame the header arrived in, and `addr_context` the address contexts.
+    /// Returns the header and its length. `ll_src_addr` and `ll_dst_addr` are
+    /// the link-layer addresses of the frame the header arrived in, and
+    /// `addr_context` the address contexts, indexed by context identifier.
     /// Elided address bits are restored from them.
     ///
     /// Errors:
-    /// - `Error` if the buffer is too short, is not an IPHC header, or an
-    ///   address cannot be resolved.
+    /// - `Error` if the buffer is too short, is not an IPHC header, an
+    ///   encoding is reserved or unsupported, or an address refers to a
+    ///   context or link-layer address that is not there.
     pub fn parse(
-        packet: &Packet<'_>,
+        buf: &[u8],
         ll_src_addr: Option<LlAddress>,
         ll_dst_addr: Option<LlAddress>,
         addr_context: &[AddressContext],
-    ) -> Result<Self> {
-        // Ensure basic accessors will work.
-        packet.check_len()?;
-
-        if packet.dispatch_field() != DISPATCH_IPHC_HEADER {
-            // This is not an LOWPAN_IPHC packet.
+    ) -> Result<(Self, usize)> {
+        if buf.len() < 2 {
             return Err(Error);
         }
+        let iphc = u16::from_be_bytes([buf[0], buf[1]]);
+        if iphc >> 13 != DISPATCH_IPHC_HEADER as u16 {
+            return Err(Error);
+        }
+        let tf = ((iphc >> 11) & 0b11) as u8;
+        let nh = (iphc >> 10) & 1 != 0;
+        let hlim = ((iphc >> 8) & 0b11) as u8;
+        let cid = (iphc >> 7) & 1 != 0;
+        let sac = (iphc >> 6) & 1 != 0;
+        let sam = ((iphc >> 4) & 0b11) as u8;
+        let m = (iphc >> 3) & 1 != 0;
+        let dac = (iphc >> 2) & 1 != 0;
+        let dam = (iphc & 0b11) as u8;
 
-        let src_addr = packet.src_addr()?.resolve(ll_src_addr, addr_context)?;
-        let dst_addr = packet.dst_addr()?.resolve(ll_dst_addr, addr_context)?;
+        let mut offset = 2;
 
-        Ok(Self {
-            src_addr,
-            ll_src_addr,
-            dst_addr,
-            ll_dst_addr,
-            next_header: packet.next_header(),
-            hop_limit: packet.hop_limit(),
-            ecn: packet.ecn_field(),
-            dscp: packet.dscp_field(),
-            flow_label: packet.flow_label_field(),
-        })
+        // The context identifier extension. Without it, context 0 is used
+        // (RFC 6282 § 3.1.1, CID).
+        let (src_context, dst_context) = if cid {
+            let b = take(buf, &mut offset, 1)?[0];
+            ((b >> 4) as usize, (b & 0x0f) as usize)
+        } else {
+            (0, 0)
+        };
+
+        let (ecn, dscp, flow_label) = match tf {
+            0b00 => {
+                let b = take(buf, &mut offset, 4)?;
+                (
+                    Some(b[0] & 0b1100_0000),
+                    Some(b[0] & 0b11_1111),
+                    Some(u16::from_be_bytes([b[2], b[3]])),
+                )
+            }
+            0b01 => {
+                let b = take(buf, &mut offset, 3)?;
+                (Some(b[0] & 0b1100_0000), None, Some(u16::from_be_bytes([b[1], b[2]])))
+            }
+            0b10 => {
+                let b = take(buf, &mut offset, 1)?;
+                (Some(b[0] & 0b1100_0000), Some(b[0] & 0b11_1111), None)
+            }
+            _ => (None, None, None),
+        };
+
+        let next_header = if nh {
+            NextHeader::Compressed
+        } else {
+            NextHeader::Uncompressed(IpProtocol::from(take(buf, &mut offset, 1)?[0]))
+        };
+
+        let hop_limit = match hlim {
+            0b00 => take(buf, &mut offset, 1)?[0],
+            0b01 => 1,
+            0b10 => 64,
+            _ => 255,
+        };
+
+        let mut bytes = [0u8; 16];
+        let src_addr = match (sac, sam) {
+            // The full address is carried inline.
+            (false, 0b00) => ipv6::Address::from_octets(take(buf, &mut offset, 16)?.try_into().unwrap()),
+            // The link-local prefix is elided.
+            (false, 0b01) => {
+                bytes[0..2].copy_from_slice(&LINK_LOCAL_PREFIX);
+                bytes[8..].copy_from_slice(take(buf, &mut offset, 8)?);
+                ipv6::Address::from_octets(bytes)
+            }
+            // The IID embeds a short address: fe80::ff:fe00:XXXX.
+            (false, 0b10) => {
+                bytes[0..2].copy_from_slice(&LINK_LOCAL_PREFIX);
+                bytes[11..13].copy_from_slice(&EUI64_MIDDLE_VALUE);
+                bytes[14..].copy_from_slice(take(buf, &mut offset, 2)?);
+                ipv6::Address::from_octets(bytes)
+            }
+            // Fully elided: link-local, IID from the link-layer address.
+            (false, 0b11) => {
+                bytes[0..2].copy_from_slice(&LINK_LOCAL_PREFIX);
+                bytes[8..].copy_from_slice(&ll_iid(ll_src_addr)?);
+                ipv6::Address::from_octets(bytes)
+            }
+            (true, 0b00) => ipv6::Address::UNSPECIFIED,
+            // Context prefix, IID carried inline.
+            (true, 0b01) => {
+                bytes[8..].copy_from_slice(take(buf, &mut offset, 8)?);
+                apply_context(addr_context, src_context, &mut bytes)?;
+                ipv6::Address::from_octets(bytes)
+            }
+            // Context prefix, IID from the 0000:00ff:fe00:XXXX mapping.
+            (true, 0b10) => {
+                bytes[11..13].copy_from_slice(&EUI64_MIDDLE_VALUE);
+                bytes[14..].copy_from_slice(take(buf, &mut offset, 2)?);
+                apply_context(addr_context, src_context, &mut bytes)?;
+                ipv6::Address::from_octets(bytes)
+            }
+            // Context prefix, IID from the link-layer address.
+            (true, 0b11) => {
+                bytes[8..].copy_from_slice(&ll_iid(ll_src_addr)?);
+                apply_context(addr_context, src_context, &mut bytes)?;
+                ipv6::Address::from_octets(bytes)
+            }
+            _ => unreachable!(),
+        };
+
+        let mut bytes = [0u8; 16];
+        let dst_addr = match (m, dac, dam) {
+            // Unicast: same modes as the source address.
+            (false, false, 0b00) => ipv6::Address::from_octets(take(buf, &mut offset, 16)?.try_into().unwrap()),
+            (false, false, 0b01) => {
+                bytes[0..2].copy_from_slice(&LINK_LOCAL_PREFIX);
+                bytes[8..].copy_from_slice(take(buf, &mut offset, 8)?);
+                ipv6::Address::from_octets(bytes)
+            }
+            (false, false, 0b10) => {
+                bytes[0..2].copy_from_slice(&LINK_LOCAL_PREFIX);
+                bytes[11..13].copy_from_slice(&EUI64_MIDDLE_VALUE);
+                bytes[14..].copy_from_slice(take(buf, &mut offset, 2)?);
+                ipv6::Address::from_octets(bytes)
+            }
+            (false, false, 0b11) => {
+                bytes[0..2].copy_from_slice(&LINK_LOCAL_PREFIX);
+                bytes[8..].copy_from_slice(&ll_iid(ll_dst_addr)?);
+                ipv6::Address::from_octets(bytes)
+            }
+            // Reserved.
+            (false, true, 0b00) => return Err(Error),
+            (false, true, 0b01) => {
+                bytes[8..].copy_from_slice(take(buf, &mut offset, 8)?);
+                apply_context(addr_context, dst_context, &mut bytes)?;
+                ipv6::Address::from_octets(bytes)
+            }
+            (false, true, 0b10) => {
+                bytes[11..13].copy_from_slice(&EUI64_MIDDLE_VALUE);
+                bytes[14..].copy_from_slice(take(buf, &mut offset, 2)?);
+                apply_context(addr_context, dst_context, &mut bytes)?;
+                ipv6::Address::from_octets(bytes)
+            }
+            (false, true, 0b11) => {
+                bytes[8..].copy_from_slice(&ll_iid(ll_dst_addr)?);
+                apply_context(addr_context, dst_context, &mut bytes)?;
+                ipv6::Address::from_octets(bytes)
+            }
+            // Multicast.
+            (true, false, 0b00) => ipv6::Address::from_octets(take(buf, &mut offset, 16)?.try_into().unwrap()),
+            (true, false, 0b01) => {
+                // ffXX::00XX:XXXX:XXXX
+                let b = take(buf, &mut offset, 6)?;
+                bytes[0] = 0xff;
+                bytes[1] = b[0];
+                bytes[11..].copy_from_slice(&b[1..]);
+                ipv6::Address::from_octets(bytes)
+            }
+            (true, false, 0b10) => {
+                // ffXX::00XX:XXXX
+                let b = take(buf, &mut offset, 4)?;
+                bytes[0] = 0xff;
+                bytes[1] = b[0];
+                bytes[13..].copy_from_slice(&b[1..]);
+                ipv6::Address::from_octets(bytes)
+            }
+            (true, false, 0b11) => {
+                // ff02::00XX
+                bytes[0] = 0xff;
+                bytes[1] = 0x02;
+                bytes[15] = take(buf, &mut offset, 1)?[0];
+                ipv6::Address::from_octets(bytes)
+            }
+            // Unicast-prefix-based multicast (unsupported), and reserved.
+            (true, true, _) => return Err(Error),
+            _ => unreachable!(),
+        };
+
+        Ok((
+            Self {
+                src_addr,
+                ll_src_addr,
+                dst_addr,
+                ll_dst_addr,
+                next_header,
+                hop_limit,
+                ecn,
+                dscp,
+                flow_label,
+            },
+            offset,
+        ))
     }
 
     /// Return the length of the header this will emit.
     pub fn buffer_len(&self) -> usize {
-        let mut len = 0;
-        len += 2; // The minimal header length
-
-        len += match self.next_header {
-            NextHeader::Compressed => 0, // The next header is compressed (we don't need to inline what the next header is)
-            NextHeader::Uncompressed(_) => 1, // The next header field is inlined
-        };
-
-        // Hop Limit size
-        len += match self.hop_limit {
-            255 | 64 | 1 => 0, // We can inline the hop limit
-            _ => 1,
-        };
-
-        // Add the length of the source address
-        len += if self.src_addr == ipv6::Address::UNSPECIFIED {
-            0
-        } else if self.src_addr.is_link_local() {
-            let src = self.src_addr.octets();
-            let ll = [src[14], src[15]];
-
-            let is_eui_64 = self
-                .ll_src_addr
-                .map(|addr| addr.as_eui_64().map(|addr| addr[..] == src[8..]).unwrap_or(false))
-                .unwrap_or(false);
-
-            if src[8..14] == [0, 0, 0, 0xff, 0xfe, 0] {
-                if self.ll_src_addr == Some(LlAddress::Short(ll)) {
-                    0
-                } else {
-                    2
-                }
-            } else if is_eui_64 {
-                0
-            } else {
-                8
-            }
-        } else {
-            16
-        };
-
-        // Add the size of the destination header
-        let dst = self.dst_addr.octets();
-        len += if self.dst_addr.is_multicast() {
-            if dst[1] == 0x02 && dst[2..15] == [0; 13] {
-                1
-            } else if dst[2..13] == [0; 11] {
-                4
-            } else if dst[2..11] == [0; 9] {
-                6
-            } else {
-                16
-            }
-        } else if self.dst_addr.is_link_local() {
-            let is_eui_64 = self
-                .ll_dst_addr
-                .map(|addr| addr.as_eui_64().map(|addr| addr[..] == dst[8..]).unwrap_or(false))
-                .unwrap_or(false);
-
-            if dst[8..14] == [0, 0, 0, 0xff, 0xfe, 0] {
-                let ll = [dst[14], dst[15]];
-
-                if self.ll_dst_addr == Some(LlAddress::Short(ll)) {
-                    0
-                } else {
-                    2
-                }
-            } else if is_eui_64 {
-                0
-            } else {
-                8
-            }
-        } else {
-            16
-        };
-
-        len += match (self.ecn, self.dscp, self.flow_label) {
-            (Some(_), Some(_), Some(_)) => 4,
-            (Some(_), None, Some(_)) => 3,
-            (Some(_), Some(_), None) => 1,
-            (None, None, None) => 0,
-            _ => unreachable!(),
-        };
-
+        let mut len = 2;
+        if let NextHeader::Uncompressed(_) = self.next_header {
+            len += 1;
+        }
+        if !matches!(self.hop_limit, 255 | 64 | 1) {
+            len += 1;
+        }
+        len += compress_src(&self.src_addr, self.ll_src_addr).3;
+        len += compress_dst(&self.dst_addr, self.ll_dst_addr).3;
         len
     }
 
-    /// Write the header into a packet.
+    /// Write the header into the front of `buf`.
     ///
-    /// The buffer must be zeroed first. The traffic class and flow label are
-    /// always elided.
-    pub fn emit(&self, packet: &mut Packet<'_>) {
-        let idx = 2;
+    /// Writes exactly [`buffer_len`](Self::buffer_len) bytes. The traffic
+    /// class and flow label are always elided.
+    ///
+    /// # Panics
+    /// Panics if `buf` is shorter than [`buffer_len`](Self::buffer_len).
+    pub fn emit(&self, buf: &mut [u8]) {
+        let (sac, sam, src_inline, src_len) = compress_src(&self.src_addr, self.ll_src_addr);
+        let (m, dam, dst_inline, dst_len) = compress_dst(&self.dst_addr, self.ll_dst_addr);
 
-        packet.set_dispatch_field();
-
+        let mut iphc = (DISPATCH_IPHC_HEADER as u16) << 13;
         // The traffic class and flow label are never carried.
-        packet.set_tf_field(0b11);
+        iphc |= 0b11 << 11;
+        if self.next_header == NextHeader::Compressed {
+            iphc |= 1 << 10;
+        }
+        iphc |= match self.hop_limit {
+            1 => 0b01,
+            64 => 0b10,
+            255 => 0b11,
+            _ => 0b00,
+        } << 8;
+        iphc |= (sac as u16) << 6 | (sam as u16) << 4 | (m as u16) << 3 | dam as u16;
+        buf[0..2].copy_from_slice(&iphc.to_be_bytes());
 
-        let idx = packet.set_next_header(self.next_header, idx);
-        let idx = packet.set_hop_limit(self.hop_limit, idx);
-        let idx = packet.set_src_address(self.src_addr, self.ll_src_addr, idx);
-        packet.set_dst_address(self.dst_addr, self.ll_dst_addr, idx);
+        let mut offset = 2;
+        if let NextHeader::Uncompressed(nh) = self.next_header {
+            buf[offset] = nh.into();
+            offset += 1;
+        }
+        if !matches!(self.hop_limit, 1 | 64 | 255) {
+            buf[offset] = self.hop_limit;
+            offset += 1;
+        }
+        buf[offset..offset + src_len].copy_from_slice(&src_inline[..src_len]);
+        offset += src_len;
+        buf[offset..offset + dst_len].copy_from_slice(&dst_inline[..dst_len]);
     }
 }
 
@@ -798,72 +424,96 @@ impl Repr {
 mod test {
     use super::*;
 
+    const SRC_LL: LlAddress = LlAddress::Extended([0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
+    const DST_LL: LlAddress = LlAddress::Extended([0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+
+    /// Fully elided addresses resolve against the link-layer addresses.
     #[test]
-    fn iphc_fields() {
-        let mut bytes = [
-            0x7a, 0x33, // IPHC
-            0x3a, // Next header
+    fn parse_elided() {
+        let bytes = [
+            0x7a, 0x33, // IPHC: TF elided, NH inline, hop limit 64, both addresses elided
+            0x3a, // next header
         ];
+        let (repr, len) = Repr::parse(&bytes, Some(SRC_LL), Some(DST_LL), &[]).unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(repr.next_header, NextHeader::Uncompressed(IpProtocol::Icmpv6));
+        assert_eq!(repr.hop_limit, 64);
+        assert_eq!(repr.src_addr, SRC_LL.as_link_local_address().unwrap());
+        assert_eq!(repr.dst_addr, DST_LL.as_link_local_address().unwrap());
+        assert_eq!(repr.ecn, None);
+        assert_eq!(repr.dscp, None);
+        assert_eq!(repr.flow_label, None);
 
-        let packet = Packet::new_unchecked(&mut bytes[..]);
+        // Without the link-layer addresses the elided bits cannot be restored.
+        assert!(Repr::parse(&bytes, None, Some(DST_LL), &[]).is_err());
+        assert!(Repr::parse(&bytes, Some(SRC_LL), None, &[]).is_err());
+    }
 
-        assert_eq!(packet.dispatch_field(), 0b011);
-        assert_eq!(packet.tf_field(), 0b11);
-        assert_eq!(packet.nh_field(), 0b0);
-        assert_eq!(packet.hlim_field(), 0b10);
-        assert_eq!(packet.cid_field(), 0b0);
-        assert_eq!(packet.sac_field(), 0b0);
-        assert_eq!(packet.sam_field(), 0b11);
-        assert_eq!(packet.m_field(), 0b0);
-        assert_eq!(packet.dac_field(), 0b0);
-        assert_eq!(packet.dam_field(), 0b11);
-
-        assert_eq!(packet.next_header(), NextHeader::Uncompressed(IpProtocol::Icmpv6));
-
-        assert_eq!(packet.src_address_size(), 0);
-        assert_eq!(packet.dst_address_size(), 0);
-        assert_eq!(packet.hop_limit(), 64);
-
-        assert_eq!(
-            packet.src_addr(),
-            Ok(UnresolvedAddress::WithoutContext(AddressMode::FullyElided))
-        );
-        assert_eq!(
-            packet.dst_addr(),
-            Ok(UnresolvedAddress::WithoutContext(AddressMode::FullyElided))
-        );
-
-        let mut bytes = [
-            0x7e, 0xf7, // IPHC,
-            0x00, // CID
+    /// Context-compressed addresses resolve against the address contexts.
+    #[test]
+    fn parse_context() {
+        let context = AddressContext([0xfd, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]);
+        let bytes = [
+            0x7e, 0xf7, // IPHC: NH compressed, hop limit 64, both addresses elided with context
+            0x00, // context identifier extension: context 0 for both
         ];
+        let (repr, len) = Repr::parse(&bytes, Some(SRC_LL), Some(DST_LL), &[context]).unwrap();
+        assert_eq!(len, 3);
+        assert_eq!(repr.next_header, NextHeader::Compressed);
+        assert_eq!(repr.hop_limit, 64);
 
-        let packet = Packet::new_unchecked(&mut bytes[..]);
+        let expected = |ll: LlAddress| {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&context.0);
+            bytes[8..].copy_from_slice(&ll.as_eui_64().unwrap());
+            ipv6::Address::from_octets(bytes)
+        };
+        assert_eq!(repr.src_addr, expected(SRC_LL));
+        assert_eq!(repr.dst_addr, expected(DST_LL));
 
-        assert_eq!(packet.dispatch_field(), 0b011);
-        assert_eq!(packet.tf_field(), 0b11);
-        assert_eq!(packet.nh_field(), 0b1);
-        assert_eq!(packet.hlim_field(), 0b10);
-        assert_eq!(packet.cid_field(), 0b1);
-        assert_eq!(packet.sac_field(), 0b1);
-        assert_eq!(packet.sam_field(), 0b11);
-        assert_eq!(packet.m_field(), 0b0);
-        assert_eq!(packet.dac_field(), 0b1);
-        assert_eq!(packet.dam_field(), 0b11);
+        // Without the context the addresses cannot be resolved.
+        assert!(Repr::parse(&bytes, Some(SRC_LL), Some(DST_LL), &[]).is_err());
+    }
 
-        assert_eq!(packet.next_header(), NextHeader::Compressed);
-
-        assert_eq!(packet.src_address_size(), 0);
-        assert_eq!(packet.dst_address_size(), 0);
-        assert_eq!(packet.hop_limit(), 64);
-
+    /// A context-compressed address with a 16-bit inline part takes its IID
+    /// from the 0000:00ff:fe00:XXXX mapping (RFC 6282 § 3.1.1, SAM=10).
+    #[test]
+    fn parse_context_16bit() {
+        let context = AddressContext([0xfd, 0, 0, 0, 0, 0, 0, 0]);
+        let bytes = [
+            0x7e, 0x63, // IPHC: NH compressed, hop limit 64, SAC=1 SAM=10, DAM=11
+            0x12, 0x34, // the 16 inline source bits
+        ];
+        let (repr, _) = Repr::parse(&bytes, Some(SRC_LL), Some(DST_LL), &[context]).unwrap();
         assert_eq!(
-            packet.src_addr(),
-            Ok(UnresolvedAddress::WithContext((0, AddressMode::FullyElided)))
+            repr.src_addr,
+            ipv6::Address::new(0xfd00, 0, 0, 0, 0, 0xff, 0xfe00, 0x1234)
         );
+    }
+
+    /// Emitting a header and parsing it back round-trips, even into a buffer
+    /// full of stale bytes: emit writes every byte of the header.
+    #[test]
+    fn emit_parse_roundtrip() {
+        let repr = Repr {
+            src_addr: ipv6::Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1),
+            ll_src_addr: Some(SRC_LL),
+            dst_addr: DST_LL.as_link_local_address().unwrap(),
+            ll_dst_addr: Some(DST_LL),
+            next_header: NextHeader::Uncompressed(IpProtocol::Icmpv6),
+            hop_limit: 17,
+            ecn: None,
+            dscp: None,
+            flow_label: None,
+        };
+        let len = repr.buffer_len();
+        // Base, next header, hop limit, full source address, elided destination.
+        assert_eq!(len, 2 + 1 + 1 + 16);
+        let mut buf = [0xffu8; MAX_HEADER_LEN];
+        repr.emit(&mut buf[..len]);
         assert_eq!(
-            packet.dst_addr(),
-            Ok(UnresolvedAddress::WithContext((0, AddressMode::FullyElided)))
+            Repr::parse(&buf[..len], Some(SRC_LL), Some(DST_LL), &[]),
+            Ok((repr, len))
         );
     }
 }

@@ -12,8 +12,6 @@ use crate::PacketBuf;
 use crate::wire::IgmpPacket;
 #[cfg(feature = "udp")]
 use crate::wire::UdpPacket;
-#[cfg(feature = "medium-ieee802154")]
-use crate::wire::sixlowpan::UnresolvedAddress as SixlowpanUnresolvedAddress;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 use crate::wire::{ArpHardware, ArpPacket, EthernetAddress, Ipv4Address};
 #[cfg(feature = "dns")]
@@ -32,8 +30,9 @@ use crate::wire::{
 };
 #[cfg(feature = "medium-ieee802154")]
 use crate::wire::{
-    Ieee802154Frame, Ieee802154FrameType, SixlowpanExtHeaderId, SixlowpanExtHeaderPacket, SixlowpanFragPacket,
-    SixlowpanIphcPacket, SixlowpanNextHeader, SixlowpanNhcPacket, SixlowpanPacket, SixlowpanUdpNhcPacket,
+    Ieee802154Address, Ieee802154FrameType, Ieee802154Repr, SixlowpanExtHeaderId, SixlowpanExtHeaderRepr,
+    SixlowpanFragRepr, SixlowpanIphcRepr, SixlowpanNextHeader, SixlowpanNhcPacket, SixlowpanPacket,
+    SixlowpanUdpNhcRepr,
 };
 use crate::wire::{IpProtocol, IpVersion};
 #[cfg(all(feature = "ipv6", feature = "multicast"))]
@@ -98,30 +97,28 @@ fn log_layer(buf: &mut [u8], layer: Layer) {
 /// Log the MAC header, then walk the 6LoWPAN headers of the payload.
 #[cfg(feature = "medium-ieee802154")]
 fn log_ieee802154(buf: &mut [u8]) {
-    let mut frame = match Ieee802154Frame::new_checked(buf) {
-        Ok(f) => f,
+    let (repr, header_len) = match Ieee802154Repr::parse(buf) {
+        Ok(x) => x,
         Err(_) => {
             trace!("IEEE802.15.4: malformed");
             return;
         }
     };
-    trace!("{}", frame);
-    if frame.frame_type() != Ieee802154FrameType::Data || frame.security_enabled() {
+    trace!("{}", repr);
+    if repr.frame_type != Ieee802154FrameType::Data || repr.security_enabled {
         return;
     }
-    let Some(payload) = frame.payload_mut() else {
-        return;
-    };
-    log_sixlowpan(payload);
+    log_sixlowpan(&mut buf[header_len..], repr.src_addr, repr.dst_addr);
 }
 
 /// Log a 6LoWPAN packet: the fragment header if there is one, then the
 /// compressed IPv6 header and the compressed headers below it.
 ///
-/// Addresses are logged in their compressed form: resolving them needs the
-/// link-layer addresses and the address contexts, which this does not have.
+/// Elided addresses are resolved against the frame's link-layer addresses.
+/// An address compressed against an address context cannot be resolved here,
+/// and ends the walk.
 #[cfg(feature = "medium-ieee802154")]
-fn log_sixlowpan(buf: &mut [u8]) {
+fn log_sixlowpan(buf: &mut [u8], ll_src: Option<Ieee802154Address>, ll_dst: Option<Ieee802154Address>) {
     let len = buf.len();
     if len == 0 {
         trace!("6LoWPAN: empty");
@@ -129,68 +126,57 @@ fn log_sixlowpan(buf: &mut [u8]) {
     }
     match SixlowpanPacket::dispatch(buf) {
         Ok(SixlowpanPacket::FragmentHeader) => {
-            let (header_len, first) = match SixlowpanFragPacket::new_checked(&mut buf[..]) {
-                Ok(frag) if frag.is_first_fragment() => {
-                    trace!(
-                        "6LoWPAN FRAG1 size={} tag={} payload={}",
-                        frag.datagram_size(),
-                        frag.datagram_tag(),
-                        frag.payload().len()
-                    );
-                    (frag.header_len(), true)
-                }
-                Ok(frag) => {
-                    trace!(
-                        "6LoWPAN FRAGN size={} tag={} offset={} payload={}",
-                        frag.datagram_size(),
-                        frag.datagram_tag(),
-                        frag.datagram_offset() as usize * 8,
-                        frag.payload().len()
-                    );
-                    (frag.header_len(), false)
-                }
+            let frag = match SixlowpanFragRepr::parse(buf) {
+                Ok(f) => f,
                 Err(_) => {
                     trace!("6LoWPAN fragment: malformed");
                     return;
                 }
             };
-            // Only the first fragment carries the headers. The rest are payload bytes,
-            // which mean nothing without the packet they belong to.
-            if first {
-                log_sixlowpan(&mut buf[header_len..]);
+            let header_len = frag.buffer_len();
+            if frag.is_first_fragment() {
+                trace!(
+                    "6LoWPAN FRAG1 size={} tag={} payload={}",
+                    frag.size(),
+                    frag.tag(),
+                    len - header_len
+                );
+                // Only the first fragment carries the headers. The rest are payload bytes,
+                // which mean nothing without the packet they belong to.
+                log_sixlowpan(&mut buf[header_len..], ll_src, ll_dst);
+            } else {
+                trace!(
+                    "6LoWPAN FRAGN size={} tag={} offset={} payload={}",
+                    frag.size(),
+                    frag.tag(),
+                    frag.offset() as usize * 8,
+                    len - header_len
+                );
             }
         }
         Ok(SixlowpanPacket::IphcHeader) => {
-            let (header_len, next_header) = match SixlowpanIphcPacket::new_checked(&mut buf[..]) {
-                Ok(iphc) => {
-                    trace!(
-                        "6LoWPAN IPHC nh={} hlim={} src={:?} dst={:?} src_ctx={:?} dst_ctx={:?} payload={}",
-                        iphc.next_header(),
-                        iphc.hop_limit(),
-                        iphc.src_addr().unwrap_or(SixlowpanUnresolvedAddress::Reserved),
-                        iphc.dst_addr().unwrap_or(SixlowpanUnresolvedAddress::Reserved),
-                        iphc.src_context_id(),
-                        iphc.dst_context_id(),
-                        iphc.payload().len()
-                    );
-                    if let (Some(ecn), Some(dscp)) = (iphc.ecn_field(), iphc.dscp_field()) {
-                        trace!("  traffic class dscp={} ecn={}", dscp, ecn);
-                    }
-                    if let Some(flow_label) = iphc.flow_label_field() {
-                        trace!("  flow label {}", flow_label);
-                    }
-                    (iphc.header_len(), iphc.next_header())
-                }
+            let (iphc, header_len) = match SixlowpanIphcRepr::parse(buf, ll_src, ll_dst, &[]) {
+                Ok(x) => x,
                 Err(_) => {
-                    trace!("6LoWPAN IPHC: malformed");
+                    trace!("6LoWPAN IPHC: malformed, or context-compressed addresses");
                     return;
                 }
             };
-            if header_len > len {
-                trace!("6LoWPAN IPHC: malformed");
-                return;
+            trace!(
+                "6LoWPAN IPHC src={} dst={} nh={} hlim={} payload={}",
+                iphc.src_addr,
+                iphc.dst_addr,
+                iphc.next_header,
+                iphc.hop_limit,
+                len - header_len
+            );
+            if let (Some(ecn), Some(dscp)) = (iphc.ecn, iphc.dscp) {
+                trace!("  traffic class dscp={} ecn={}", dscp, ecn);
             }
-            log_sixlowpan_next_header(next_header, &mut buf[header_len..]);
+            if let Some(flow_label) = iphc.flow_label {
+                trace!("  flow label {}", flow_label);
+            }
+            log_sixlowpan_next_header(iphc.next_header, &mut buf[header_len..]);
         }
         Err(_) => trace!("6LoWPAN: unknown dispatch={:#04x} len={}", buf[0], len),
     }
@@ -217,77 +203,71 @@ fn log_sixlowpan_nhc(buf: &mut [u8]) {
     }
     match SixlowpanNhcPacket::dispatch(buf) {
         Ok(SixlowpanNhcPacket::ExtHeader) => {
-            let (total_len, next_header) = match SixlowpanExtHeaderPacket::new_checked(&mut buf[..]) {
-                Ok(ext) => {
-                    let id = ext.extension_header_id();
-                    let next_header = ext.next_header();
-                    let total_len = ext.header_len() + ext.length() as usize;
-                    if total_len > len {
-                        trace!("6LoWPAN NHC ext header: malformed");
-                        return;
-                    }
-                    trace!(
-                        "6LoWPAN NHC ext header id={:?} next={} len={}",
-                        id,
-                        next_header,
-                        ext.length()
-                    );
-                    // Only these two carry TLV options, the others carry header-specific fields.
-                    if matches!(
-                        id,
-                        SixlowpanExtHeaderId::HopByHopHeader | SixlowpanExtHeaderId::DestinationOptionsHeader
-                    ) {
-                        for opt in Ipv6OptionsIter::new(ext.payload()) {
-                            match opt {
-                                Ok((_, ty, data)) => trace!("  option type={} len={}", ty, data.len()),
-                                Err(_) => {
-                                    trace!("  option: malformed");
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    (total_len, next_header)
-                }
+            let (ext, header_len) = match SixlowpanExtHeaderRepr::parse(buf) {
+                Ok(x) => x,
                 Err(_) => {
                     trace!("6LoWPAN NHC ext header: malformed");
                     return;
                 }
             };
-            log_sixlowpan_next_header(next_header, &mut buf[total_len..]);
+            let total_len = header_len + ext.length as usize;
+            if total_len > len {
+                trace!("6LoWPAN NHC ext header: malformed");
+                return;
+            }
+            trace!(
+                "6LoWPAN NHC ext header id={:?} next={} len={}",
+                ext.ext_header_id, ext.next_header, ext.length
+            );
+            // Only these two carry TLV options, the others carry header-specific fields.
+            if matches!(
+                ext.ext_header_id,
+                SixlowpanExtHeaderId::HopByHopHeader | SixlowpanExtHeaderId::DestinationOptionsHeader
+            ) {
+                for opt in Ipv6OptionsIter::new(&buf[header_len..total_len]) {
+                    match opt {
+                        Ok((_, ty, data)) => trace!("  option type={} len={}", ty, data.len()),
+                        Err(_) => {
+                            trace!("  option: malformed");
+                            break;
+                        }
+                    }
+                }
+            }
+            log_sixlowpan_next_header(ext.next_header, &mut buf[total_len..]);
         }
         Ok(SixlowpanNhcPacket::UdpHeader) => {
-            let (header_len, src_port, dst_port) = match SixlowpanUdpNhcPacket::new_checked(&mut buf[..]) {
-                Ok(udp) => {
-                    let (src_port, dst_port) = (udp.src_port(), udp.dst_port());
-                    match udp.checksum() {
-                        Some(checksum) => trace!(
-                            "6LoWPAN NHC UDP src={} dst={} checksum={:#06x} payload={}",
-                            src_port,
-                            dst_port,
-                            checksum,
-                            udp.payload().len()
-                        ),
-                        None => trace!(
-                            "6LoWPAN NHC UDP src={} dst={} checksum=elided payload={}",
-                            src_port,
-                            dst_port,
-                            udp.payload().len()
-                        ),
-                    }
-                    (udp.header_len(), src_port, dst_port)
-                }
+            let (udp, header_len) = match SixlowpanUdpNhcRepr::parse(buf) {
+                Ok(x) => x,
                 Err(_) => {
                     trace!("6LoWPAN NHC UDP: malformed");
                     return;
                 }
             };
+            match udp.checksum {
+                Some(checksum) => trace!(
+                    "6LoWPAN NHC UDP src={} dst={} checksum={:#06x} payload={}",
+                    udp.src_port,
+                    udp.dst_port,
+                    checksum,
+                    len - header_len
+                ),
+                None => trace!(
+                    "6LoWPAN NHC UDP src={} dst={} checksum=elided payload={}",
+                    udp.src_port,
+                    udp.dst_port,
+                    len - header_len
+                ),
+            }
             #[cfg(feature = "dns")]
-            if [src_port, dst_port].iter().any(|&port| port == 53 || port == 5353) {
+            if [udp.src_port, udp.dst_port]
+                .iter()
+                .any(|&port| port == 53 || port == 5353)
+            {
                 log_dns(&mut buf[header_len..]);
             }
             #[cfg(not(feature = "dns"))]
-            let _ = (header_len, src_port, dst_port);
+            let _ = header_len;
         }
         Err(_) => trace!("6LoWPAN NHC: unknown dispatch={:#04x} len={}", buf[0], len),
     }

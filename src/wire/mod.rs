@@ -30,6 +30,15 @@ mod field {
     pub type Rest = ::core::ops::RangeFrom<usize>;
 }
 
+/// Read `n` bytes at `*offset` and advance it. For parsers of headers whose
+/// layout depends on their own fields.
+#[cfg(feature = "medium-ieee802154")]
+pub(crate) fn take<'a>(buf: &'a [u8], offset: &mut usize, n: usize) -> Result<&'a [u8]> {
+    let bytes = buf.get(*offset..*offset + n).ok_or(Error)?;
+    *offset += n;
+    Ok(bytes)
+}
+
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 mod arp;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
@@ -164,8 +173,7 @@ pub use self::ndiscoption::{NdiscOption, PrefixInfoFlags as NdiscPrefixInfoFlags
 
 #[cfg(feature = "medium-ieee802154")]
 pub use self::ieee802154::{
-    Address as Ieee802154Address, AddressingMode as Ieee802154AddressingMode, Frame as Ieee802154Frame,
-    FrameType as Ieee802154FrameType, FrameVersion as Ieee802154FrameVersion,
+    Address as Ieee802154Address, FrameType as Ieee802154FrameType, FrameVersion as Ieee802154FrameVersion,
     MAX_HEADER_LEN as IEEE802154_MAX_HEADER_LEN, Pan as Ieee802154Pan, Repr as Ieee802154Repr,
 };
 
@@ -174,14 +182,12 @@ pub use self::sixlowpan::{
     AddressContext as SixlowpanAddressContext, NextHeader as SixlowpanNextHeader, SixlowpanPacket,
     frag::{
         FIRST_FRAGMENT_HEADER_SIZE as SIXLOWPAN_FIRST_FRAGMENT_HEADER_SIZE, Key as SixlowpanFragKey,
-        NEXT_FRAGMENT_HEADER_SIZE as SIXLOWPAN_NEXT_FRAGMENT_HEADER_SIZE, Packet as SixlowpanFragPacket,
-        Repr as SixlowpanFragRepr,
+        NEXT_FRAGMENT_HEADER_SIZE as SIXLOWPAN_NEXT_FRAGMENT_HEADER_SIZE, Repr as SixlowpanFragRepr,
     },
-    iphc::{MAX_HEADER_LEN as SIXLOWPAN_IPHC_MAX_HEADER_LEN, Packet as SixlowpanIphcPacket, Repr as SixlowpanIphcRepr},
+    iphc::{MAX_HEADER_LEN as SIXLOWPAN_IPHC_MAX_HEADER_LEN, Repr as SixlowpanIphcRepr},
     nhc::{
-        ExtHeaderId as SixlowpanExtHeaderId, ExtHeaderPacket as SixlowpanExtHeaderPacket,
-        ExtHeaderRepr as SixlowpanExtHeaderRepr, NhcPacket as SixlowpanNhcPacket,
-        UdpNhcPacket as SixlowpanUdpNhcPacket, UdpNhcRepr as SixlowpanUdpNhcRepr,
+        ExtHeaderId as SixlowpanExtHeaderId, ExtHeaderRepr as SixlowpanExtHeaderRepr, NhcPacket as SixlowpanNhcPacket,
+        UdpNhcRepr as SixlowpanUdpNhcRepr,
     },
 };
 

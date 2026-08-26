@@ -2,9 +2,7 @@
 
 use core::fmt;
 
-use byteorder::{ByteOrder, LittleEndian};
-
-use super::{Error, Result};
+use super::{Error, Result, take};
 use crate::wire::Ipv6Address;
 
 open_enum! {
@@ -29,19 +27,6 @@ open_enum! {
     }
 }
 
-impl AddressingMode {
-    /// Return the size in octets of the address.
-    const fn size(&self) -> usize {
-        match *self {
-            AddressingMode::Absent => 0,
-            AddressingMode::Short => 2,
-            AddressingMode::Extended => 8,
-            // `Frame::new_checked` rejects unknown modes before any accessor runs.
-            _ => 0,
-        }
-    }
-}
-
 /// An IEEE 802.15.4 PAN identifier.
 #[derive(Debug, Hash, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 pub struct Pan(pub u16);
@@ -52,9 +37,7 @@ impl Pan {
 
     /// The PAN identifier as bytes, in little-endian.
     pub fn as_bytes(&self) -> [u8; 2] {
-        let mut pan = [0u8; 2];
-        LittleEndian::write_u16(&mut pan, self.0);
-        pan
+        self.0.to_le_bytes()
     }
 }
 
@@ -123,14 +106,6 @@ impl Address {
     /// Query whether this address is the broadcast address.
     pub fn is_broadcast(&self) -> bool {
         *self == Self::BROADCAST
-    }
-
-    const fn short_from_bytes(a: [u8; 2]) -> Self {
-        Self::Short(a)
-    }
-
-    const fn extended_from_bytes(a: [u8; 8]) -> Self {
-        Self::Extended(a)
     }
 
     /// Construct an address from its bytes: 2 for a short address, 8 for an
@@ -214,687 +189,16 @@ open_enum! {
     }
 }
 
-/// A read/write wrapper around an IEEE 802.15.4 frame buffer.
-#[derive(Debug)]
-pub struct Frame<'a> {
-    buffer: &'a mut [u8],
-}
-
-mod field {
-    use crate::wire::field::*;
-
-    pub const FRAMECONTROL: Field = 0..2;
-    pub const SEQUENCE_NUMBER: usize = 2;
-    pub const ADDRESSING: Rest = 3..;
-}
-
-/// The largest MAC header: frame control, sequence number, destination PAN,
-/// and two extended addresses.
+/// The largest MAC header this crate emits: frame control, sequence number,
+/// destination PAN, and two extended addresses.
 pub const MAX_HEADER_LEN: usize = 3 + 2 + 8 + 8;
-
-macro_rules! fc_bit_field {
-    ($field:ident, $bit:literal) => {
-        #[inline]
-        pub fn $field(&self) -> bool {
-            let raw = LittleEndian::read_u16(&self.buffer[field::FRAMECONTROL]);
-
-            ((raw >> $bit) & 0b1) == 0b1
-        }
-    };
-}
-
-macro_rules! set_fc_bit_field {
-    ($field:ident, $bit:literal) => {
-        #[inline]
-        pub fn $field(&mut self, val: bool) {
-            let data = &mut self.buffer[field::FRAMECONTROL];
-            let mut raw = LittleEndian::read_u16(data);
-            raw = (raw & !(1 << $bit)) | ((val as u16) << $bit);
-
-            data.copy_from_slice(&raw.to_le_bytes());
-        }
-    };
-}
-
-impl<'a> Frame<'a> {
-    /// Imbue a raw octet buffer with IEEE 802.15.4 frame structure.
-    pub const fn new_unchecked(buffer: &'a mut [u8]) -> Frame<'a> {
-        Frame { buffer }
-    }
-
-    /// Shorthand for a combination of [new_unchecked] and [check_len].
-    ///
-    /// Also rejects frames with an unknown frame version or addressing mode.
-    ///
-    /// [new_unchecked]: #method.new_unchecked
-    /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Frame<'a>> {
-        let packet = Self::new_unchecked(buffer);
-        packet.check_len()?;
-
-        // We don't handle unknown frame versions.
-        if !matches!(
-            packet.frame_version(),
-            FrameVersion::Ieee802154_2003 | FrameVersion::Ieee802154_2006 | FrameVersion::Ieee802154
-        ) {
-            return Err(Error);
-        }
-
-        // We don't handle unknown addressing modes.
-        if !matches!(
-            packet.dst_addressing_mode(),
-            AddressingMode::Absent | AddressingMode::Short | AddressingMode::Extended
-        ) || !matches!(
-            packet.src_addressing_mode(),
-            AddressingMode::Absent | AddressingMode::Short | AddressingMode::Extended
-        ) {
-            return Err(Error);
-        }
-
-        // We don't handle absent addressing mode with PAN ID compression for older frame versions.
-        if matches!(
-            packet.frame_version(),
-            FrameVersion::Ieee802154_2003 | FrameVersion::Ieee802154_2006
-        ) && packet.pan_id_compression()
-            && matches!(packet.dst_addressing_mode(), AddressingMode::Absent)
-            && matches!(packet.src_addressing_mode(), AddressingMode::Absent)
-        {
-            return Err(Error);
-        }
-
-        Ok(packet)
-    }
-
-    /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short, or longer than 127 bytes.
-    pub fn check_len(&self) -> Result<()> {
-        // We need at least 3 bytes
-        if self.buffer.len() < 3 {
-            return Err(Error);
-        }
-
-        // We don't handle frames with a payload larger than 127 bytes.
-        if self.buffer.len() > 127 {
-            return Err(Error);
-        }
-
-        let mut offset = field::ADDRESSING.start
-            + if let Some((dst_pan_id, dst_addr, src_pan_id, src_addr)) = self.addr_present_flags() {
-                let mut offset = if dst_pan_id { 2 } else { 0 };
-                offset += dst_addr.size();
-                offset += if src_pan_id { 2 } else { 0 };
-                offset += src_addr.size();
-
-                if offset > self.buffer.len() {
-                    return Err(Error);
-                }
-                offset
-            } else {
-                0
-            };
-
-        if self.security_enabled() {
-            // First check that we can access the security header control bits.
-            if offset + 1 > self.buffer.len() {
-                return Err(Error);
-            }
-
-            offset += self.security_header_len();
-        }
-
-        if offset > self.buffer.len() {
-            return Err(Error);
-        }
-
-        Ok(())
-    }
-
-    /// Return the FrameType field.
-    #[inline]
-    pub fn frame_type(&self) -> FrameType {
-        let raw = LittleEndian::read_u16(&self.buffer[field::FRAMECONTROL]);
-        let ft = (raw & 0b111) as u8;
-        FrameType::from(ft)
-    }
-
-    fc_bit_field!(security_enabled, 3);
-    fc_bit_field!(frame_pending, 4);
-    fc_bit_field!(ack_request, 5);
-    fc_bit_field!(pan_id_compression, 6);
-
-    fc_bit_field!(sequence_number_suppression, 8);
-    fc_bit_field!(ie_present, 9);
-
-    /// Return the destination addressing mode.
-    #[inline]
-    pub fn dst_addressing_mode(&self) -> AddressingMode {
-        let raw = LittleEndian::read_u16(&self.buffer[field::FRAMECONTROL]);
-        let am = ((raw >> 10) & 0b11) as u8;
-        AddressingMode::from(am)
-    }
-
-    /// Return the frame version.
-    #[inline]
-    pub fn frame_version(&self) -> FrameVersion {
-        let raw = LittleEndian::read_u16(&self.buffer[field::FRAMECONTROL]);
-        let fv = ((raw >> 12) & 0b11) as u8;
-        FrameVersion::from(fv)
-    }
-
-    /// Return the source addressing mode.
-    #[inline]
-    pub fn src_addressing_mode(&self) -> AddressingMode {
-        let raw = LittleEndian::read_u16(&self.buffer[field::FRAMECONTROL]);
-        let am = ((raw >> 14) & 0b11) as u8;
-        AddressingMode::from(am)
-    }
-
-    /// Return the sequence number of the frame.
-    #[inline]
-    pub fn sequence_number(&self) -> Option<u8> {
-        match self.frame_type() {
-            FrameType::Beacon
-            | FrameType::Data
-            | FrameType::Acknowledgement
-            | FrameType::MacCommand
-            | FrameType::Multipurpose => {
-                let raw = self.buffer[field::SEQUENCE_NUMBER];
-                Some(raw)
-            }
-            _ => None,
-        }
-    }
-
-    /// Return the addressing fields.
-    #[inline]
-    fn addressing_fields(&self) -> Option<&[u8]> {
-        match self.frame_type() {
-            FrameType::Beacon | FrameType::Data | FrameType::MacCommand | FrameType::Multipurpose => (),
-            FrameType::Acknowledgement if self.frame_version() == FrameVersion::Ieee802154 => (),
-            _ => return None,
-        }
-
-        if let Some((dst_pan_id, dst_addr, src_pan_id, src_addr)) = self.addr_present_flags() {
-            let mut offset = if dst_pan_id { 2 } else { 0 };
-            offset += dst_addr.size();
-            offset += if src_pan_id { 2 } else { 0 };
-            offset += src_addr.size();
-
-            Some(&self.buffer[field::ADDRESSING][..offset])
-        } else {
-            None
-        }
-    }
-
-    fn addr_present_flags(&self) -> Option<(bool, AddressingMode, bool, AddressingMode)> {
-        let dst_addr_mode = self.dst_addressing_mode();
-        let src_addr_mode = self.src_addressing_mode();
-        let pan_id_compression = self.pan_id_compression();
-
-        const ABSENT: AddressingMode = AddressingMode::Absent;
-        const SHORT: AddressingMode = AddressingMode::Short;
-        const EXTENDED: AddressingMode = AddressingMode::Extended;
-        match self.frame_version() {
-            FrameVersion::Ieee802154_2003 | FrameVersion::Ieee802154_2006 => match (dst_addr_mode, src_addr_mode) {
-                (ABSENT, src) => Some((false, ABSENT, true, src)),
-                (dst, ABSENT) => Some((true, dst, false, ABSENT)),
-
-                (dst, src) if pan_id_compression => Some((true, dst, false, src)),
-                (dst, src) if !pan_id_compression => Some((true, dst, true, src)),
-                _ => None,
-            },
-            FrameVersion::Ieee802154 => Some(match (dst_addr_mode, src_addr_mode, pan_id_compression) {
-                (ABSENT, ABSENT, false) => (false, ABSENT, false, ABSENT),
-                (ABSENT, ABSENT, true) => (true, ABSENT, false, ABSENT),
-                (dst, ABSENT, false) if dst != ABSENT => (true, dst, false, ABSENT),
-                (dst, ABSENT, true) if dst != ABSENT => (false, dst, false, ABSENT),
-                (ABSENT, src, false) if src != ABSENT => (false, ABSENT, true, src),
-                (ABSENT, src, true) if src != ABSENT => (false, ABSENT, true, src),
-                (EXTENDED, EXTENDED, false) => (true, EXTENDED, false, EXTENDED),
-                (EXTENDED, EXTENDED, true) => (false, EXTENDED, false, EXTENDED),
-                (SHORT, SHORT, false) => (true, SHORT, true, SHORT),
-                (SHORT, EXTENDED, false) => (true, SHORT, true, EXTENDED),
-                (EXTENDED, SHORT, false) => (true, EXTENDED, true, SHORT),
-                (SHORT, EXTENDED, true) => (true, SHORT, false, EXTENDED),
-                (EXTENDED, SHORT, true) => (true, EXTENDED, false, SHORT),
-                (SHORT, SHORT, true) => (true, SHORT, false, SHORT),
-                _ => return None,
-            }),
-            _ => None,
-        }
-    }
-
-    /// Return the destination PAN field.
-    #[inline]
-    pub fn dst_pan_id(&self) -> Option<Pan> {
-        if let Some((true, _, _, _)) = self.addr_present_flags() {
-            let addressing_fields = self.addressing_fields()?;
-            Some(Pan(LittleEndian::read_u16(&addressing_fields[..2])))
-        } else {
-            None
-        }
-    }
-
-    /// Return the destination address field.
-    #[inline]
-    pub fn dst_addr(&self) -> Option<Address> {
-        if let Some((dst_pan_id, dst_addr, _, _)) = self.addr_present_flags() {
-            let addressing_fields = self.addressing_fields()?;
-            let offset = if dst_pan_id { 2 } else { 0 };
-
-            match dst_addr {
-                AddressingMode::Absent => Some(Address::Absent),
-                AddressingMode::Short => {
-                    let mut raw = [0u8; 2];
-                    raw.clone_from_slice(&addressing_fields[offset..offset + 2]);
-                    raw.reverse();
-                    Some(Address::short_from_bytes(raw))
-                }
-                AddressingMode::Extended => {
-                    let mut raw = [0u8; 8];
-                    raw.clone_from_slice(&addressing_fields[offset..offset + 8]);
-                    raw.reverse();
-                    Some(Address::extended_from_bytes(raw))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Return the source PAN field.
-    #[inline]
-    pub fn src_pan_id(&self) -> Option<Pan> {
-        if let Some((dst_pan_id, dst_addr, true, _)) = self.addr_present_flags() {
-            let mut offset = if dst_pan_id { 2 } else { 0 };
-            offset += dst_addr.size();
-            let addressing_fields = self.addressing_fields()?;
-            Some(Pan(LittleEndian::read_u16(&addressing_fields[offset..][..2])))
-        } else {
-            None
-        }
-    }
-
-    /// Return the source address field.
-    #[inline]
-    pub fn src_addr(&self) -> Option<Address> {
-        if let Some((dst_pan_id, dst_addr, src_pan_id, src_addr)) = self.addr_present_flags() {
-            let addressing_fields = self.addressing_fields()?;
-            let mut offset = if dst_pan_id { 2 } else { 0 };
-            offset += dst_addr.size();
-            offset += if src_pan_id { 2 } else { 0 };
-
-            match src_addr {
-                AddressingMode::Absent => Some(Address::Absent),
-                AddressingMode::Short => {
-                    let mut raw = [0u8; 2];
-                    raw.clone_from_slice(&addressing_fields[offset..offset + 2]);
-                    raw.reverse();
-                    Some(Address::short_from_bytes(raw))
-                }
-                AddressingMode::Extended => {
-                    let mut raw = [0u8; 8];
-                    raw.clone_from_slice(&addressing_fields[offset..offset + 8]);
-                    raw.reverse();
-                    Some(Address::extended_from_bytes(raw))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        }
-    }
-
-    /// Return the index where the auxiliary security header starts.
-    fn aux_security_header_start(&self) -> usize {
-        // We start with 3, because 2 bytes for frame control and the sequence number.
-        let mut index = 3;
-        index += if let Some(addrs) = self.addressing_fields() {
-            addrs.len()
-        } else {
-            0
-        };
-        index
-    }
-
-    /// Return the size of the security header.
-    fn security_header_len(&self) -> usize {
-        let mut size = 1;
-        size += if self.frame_counter_suppressed() { 0 } else { 4 };
-        size += if let Some(len) = self.key_identifier_length() {
-            len as usize
-        } else {
-            0
-        };
-        size
-    }
-
-    /// Return the index where the payload starts.
-    fn payload_start(&self) -> usize {
-        let mut index = self.aux_security_header_start();
-
-        if self.security_enabled() {
-            index += self.security_header_len();
-        }
-
-        index
-    }
-
-    /// Return the length of the key identifier field.
-    fn key_identifier_length(&self) -> Option<u8> {
-        Some(match self.key_identifier_mode() {
-            0 => 0,
-            1 => 1,
-            2 => 5,
-            3 => 9,
-            _ => return None,
-        })
-    }
-
-    /// Return the security level of the auxiliary security header.
-    pub fn security_level(&self) -> u8 {
-        let index = self.aux_security_header_start();
-        let b = self.buffer[index..][0];
-        b & 0b111
-    }
-
-    /// Return the key identifier mode used by the auxiliary security header.
-    pub fn key_identifier_mode(&self) -> u8 {
-        let index = self.aux_security_header_start();
-        let b = self.buffer[index..][0];
-        (b >> 3) & 0b11
-    }
-
-    /// Return `true` when the frame counter in the security header is suppressed.
-    pub fn frame_counter_suppressed(&self) -> bool {
-        let index = self.aux_security_header_start();
-        let b = self.buffer[index..][0];
-        ((b >> 5) & 0b1) == 0b1
-    }
-
-    /// Return the frame counter field.
-    pub fn frame_counter(&self) -> Option<u32> {
-        if self.frame_counter_suppressed() {
-            None
-        } else {
-            let index = self.aux_security_header_start();
-            let b = &self.buffer[index..];
-            Some(LittleEndian::read_u32(&b[1..1 + 4]))
-        }
-    }
-
-    /// Return the Key Identifier field.
-    fn key_identifier(&self) -> &[u8] {
-        let index = self.aux_security_header_start();
-        let b = &self.buffer[index..];
-        let length = if let Some(len) = self.key_identifier_length() {
-            len as usize
-        } else {
-            0
-        };
-        &b[5..][..length]
-    }
-
-    /// Return the Key Source field.
-    pub fn key_source(&self) -> Option<&[u8]> {
-        let ki = self.key_identifier();
-        let len = ki.len();
-        if len > 1 { Some(&ki[..len - 1]) } else { None }
-    }
-
-    /// Return the Key Index field.
-    pub fn key_index(&self) -> Option<u8> {
-        let ki = self.key_identifier();
-        let len = ki.len();
-
-        if len > 0 { Some(ki[len - 1]) } else { None }
-    }
-
-    /// Return the Message Integrity Code (MIC).
-    pub fn message_integrity_code(&self) -> Option<&[u8]> {
-        let mic_len = match self.security_level() {
-            0 | 4 => return None,
-            1 | 5 => 4,
-            2 | 6 => 8,
-            3 | 7 => 16,
-            _ => panic!(),
-        };
-
-        let len = self.buffer.len();
-
-        Some(&self.buffer[len - mic_len..])
-    }
-
-    /// Return the MAC header.
-    pub fn mac_header(&self) -> &[u8] {
-        &self.buffer[..self.payload_start()]
-    }
-
-    /// Return the length of the MAC header.
-    pub fn header_len(&self) -> usize {
-        self.payload_start()
-    }
-
-    /// Return a pointer to the payload. `None` unless this is a data frame.
-    #[inline]
-    pub fn payload(&self) -> Option<&[u8]> {
-        match self.frame_type() {
-            FrameType::Data => {
-                let index = self.payload_start();
-                Some(&self.buffer[index..])
-            }
-            _ => None,
-        }
-    }
-
-    /// Set the frame type.
-    #[inline]
-    pub fn set_frame_type(&mut self, frame_type: FrameType) {
-        let data = &mut self.buffer[field::FRAMECONTROL];
-        let mut raw = LittleEndian::read_u16(data);
-
-        raw = (raw & !(0b111)) | (u8::from(frame_type) as u16 & 0b111);
-        data.copy_from_slice(&raw.to_le_bytes());
-    }
-
-    set_fc_bit_field!(set_security_enabled, 3);
-    set_fc_bit_field!(set_frame_pending, 4);
-    set_fc_bit_field!(set_ack_request, 5);
-    set_fc_bit_field!(set_pan_id_compression, 6);
-
-    /// Set the frame version.
-    #[inline]
-    pub fn set_frame_version(&mut self, version: FrameVersion) {
-        let data = &mut self.buffer[field::FRAMECONTROL];
-        let mut raw = LittleEndian::read_u16(data);
-
-        raw = (raw & !(0b11 << 12)) | ((u8::from(version) as u16 & 0b11) << 12);
-        data.copy_from_slice(&raw.to_le_bytes());
-    }
-
-    /// Set the frame sequence number.
-    #[inline]
-    pub fn set_sequence_number(&mut self, value: u8) {
-        self.buffer[field::SEQUENCE_NUMBER] = value;
-    }
-
-    /// Set the destination PAN ID.
-    ///
-    /// The destination addressing mode is set to `Extended`, since the field
-    /// only exists when a destination address is present. Set the address after.
-    #[inline]
-    pub fn set_dst_pan_id(&mut self, value: Pan) {
-        // NOTE the destination addressing mode must be different than Absent.
-        // This is the reason why we set it to Extended.
-        self.set_dst_addressing_mode(AddressingMode::Extended);
-
-        self.buffer[field::ADDRESSING][..2].copy_from_slice(&value.as_bytes());
-    }
-
-    /// Set the destination address.
-    #[inline]
-    pub fn set_dst_addr(&mut self, value: Address) {
-        match value {
-            Address::Absent => self.set_dst_addressing_mode(AddressingMode::Absent),
-            Address::Short(mut value) => {
-                value.reverse();
-                self.set_dst_addressing_mode(AddressingMode::Short);
-                self.buffer[field::ADDRESSING][2..2 + 2].copy_from_slice(&value);
-            }
-            Address::Extended(mut value) => {
-                value.reverse();
-                self.set_dst_addressing_mode(AddressingMode::Extended);
-                let data = &mut self.buffer[field::ADDRESSING];
-                data[2..2 + 8].copy_from_slice(&value);
-            }
-        }
-    }
-
-    /// Set the destination addressing mode.
-    #[inline]
-    fn set_dst_addressing_mode(&mut self, value: AddressingMode) {
-        let data = &mut self.buffer[field::FRAMECONTROL];
-        let mut raw = LittleEndian::read_u16(data);
-
-        raw = (raw & !(0b11 << 10)) | ((u8::from(value) as u16 & 0b11) << 10);
-        data.copy_from_slice(&raw.to_le_bytes());
-    }
-
-    /// Set the source PAN ID.
-    #[inline]
-    pub fn set_src_pan_id(&mut self, value: Pan) {
-        let offset = match self.dst_addressing_mode() {
-            AddressingMode::Absent => 0,
-            AddressingMode::Short => 2,
-            AddressingMode::Extended => 8,
-            _ => unreachable!(),
-        } + 2;
-
-        let data = &mut self.buffer[field::ADDRESSING];
-        data[offset..offset + 2].copy_from_slice(&value.as_bytes());
-    }
-
-    /// Set the source address.
-    #[inline]
-    pub fn set_src_addr(&mut self, value: Address) {
-        let offset = match self.dst_addressing_mode() {
-            AddressingMode::Absent => 0,
-            AddressingMode::Short => 2,
-            AddressingMode::Extended => 8,
-            _ => unreachable!(),
-        } + 2;
-
-        let offset = offset + if self.pan_id_compression() { 0 } else { 2 };
-
-        match value {
-            Address::Absent => self.set_src_addressing_mode(AddressingMode::Absent),
-            Address::Short(mut value) => {
-                value.reverse();
-                self.set_src_addressing_mode(AddressingMode::Short);
-                let data = &mut self.buffer[field::ADDRESSING];
-                data[offset..offset + 2].copy_from_slice(&value);
-            }
-            Address::Extended(mut value) => {
-                value.reverse();
-                self.set_src_addressing_mode(AddressingMode::Extended);
-                let data = &mut self.buffer[field::ADDRESSING];
-                data[offset..offset + 8].copy_from_slice(&value);
-            }
-        }
-    }
-
-    /// Set the source addressing mode.
-    #[inline]
-    fn set_src_addressing_mode(&mut self, value: AddressingMode) {
-        let data = &mut self.buffer[field::FRAMECONTROL];
-        let mut raw = LittleEndian::read_u16(data);
-
-        raw = (raw & !(0b11 << 14)) | ((u8::from(value) as u16 & 0b11) << 14);
-        data.copy_from_slice(&raw.to_le_bytes());
-    }
-
-    /// Return a mutable pointer to the payload. `None` unless this is a data frame.
-    #[inline]
-    pub fn payload_mut(&mut self) -> Option<&mut [u8]> {
-        match self.frame_type() {
-            FrameType::Data => {
-                let index = self.payload_start();
-                Some(&mut self.buffer[index..])
-            }
-            _ => None,
-        }
-    }
-}
-
-impl<'a> AsRef<[u8]> for Frame<'a> {
-    fn as_ref(&self) -> &[u8] {
-        self.buffer
-    }
-}
-
-impl<'a> fmt::Display for Frame<'a> {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "IEEE802.15.4 frame type={}", self.frame_type())?;
-
-        if let Some(seq) = self.sequence_number() {
-            write!(f, " seq={:02x}", seq)?;
-        }
-
-        if let Some(pan) = self.dst_pan_id() {
-            write!(f, " dst-pan={}", pan)?;
-        }
-
-        if let Some(pan) = self.src_pan_id() {
-            write!(f, " src-pan={}", pan)?;
-        }
-
-        if let Some(addr) = self.dst_addr() {
-            write!(f, " dst={}", addr)?;
-        }
-
-        if let Some(addr) = self.src_addr() {
-            write!(f, " src={}", addr)?;
-        }
-
-        Ok(())
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl<'a> defmt::Format for Frame<'a> {
-    fn format(&self, f: defmt::Formatter) {
-        defmt::write!(f, "IEEE802.15.4 frame type={}", self.frame_type());
-
-        if let Some(seq) = self.sequence_number() {
-            defmt::write!(f, " seq={:02x}", seq);
-        }
-
-        if let Some(pan) = self.dst_pan_id() {
-            defmt::write!(f, " dst-pan={}", pan);
-        }
-
-        if let Some(pan) = self.src_pan_id() {
-            defmt::write!(f, " src-pan={}", pan);
-        }
-
-        if let Some(addr) = self.dst_addr() {
-            defmt::write!(f, " dst={}", addr);
-        }
-
-        if let Some(addr) = self.src_addr() {
-            defmt::write!(f, " src={}", addr);
-        }
-    }
-}
 
 /// The fields of an IEEE 802.15.4 MAC header.
 ///
 /// The layout of the header depends on its own fields (which addresses are
-/// present, whether the PAN identifier is compressed), so it is built from all
-/// of them at once with [`emit`](Self::emit).
+/// present, whether the PAN identifier is compressed), so the header is parsed
+/// and emitted as a whole.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Repr {
     pub frame_type: FrameType,
     pub security_enabled: bool,
@@ -909,29 +213,207 @@ pub struct Repr {
     pub src_addr: Option<Address>,
 }
 
+/// Which addressing fields the frame carries:
+/// (destination PAN, destination address mode, source PAN, source address mode).
+fn addr_present_flags(
+    frame_version: FrameVersion,
+    dst_addr_mode: AddressingMode,
+    src_addr_mode: AddressingMode,
+    pan_id_compression: bool,
+) -> Option<(bool, AddressingMode, bool, AddressingMode)> {
+    const ABSENT: AddressingMode = AddressingMode::Absent;
+    const SHORT: AddressingMode = AddressingMode::Short;
+    const EXTENDED: AddressingMode = AddressingMode::Extended;
+    match frame_version {
+        FrameVersion::Ieee802154_2003 | FrameVersion::Ieee802154_2006 => match (dst_addr_mode, src_addr_mode) {
+            (ABSENT, src) => Some((false, ABSENT, true, src)),
+            (dst, ABSENT) => Some((true, dst, false, ABSENT)),
+
+            (dst, src) if pan_id_compression => Some((true, dst, false, src)),
+            (dst, src) if !pan_id_compression => Some((true, dst, true, src)),
+            _ => None,
+        },
+        FrameVersion::Ieee802154 => Some(match (dst_addr_mode, src_addr_mode, pan_id_compression) {
+            (ABSENT, ABSENT, false) => (false, ABSENT, false, ABSENT),
+            (ABSENT, ABSENT, true) => (true, ABSENT, false, ABSENT),
+            (dst, ABSENT, false) if dst != ABSENT => (true, dst, false, ABSENT),
+            (dst, ABSENT, true) if dst != ABSENT => (false, dst, false, ABSENT),
+            (ABSENT, src, false) if src != ABSENT => (false, ABSENT, true, src),
+            (ABSENT, src, true) if src != ABSENT => (false, ABSENT, true, src),
+            (EXTENDED, EXTENDED, false) => (true, EXTENDED, false, EXTENDED),
+            (EXTENDED, EXTENDED, true) => (false, EXTENDED, false, EXTENDED),
+            (SHORT, SHORT, false) => (true, SHORT, true, SHORT),
+            (SHORT, EXTENDED, false) => (true, SHORT, true, EXTENDED),
+            (EXTENDED, SHORT, false) => (true, EXTENDED, true, SHORT),
+            (SHORT, EXTENDED, true) => (true, SHORT, false, EXTENDED),
+            (EXTENDED, SHORT, true) => (true, EXTENDED, false, SHORT),
+            (SHORT, SHORT, true) => (true, SHORT, false, SHORT),
+            _ => return None,
+        }),
+        _ => None,
+    }
+}
+
+/// Read an address in little-endian byte order.
+fn parse_addr(buf: &[u8], offset: &mut usize, mode: AddressingMode) -> Result<Address> {
+    match mode {
+        AddressingMode::Absent => Ok(Address::Absent),
+        AddressingMode::Short => {
+            let raw = take(buf, offset, 2)?;
+            Ok(Address::Short([raw[1], raw[0]]))
+        }
+        AddressingMode::Extended => {
+            let raw = take(buf, offset, 8)?;
+            let mut bytes: [u8; 8] = raw.try_into().unwrap();
+            bytes.reverse();
+            Ok(Address::Extended(bytes))
+        }
+        _ => Err(Error),
+    }
+}
+
+/// Write an address in little-endian byte order. Returns the length written.
+fn emit_addr(buf: &mut [u8], addr: Option<Address>) -> usize {
+    match addr {
+        None | Some(Address::Absent) => 0,
+        Some(Address::Short(mut bytes)) => {
+            bytes.reverse();
+            buf[..2].copy_from_slice(&bytes);
+            2
+        }
+        Some(Address::Extended(mut bytes)) => {
+            bytes.reverse();
+            buf[..8].copy_from_slice(&bytes);
+            8
+        }
+    }
+}
+
 impl Repr {
     /// Parse the MAC header of a frame.
-    pub fn parse(packet: &Frame<'_>) -> Result<Repr> {
-        // Ensure the basic accessors will work.
-        packet.check_len()?;
+    ///
+    /// Returns the header and its length, the auxiliary security header
+    /// included. The payload starts at that offset.
+    ///
+    /// Errors:
+    /// - `Error` if the buffer is shorter than the header, or longer than 127
+    ///   bytes, or the frame version or an addressing mode is unknown.
+    pub fn parse(buf: &[u8]) -> Result<(Repr, usize)> {
+        // A frame is at most 127 bytes, and starts with the frame control
+        // field and a sequence number.
+        if buf.len() < 3 || buf.len() > 127 {
+            return Err(Error);
+        }
 
-        Ok(Repr {
-            frame_type: packet.frame_type(),
-            security_enabled: packet.security_enabled(),
-            frame_pending: packet.frame_pending(),
-            ack_request: packet.ack_request(),
-            sequence_number: packet.sequence_number(),
-            pan_id_compression: packet.pan_id_compression(),
-            frame_version: packet.frame_version(),
-            dst_pan_id: packet.dst_pan_id(),
-            dst_addr: packet.dst_addr(),
-            src_pan_id: packet.src_pan_id(),
-            src_addr: packet.src_addr(),
-        })
+        let fc = u16::from_le_bytes([buf[0], buf[1]]);
+        let frame_type = FrameType((fc & 0b111) as u8);
+        let security_enabled = fc & (1 << 3) != 0;
+        let frame_pending = fc & (1 << 4) != 0;
+        let ack_request = fc & (1 << 5) != 0;
+        let pan_id_compression = fc & (1 << 6) != 0;
+        let dst_addr_mode = AddressingMode(((fc >> 10) & 0b11) as u8);
+        let frame_version = FrameVersion(((fc >> 12) & 0b11) as u8);
+        let src_addr_mode = AddressingMode(((fc >> 14) & 0b11) as u8);
+
+        // We don't handle unknown frame versions.
+        if !matches!(
+            frame_version,
+            FrameVersion::Ieee802154_2003 | FrameVersion::Ieee802154_2006 | FrameVersion::Ieee802154
+        ) {
+            return Err(Error);
+        }
+
+        // We don't handle unknown addressing modes.
+        for mode in [dst_addr_mode, src_addr_mode] {
+            if !matches!(
+                mode,
+                AddressingMode::Absent | AddressingMode::Short | AddressingMode::Extended
+            ) {
+                return Err(Error);
+            }
+        }
+
+        // We don't handle absent addressing mode with PAN ID compression for older frame versions.
+        if matches!(
+            frame_version,
+            FrameVersion::Ieee802154_2003 | FrameVersion::Ieee802154_2006
+        ) && pan_id_compression
+            && dst_addr_mode == AddressingMode::Absent
+            && src_addr_mode == AddressingMode::Absent
+        {
+            return Err(Error);
+        }
+
+        let sequence_number = match frame_type {
+            FrameType::Beacon
+            | FrameType::Data
+            | FrameType::Acknowledgement
+            | FrameType::MacCommand
+            | FrameType::Multipurpose => Some(buf[2]),
+            _ => None,
+        };
+
+        // Which frame types carry addressing fields.
+        let has_addressing = match frame_type {
+            FrameType::Beacon | FrameType::Data | FrameType::MacCommand | FrameType::Multipurpose => true,
+            FrameType::Acknowledgement => frame_version == FrameVersion::Ieee802154,
+            _ => false,
+        };
+
+        let mut offset = 3;
+        let (mut dst_pan_id, mut dst_addr, mut src_pan_id, mut src_addr) = (None, None, None, None);
+        if has_addressing
+            && let Some((dst_pan, dst_mode, src_pan, src_mode)) =
+                addr_present_flags(frame_version, dst_addr_mode, src_addr_mode, pan_id_compression)
+        {
+            if dst_pan {
+                let raw = take(buf, &mut offset, 2)?;
+                dst_pan_id = Some(Pan(u16::from_le_bytes([raw[0], raw[1]])));
+            }
+            dst_addr = Some(parse_addr(buf, &mut offset, dst_mode)?);
+            if src_pan {
+                let raw = take(buf, &mut offset, 2)?;
+                src_pan_id = Some(Pan(u16::from_le_bytes([raw[0], raw[1]])));
+            }
+            src_addr = Some(parse_addr(buf, &mut offset, src_mode)?);
+        }
+
+        if security_enabled {
+            // The security control byte, then the frame counter and the key
+            // identifier its bits say are there.
+            let b = *buf.get(offset).ok_or(Error)?;
+            let frame_counter_suppressed = (b >> 5) & 0b1 == 0b1;
+            let key_identifier_len = match (b >> 3) & 0b11 {
+                0 => 0,
+                1 => 1,
+                2 => 5,
+                _ => 9,
+            };
+            offset += 1 + if frame_counter_suppressed { 0 } else { 4 } + key_identifier_len;
+            if offset > buf.len() {
+                return Err(Error);
+            }
+        }
+
+        Ok((
+            Repr {
+                frame_type,
+                security_enabled,
+                frame_pending,
+                ack_request,
+                sequence_number,
+                pan_id_compression,
+                frame_version,
+                dst_pan_id,
+                dst_addr,
+                src_pan_id,
+                src_addr,
+            },
+            offset,
+        ))
     }
 
     /// Return the length of the MAC header this will emit.
-    #[inline]
     pub const fn buffer_len(&self) -> usize {
         3 + 2
             + match self.dst_addr {
@@ -947,36 +429,100 @@ impl Repr {
             }
     }
 
-    /// Write the MAC header into a frame.
+    /// Write the MAC header into the front of `buf`.
     ///
-    /// The buffer must be zeroed first, or hold a previously emitted header.
-    pub fn emit(&self, frame: &mut Frame<'_>) {
-        frame.set_frame_type(self.frame_type);
-        frame.set_security_enabled(self.security_enabled);
-        frame.set_frame_pending(self.frame_pending);
-        frame.set_ack_request(self.ack_request);
-        frame.set_pan_id_compression(self.pan_id_compression);
-        frame.set_frame_version(self.frame_version);
+    /// Writes exactly [`buffer_len`](Self::buffer_len) bytes. A missing
+    /// sequence number or PAN identifier is written as zero.
+    ///
+    /// # Panics
+    /// Panics if `buf` is shorter than [`buffer_len`](Self::buffer_len).
+    pub fn emit(&self, buf: &mut [u8]) {
+        let addr_mode = |addr: Option<Address>| match addr {
+            None | Some(Address::Absent) => AddressingMode::Absent,
+            Some(Address::Short(_)) => AddressingMode::Short,
+            Some(Address::Extended(_)) => AddressingMode::Extended,
+        };
+        let fc = (self.frame_type.0 as u16 & 0b111)
+            | (self.security_enabled as u16) << 3
+            | (self.frame_pending as u16) << 4
+            | (self.ack_request as u16) << 5
+            | (self.pan_id_compression as u16) << 6
+            | (addr_mode(self.dst_addr).0 as u16) << 10
+            | (self.frame_version.0 as u16 & 0b11) << 12
+            | (addr_mode(self.src_addr).0 as u16) << 14;
+        buf[0..2].copy_from_slice(&fc.to_le_bytes());
+        buf[2] = self.sequence_number.unwrap_or(0);
 
-        if let Some(sequence_number) = self.sequence_number {
-            frame.set_sequence_number(sequence_number);
+        let dst_pan = match self.dst_pan_id {
+            Some(pan) => pan,
+            None => Pan(0),
+        };
+        buf[3..5].copy_from_slice(&dst_pan.as_bytes());
+        let mut offset = 5;
+        offset += emit_addr(&mut buf[offset..], self.dst_addr);
+        if !self.pan_id_compression {
+            let src_pan = match self.src_pan_id {
+                Some(pan) => pan,
+                None => Pan(0),
+            };
+            buf[offset..offset + 2].copy_from_slice(&src_pan.as_bytes());
+            offset += 2;
+        }
+        emit_addr(&mut buf[offset..], self.src_addr);
+    }
+}
+
+impl fmt::Display for Repr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "IEEE802.15.4 frame type={}", self.frame_type)?;
+
+        if let Some(seq) = self.sequence_number {
+            write!(f, " seq={seq:02x}")?;
         }
 
-        if let Some(dst_pan_id) = self.dst_pan_id {
-            frame.set_dst_pan_id(dst_pan_id);
-        }
-        if let Some(dst_addr) = self.dst_addr {
-            frame.set_dst_addr(dst_addr);
+        if let Some(pan) = self.dst_pan_id {
+            write!(f, " dst-pan={pan}")?;
         }
 
-        if let Some(src_pan_id) = self.src_pan_id
-            && !self.pan_id_compression
-        {
-            frame.set_src_pan_id(src_pan_id);
+        if let Some(pan) = self.src_pan_id {
+            write!(f, " src-pan={pan}")?;
         }
 
-        if let Some(src_addr) = self.src_addr {
-            frame.set_src_addr(src_addr);
+        if let Some(addr) = self.dst_addr {
+            write!(f, " dst={addr}")?;
+        }
+
+        if let Some(addr) = self.src_addr {
+            write!(f, " src={addr}")?;
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "defmt")]
+impl defmt::Format for Repr {
+    fn format(&self, f: defmt::Formatter) {
+        defmt::write!(f, "IEEE802.15.4 frame type={}", self.frame_type);
+
+        if let Some(seq) = self.sequence_number {
+            defmt::write!(f, " seq={:02x}", seq);
+        }
+
+        if let Some(pan) = self.dst_pan_id {
+            defmt::write!(f, " dst-pan={}", pan);
+        }
+
+        if let Some(pan) = self.src_pan_id {
+            defmt::write!(f, " src-pan={}", pan);
+        }
+
+        if let Some(addr) = self.dst_addr {
+            defmt::write!(f, " dst={}", addr);
+        }
+
+        if let Some(addr) = self.src_addr {
+            defmt::write!(f, " src={}", addr);
         }
     }
 }
@@ -991,10 +537,10 @@ mod test {
         assert!(!Address::BROADCAST.is_unicast());
     }
 
+    /// Emitting a header and parsing it back round-trips, even into a buffer
+    /// full of stale bytes: emit writes every byte of the header.
     #[test]
-    fn prepare_frame() {
-        let mut buffer = [0u8; 128];
-
+    fn emit_parse_roundtrip() {
         let repr = Repr {
             frame_type: FrameType::Data,
             security_enabled: false,
@@ -1009,102 +555,85 @@ mod test {
             src_addr: Some(Address::Extended([0xc7, 0xd9, 0xb5, 0x14, 0x00, 0x4b, 0x12, 0x00])),
         };
 
-        let buffer_len = repr.buffer_len();
+        let len = repr.buffer_len();
+        assert_eq!(len, 3 + 2 + 2 + 8);
 
-        let mut frame = Frame::new_unchecked(&mut buffer[..buffer_len]);
-        repr.emit(&mut frame);
+        let mut buffer = [0xffu8; 127];
+        repr.emit(&mut buffer[..len]);
 
-        println!("{frame:2x?}");
-
-        assert_eq!(frame.frame_type(), FrameType::Data);
-        assert!(!frame.security_enabled());
-        assert!(!frame.frame_pending());
-        assert!(frame.ack_request());
-        assert!(frame.pan_id_compression());
-        assert_eq!(frame.frame_version(), FrameVersion::Ieee802154);
-        assert_eq!(frame.sequence_number(), Some(1));
-        assert_eq!(frame.dst_pan_id(), Some(Pan(0xabcd)));
-        assert_eq!(frame.dst_addr(), Some(Address::BROADCAST));
-        assert_eq!(frame.src_pan_id(), None);
-        assert_eq!(
-            frame.src_addr(),
-            Some(Address::Extended([0xc7, 0xd9, 0xb5, 0x14, 0x00, 0x4b, 0x12, 0x00]))
-        );
+        let (parsed, header_len) = Repr::parse(&buffer[..len]).unwrap();
+        assert_eq!(header_len, len);
+        assert_eq!(parsed, repr);
     }
 
-    /// Setting a flag to `false` clears it: the frame control field is not
-    /// only ever ORed into.
     #[test]
-    fn clear_fc_bits() {
-        let mut buffer = [0xffu8; 3];
-        let mut frame = Frame::new_unchecked(&mut buffer[..]);
-        frame.set_ack_request(false);
-        assert!(!frame.ack_request());
-        frame.set_ack_request(true);
-        assert!(frame.ack_request());
-        assert!(frame.security_enabled());
-        frame.set_security_enabled(false);
-        assert!(!frame.security_enabled());
-    }
-
-    macro_rules! vector_test {
-        ($name:ident $bytes:expr ; $($test_method:ident -> $expected:expr,)*) => {
-            #[test]
-            #[allow(clippy::bool_assert_comparison)]
-            fn $name() -> Result<()> {
-                let mut frame = $bytes;
-                let frame = Frame::new_checked(&mut frame[..])?;
-
-                $(
-                    assert_eq!(frame.$test_method(), $expected, stringify!($test_method));
-                )*
-
-                Ok(())
-            }
-        }
-    }
-
-    vector_test! {
-        extended_addr
-        [
-            0b0000_0001, 0b1100_1100, // frame control
-            0b0, // seq
-            0xcd, 0xab, // pan id
-            0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, // dst addr
-            0x03, 0x04, // pan id
-            0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x02, // src addr
+    fn extended_addr() {
+        let frame = [
+            0b0000_0001,
+            0b1100_1100, // frame control
+            0b0,         // seq
+            0xcd,
+            0xab, // pan id
+            0x00,
+            0x01,
+            0x00,
+            0x01,
+            0x00,
+            0x01,
+            0x00,
+            0x01, // dst addr
+            0x03,
+            0x04, // pan id
+            0x00,
+            0x01,
+            0x00,
+            0x01,
+            0x00,
+            0x01,
+            0x00,
+            0x02, // src addr
         ];
-        frame_type -> FrameType::Data,
-        dst_addr -> Some(Address::Extended([0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00])),
-        src_addr -> Some(Address::Extended([0x02, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00])),
-        dst_pan_id -> Some(Pan(0xabcd)),
+        let (repr, header_len) = Repr::parse(&frame).unwrap();
+        assert_eq!(header_len, frame.len());
+        assert_eq!(repr.frame_type, FrameType::Data);
+        assert_eq!(
+            repr.dst_addr,
+            Some(Address::Extended([0x01, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00]))
+        );
+        assert_eq!(
+            repr.src_addr,
+            Some(Address::Extended([0x02, 0x00, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00]))
+        );
+        assert_eq!(repr.dst_pan_id, Some(Pan(0xabcd)));
+        assert_eq!(repr.src_pan_id, Some(Pan(0x0403)));
     }
 
-    vector_test! {
-        short_addr
-        [
-            0x01, 0x98,             // frame control
-            0x00,                   // sequence number
+    #[test]
+    fn short_addr() {
+        let frame = [
+            0x01, 0x98, // frame control
+            0x00, // sequence number
             0x34, 0x12, 0x78, 0x56, // PAN identifier and address of destination
             0x34, 0x12, 0xbc, 0x9a, // PAN identifier and address of source
         ];
-        frame_type -> FrameType::Data,
-        security_enabled -> false,
-        frame_pending -> false,
-        ack_request -> false,
-        pan_id_compression -> false,
-        dst_addressing_mode -> AddressingMode::Short,
-        frame_version -> FrameVersion::Ieee802154_2006,
-        src_addressing_mode -> AddressingMode::Short,
-        dst_pan_id -> Some(Pan(0x1234)),
-        dst_addr -> Some(Address::Short([0x56, 0x78])),
-        src_pan_id -> Some(Pan(0x1234)),
-        src_addr -> Some(Address::Short([0x9a, 0xbc])),
+        let (repr, header_len) = Repr::parse(&frame).unwrap();
+        assert_eq!(header_len, frame.len());
+        assert_eq!(repr.frame_type, FrameType::Data);
+        assert!(!repr.security_enabled);
+        assert!(!repr.frame_pending);
+        assert!(!repr.ack_request);
+        assert!(!repr.pan_id_compression);
+        assert_eq!(repr.frame_version, FrameVersion::Ieee802154_2006);
+        assert_eq!(repr.sequence_number, Some(0));
+        assert_eq!(repr.dst_pan_id, Some(Pan(0x1234)));
+        assert_eq!(repr.dst_addr, Some(Address::Short([0x56, 0x78])));
+        assert_eq!(repr.src_pan_id, Some(Pan(0x1234)));
+        assert_eq!(repr.src_addr, Some(Address::Short([0x9a, 0xbc])));
     }
 
-    vector_test! {
-        zolertia_remote
-        [
+    #[test]
+    fn zolertia_remote() {
+        let frame = [
             0x41, 0xd8, // frame control
             0x01, // sequence number
             0xcd, 0xab, // Destination PAN id
@@ -1112,57 +641,68 @@ mod test {
             0xc7, 0xd9, 0xb5, 0x14, 0x00, 0x4b, 0x12, 0x00, // Extended source address
             0x2b, 0x00, 0x00, 0x00, // payload
         ];
-        frame_type -> FrameType::Data,
-        security_enabled -> false,
-        frame_pending -> false,
-        ack_request -> false,
-        pan_id_compression -> true,
-        dst_addressing_mode -> AddressingMode::Short,
-        frame_version -> FrameVersion::Ieee802154_2006,
-        src_addressing_mode -> AddressingMode::Extended,
-        payload -> Some(&[0x2b, 0x00, 0x00, 0x00][..]),
+        let (repr, header_len) = Repr::parse(&frame).unwrap();
+        assert_eq!(repr.frame_type, FrameType::Data);
+        assert!(!repr.security_enabled);
+        assert!(!repr.frame_pending);
+        assert!(!repr.ack_request);
+        assert!(repr.pan_id_compression);
+        assert_eq!(repr.frame_version, FrameVersion::Ieee802154_2006);
+        assert_eq!(repr.dst_addr, Some(Address::BROADCAST));
+        assert_eq!(&frame[header_len..], &[0x2b, 0x00, 0x00, 0x00]);
     }
 
-    vector_test! {
-        security
-        [
-            0x69,0xdc, // frame control
+    /// A frame with link-layer security: the header length covers the
+    /// auxiliary security header, so the payload starts after it.
+    #[test]
+    fn security() {
+        let frame = [
+            0x69, 0xdc, // frame control
             0x32, // sequence number
-            0xcd,0xab, // destination PAN id
-            0xbf,0x9b,0x15,0x06,0x00,0x4b,0x12,0x00, // extended destination address
-            0xc7,0xd9,0xb5,0x14,0x00,0x4b,0x12,0x00, // extended source address
+            0xcd, 0xab, // destination PAN id
+            0xbf, 0x9b, 0x15, 0x06, 0x00, 0x4b, 0x12, 0x00, // extended destination address
+            0xc7, 0xd9, 0xb5, 0x14, 0x00, 0x4b, 0x12, 0x00, // extended source address
             0x05, // security control field
-            0x31,0x01,0x00,0x00, // frame counter
-            0x3e,0xe8,0xfb,0x85,0xe4,0xcc,0xf4,0x48,0x90,0xfe,0x56,0x66,0xf7,0x1c,0x65,0x9e,0xf9, // data
-            0x93,0xc8,0x34,0x2e,// MIC
+            0x31, 0x01, 0x00, 0x00, // frame counter
+            0x3e, 0xe8, 0xfb, 0x85, 0xe4, 0xcc, 0xf4, 0x48, 0x90, 0xfe, 0x56, 0x66, 0xf7, 0x1c, 0x65, 0x9e,
+            0xf9, // data
+            0x93, 0xc8, 0x34, 0x2e, // MIC
         ];
-        frame_type -> FrameType::Data,
-        security_enabled -> true,
-        frame_pending -> false,
-        ack_request -> true,
-        pan_id_compression -> true,
-        dst_addressing_mode -> AddressingMode::Extended,
-        frame_version -> FrameVersion::Ieee802154_2006,
-        src_addressing_mode -> AddressingMode::Extended,
-        dst_pan_id -> Some(Pan(0xabcd)),
-        dst_addr -> Some(Address::Extended([0x00,0x12,0x4b,0x00,0x06,0x15,0x9b,0xbf])),
-        src_pan_id -> None,
-        src_addr -> Some(Address::Extended([0x00,0x12,0x4b,0x00,0x14,0xb5,0xd9,0xc7])),
-        security_level -> 5,
-        key_identifier_mode -> 0,
-        frame_counter -> Some(305),
-        key_source -> None,
-        key_index -> None,
-        payload -> Some(&[0x3e,0xe8,0xfb,0x85,0xe4,0xcc,0xf4,0x48,0x90,0xfe,0x56,0x66,0xf7,0x1c,0x65,0x9e,0xf9,0x93,0xc8,0x34,0x2e][..]),
-        message_integrity_code -> Some(&[0x93, 0xC8, 0x34, 0x2E][..]),
-        mac_header -> &[
-            0x69,0xdc, // frame control
-            0x32, // sequence number
-            0xcd,0xab, // destination PAN id
-            0xbf,0x9b,0x15,0x06,0x00,0x4b,0x12,0x00, // extended destination address
-            0xc7,0xd9,0xb5,0x14,0x00,0x4b,0x12,0x00, // extended source address
-            0x05, // security control field
-            0x31,0x01,0x00,0x00, // frame counter
-        ][..],
+        let (repr, header_len) = Repr::parse(&frame).unwrap();
+        assert_eq!(repr.frame_type, FrameType::Data);
+        assert!(repr.security_enabled);
+        assert!(!repr.frame_pending);
+        assert!(repr.ack_request);
+        assert!(repr.pan_id_compression);
+        assert_eq!(repr.frame_version, FrameVersion::Ieee802154_2006);
+        assert_eq!(repr.sequence_number, Some(0x32));
+        assert_eq!(repr.dst_pan_id, Some(Pan(0xabcd)));
+        assert_eq!(
+            repr.dst_addr,
+            Some(Address::Extended([0x00, 0x12, 0x4b, 0x00, 0x06, 0x15, 0x9b, 0xbf]))
+        );
+        assert_eq!(repr.src_pan_id, None);
+        assert_eq!(
+            repr.src_addr,
+            Some(Address::Extended([0x00, 0x12, 0x4b, 0x00, 0x14, 0xb5, 0xd9, 0xc7]))
+        );
+        // 3 + dst pan + two extended addresses + security control + frame counter.
+        assert_eq!(header_len, 3 + 2 + 8 + 8 + 1 + 4);
+        // The data and the MIC are what remains.
+        assert_eq!(frame.len() - header_len, 17 + 4);
+    }
+
+    /// Truncated frames are rejected, never panicked on.
+    #[test]
+    fn truncated() {
+        let frame = [
+            0x41, 0xd8, 0x01, 0xcd, 0xab, 0xff, 0xff, 0xc7, 0xd9, 0xb5, 0x14, 0x00, 0x4b, 0x12, 0x00,
+        ];
+        assert!(Repr::parse(&frame).is_ok());
+        for len in 0..frame.len() {
+            assert_eq!(Repr::parse(&frame[..len]), Err(Error));
+        }
+        // Frames longer than 127 bytes are not valid either.
+        assert_eq!(Repr::parse(&[0u8; 128]), Err(Error));
     }
 }
