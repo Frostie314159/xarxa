@@ -18,7 +18,7 @@ use crate::icmp_error::{IcmpError, parse_quoted_packet};
 use crate::iface::link_local_addr;
 use crate::iface::{Iface, IfaceHandle, IfaceIter, IfaceState, Medium};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-use crate::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache, Key as NeighborKey, PendingQueue, ProbeEvent};
+use crate::neighbor::{Answer as NeighborAnswer, Key as NeighborKey, NeighborCache, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
 #[cfg(feature = "raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketIter, RawSocketState};
@@ -99,7 +99,7 @@ impl StackInner {
         let _ = handle;
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         {
-            self.neighbor_cache.purge_iface(handle);
+            self.neighbor_cache.clear_iface(handle);
             self.pending.purge_iface(handle);
         }
     }
@@ -516,10 +516,22 @@ impl<'d> Stack<'d> {
         self.ifaces.remove(handle.index());
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
         {
-            self.inner.neighbor_cache.purge_iface(handle);
+            self.inner.neighbor_cache.clear_iface(handle);
             self.inner.pending.purge_iface(handle);
         }
         self.inner.routes.purge_iface(handle);
+    }
+
+    /// Access the neighbor cache.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn neighbor_cache(&self) -> &NeighborCache {
+        &self.inner.neighbor_cache
+    }
+
+    /// Access the neighbor cache for modification.
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    pub fn neighbor_cache_mut(&mut self) -> &mut NeighborCache {
+        &mut self.inner.neighbor_cache
     }
 
     /// Access the routing table.

@@ -48,6 +48,21 @@ enum State {
     },
 }
 
+impl From<State> for NeighborState {
+    fn from(state: State) -> Self {
+        match state {
+            State::Incomplete { .. } => NeighborState::Incomplete,
+            State::Reachable {
+                hardware_addr,
+                expires_at,
+            } => NeighborState::Reachable {
+                hardware_addr,
+                expires_at,
+            },
+        }
+    }
+}
+
 /// An answer to a neighbor cache lookup.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +86,7 @@ impl Answer {
     }
 }
 
-/// A due resolution timer, returned by [Cache::poll_retransmit].
+/// A due resolution timer, returned by [NeighborCache::poll_retransmit].
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProbeEvent {
@@ -82,18 +97,56 @@ pub(crate) enum ProbeEvent {
     Failed(IpAddress),
 }
 
-/// A neighbor cache backed by a map.
+/// An entry in the [`NeighborCache`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Neighbor {
+    /// Interface the neighbor is reachable through.
+    pub iface: IfaceHandle,
+    /// The neighbor's IP address.
+    pub addr: IpAddress,
+    /// Whether the hardware address is known yet.
+    pub state: NeighborState,
+}
+
+/// State of a [`Neighbor`] entry.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NeighborState {
+    /// Address resolution is in progress. Packets for this neighbor are parked
+    /// until it resolves or resolution gives up.
+    Incomplete,
+    /// The neighbor's hardware address is known.
+    Reachable {
+        /// The neighbor's hardware address.
+        hardware_addr: HardwareAddress,
+        /// When the entry expires. `Instant::MAX` means never.
+        expires_at: Instant,
+    },
+}
+
+/// The neighbor cache: the stack's map of IP addresses to hardware addresses.
+///
+/// It holds one entry per neighbor, keyed by the interface it is reachable
+/// through plus its IP address. Entries are filled in by ARP and neighbor
+/// discovery, and expire after 60 s unless traffic from the neighbor refreshes
+/// them.
+///
+/// Access it with [`Stack::neighbor_cache`] and [`Stack::neighbor_cache_mut`].
+///
+/// [`Stack::neighbor_cache`]: crate::Stack::neighbor_cache
+/// [`Stack::neighbor_cache_mut`]: crate::Stack::neighbor_cache_mut
 #[derive(Debug)]
-pub struct Cache {
+pub struct NeighborCache {
     storage: BoundedVec<(Key, State), NEIGHBOR_CACHE_COUNT>,
 }
 
-impl Cache {
+impl NeighborCache {
     /// Neighbor entry lifetime, in milliseconds.
     pub(crate) const ENTRY_LIFETIME: Duration = Duration::from_millis(60_000);
 
     /// Create a cache.
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             storage: BoundedVec::new(),
         }
@@ -102,7 +155,7 @@ impl Cache {
     pub(crate) fn lookup(&self, key: &Key, timestamp: Instant) -> Answer {
         assert!(key.1.is_unicast());
 
-        match self.get(key) {
+        match self.get_state(key) {
             Some(State::Reachable {
                 hardware_addr,
                 expires_at,
@@ -115,11 +168,11 @@ impl Cache {
     /// Create an INCOMPLETE entry for a neighbor, starting address resolution.
     ///
     /// The caller sends the first solicitation itself; the entry's retransmission
-    /// timer takes over from there (see [Cache::poll_retransmit]).
+    /// timer takes over from there (see [NeighborCache::poll_retransmit]).
     pub(crate) fn start_resolution(&mut self, key: Key, timestamp: Instant) {
         debug_assert!(key.1.is_unicast());
 
-        self.insert(
+        self.insert_state(
             key,
             State::Incomplete {
                 probes_sent: 1,
@@ -179,18 +232,23 @@ impl Cache {
             .fold(Instant::MAX, Instant::min)
     }
 
-    pub fn reset_expiry_if_existing(&mut self, key: Key, source_hardware_addr: HardwareAddress, timestamp: Instant) {
+    pub(crate) fn reset_expiry_if_existing(
+        &mut self,
+        key: Key,
+        source_hardware_addr: HardwareAddress,
+        timestamp: Instant,
+    ) {
         if let Some(State::Reachable {
             hardware_addr,
             expires_at,
-        }) = self.get_mut(&key)
+        }) = self.get_state_mut(&key)
             && source_hardware_addr == *hardware_addr
         {
             *expires_at = timestamp + Self::ENTRY_LIFETIME;
         }
     }
 
-    pub fn fill(&mut self, key: Key, hardware_addr: HardwareAddress, timestamp: Instant) {
+    pub(crate) fn fill(&mut self, key: Key, hardware_addr: HardwareAddress, timestamp: Instant) {
         debug_assert!(key.1.is_unicast());
         debug_assert!(hardware_addr.is_unicast());
 
@@ -198,11 +256,11 @@ impl Cache {
         self.fill_with_expiration(key, hardware_addr, expires_at);
     }
 
-    pub fn fill_with_expiration(&mut self, key: Key, hardware_addr: HardwareAddress, expires_at: Instant) {
+    pub(crate) fn fill_with_expiration(&mut self, key: Key, hardware_addr: HardwareAddress, expires_at: Instant) {
         debug_assert!(key.1.is_unicast());
         debug_assert!(hardware_addr.is_unicast());
 
-        match self.get(&key) {
+        match self.get_state(&key) {
             Some(State::Reachable {
                 hardware_addr: old_hardware_addr,
                 ..
@@ -218,7 +276,7 @@ impl Cache {
             }
         }
 
-        self.insert(
+        self.insert_state(
             key,
             State::Reachable {
                 hardware_addr,
@@ -227,19 +285,100 @@ impl Cache {
         );
     }
 
-    /// Remove all entries for the given interface.
-    pub(crate) fn purge_iface(&mut self, iface: IfaceHandle) {
+    /// Get the entry for a neighbor.
+    ///
+    /// Expired entries are still reported until the stack reuses their slot.
+    /// Compare `expires_at` against the current time if that matters.
+    pub fn get(&self, iface: IfaceHandle, addr: IpAddress) -> Option<Neighbor> {
+        let state = self.get_state(&(iface, addr))?;
+        Some(Neighbor {
+            iface,
+            addr,
+            state: state.into(),
+        })
+    }
+
+    /// Iterate over all entries.
+    pub fn iter(&self) -> impl Iterator<Item = Neighbor> + '_ {
+        self.storage.iter().map(|((iface, addr), state)| Neighbor {
+            iface: *iface,
+            addr: *addr,
+            state: (*state).into(),
+        })
+    }
+
+    /// Add or replace an entry, mapping `addr` on `iface` to `hardware_addr`.
+    ///
+    /// `expires_at` is when the entry stops being used. Pass `Instant::MAX` for
+    /// a static entry that never expires. Note that ARP or neighbor discovery
+    /// can still replace it if the neighbor answers with a different hardware
+    /// address.
+    ///
+    /// If the cache is full, another entry is evicted to make room.
+    ///
+    /// # Panics
+    /// Panics if `addr` or `hardware_addr` is not unicast.
+    pub fn insert(&mut self, iface: IfaceHandle, addr: IpAddress, hardware_addr: HardwareAddress, expires_at: Instant) {
+        assert!(addr.is_unicast());
+        assert!(hardware_addr.is_unicast());
+
+        self.fill_with_expiration((iface, addr), hardware_addr, expires_at);
+    }
+
+    /// Remove the entry for a neighbor, returning it if there was one.
+    ///
+    /// Removing an entry whose resolution is still in progress leaves the
+    /// packets parked on it waiting: they are dropped when their own timeout
+    /// expires, a few seconds later.
+    pub fn remove(&mut self, iface: IfaceHandle, addr: IpAddress) -> Option<Neighbor> {
+        let index = self.storage.iter().position(|(key, _)| *key == (iface, addr))?;
+        let ((iface, addr), state) = self.storage.swap_remove(index);
+        Some(Neighbor {
+            iface,
+            addr,
+            state: state.into(),
+        })
+    }
+
+    /// Keep only the entries for which `f` returns true.
+    ///
+    /// Same caveat as [`NeighborCache::remove`] for entries being resolved.
+    pub fn retain(&mut self, mut f: impl FnMut(&Neighbor) -> bool) {
+        self.storage.retain(|((iface, addr), state)| {
+            f(&Neighbor {
+                iface: *iface,
+                addr: *addr,
+                state: (*state).into(),
+            })
+        });
+    }
+
+    /// Remove all entries for one interface.
+    ///
+    /// Same caveat as [`NeighborCache::remove`] for entries being resolved.
+    pub fn clear_iface(&mut self, iface: IfaceHandle) {
         self.storage.retain(|(key, _)| key.0 != iface);
     }
 
-    /// Remove all entries. Will be needed when addresses are changed at runtime.
-    #[allow(unused)]
-    pub(crate) fn flush(&mut self) {
+    /// Remove all entries.
+    ///
+    /// Same caveat as [`NeighborCache::remove`] for entries being resolved.
+    pub fn clear(&mut self) {
         self.storage.clear()
     }
 
-    fn insert(&mut self, key: Key, state: State) {
-        if let Some(entry) = self.get_mut(&key) {
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.storage.len()
+    }
+
+    /// Whether the cache is empty.
+    pub fn is_empty(&self) -> bool {
+        self.storage.is_empty()
+    }
+
+    fn insert_state(&mut self, key: Key, state: State) {
+        if let Some(entry) = self.get_state_mut(&key) {
             *entry = state;
         } else if let Err((key, state)) = self.storage.push((key, state)) {
             // The cache is full, and we need to evict an entry. Prefer evicting
@@ -262,14 +401,14 @@ impl Cache {
         }
     }
 
-    fn get(&self, key: &Key) -> Option<State> {
+    fn get_state(&self, key: &Key) -> Option<State> {
         self.storage
             .iter()
             .find(|(probe, _)| probe == key)
             .map(|(_, state)| *state)
     }
 
-    fn get_mut(&mut self, key: &Key) -> Option<&mut State> {
+    fn get_state_mut(&mut self, key: &Key) -> Option<&mut State> {
         self.storage
             .iter_mut()
             .find(|(probe, _)| probe == key)
@@ -287,7 +426,7 @@ pub(crate) struct PendingPacket {
 
 /// A queue of egress packets waiting for neighbor resolution.
 ///
-/// When egress needs a neighbor that is not in the [Cache], the fully-built IP packet
+/// When egress needs a neighbor that is not in the [NeighborCache], the fully-built IP packet
 /// is queued here and a solicitation (ARP request / NDISC neighbor solicit) is sent
 /// instead, retransmitted per RFC 4861 until an answer arrives or the probe limit is
 /// reached. When the answer arrives and fills the cache, the queued packets are
@@ -406,7 +545,7 @@ mod test {
         let addr = HardwareAddress::Ieee802154(crate::wire::Ieee802154Address::Extended([
             0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
         ]));
-        let mut cache = Cache::new();
+        let mut cache = NeighborCache::new();
         cache.fill(key(MOCK_IP_ADDR_1), addr, Instant::from_millis(0));
         assert_eq!(
             cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)),
@@ -425,7 +564,7 @@ mod test {
 
     #[test]
     fn test_fill() {
-        let mut cache = Cache::new();
+        let mut cache = NeighborCache::new();
 
         assert!(!cache.lookup(&key(MOCK_IP_ADDR_1), Instant::from_millis(0)).found());
         assert!(!cache.lookup(&key(MOCK_IP_ADDR_2), Instant::from_millis(0)).found());
@@ -440,7 +579,7 @@ mod test {
 
     #[test]
     fn test_expire() {
-        let mut cache = Cache::new();
+        let mut cache = NeighborCache::new();
 
         cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, Instant::from_millis(0));
         assert_eq!(
@@ -451,7 +590,7 @@ mod test {
             !cache
                 .lookup(
                     &key(MOCK_IP_ADDR_1),
-                    Instant::from_millis(0) + Cache::ENTRY_LIFETIME * 2
+                    Instant::from_millis(0) + NeighborCache::ENTRY_LIFETIME * 2
                 )
                 .found(),
         );
@@ -459,7 +598,7 @@ mod test {
 
     #[test]
     fn test_replace() {
-        let mut cache = Cache::new();
+        let mut cache = NeighborCache::new();
 
         cache.fill(key(MOCK_IP_ADDR_1), HADDR_A, Instant::from_millis(0));
         assert_eq!(
@@ -475,7 +614,7 @@ mod test {
 
     #[test]
     fn test_per_iface() {
-        let mut cache = Cache::new();
+        let mut cache = NeighborCache::new();
 
         // The same protocol address resolves independently on different interfaces.
         cache.fill((IF_0, MOCK_IP_ADDR_1.into()), HADDR_A, Instant::ZERO);
@@ -489,7 +628,7 @@ mod test {
             Answer::Found(HADDR_B)
         );
 
-        cache.purge_iface(IF_0);
+        cache.clear_iface(IF_0);
         assert!(!cache.lookup(&(IF_0, MOCK_IP_ADDR_1.into()), Instant::ZERO).found());
         assert_eq!(
             cache.lookup(&(IF_1, MOCK_IP_ADDR_1.into()), Instant::ZERO),
@@ -499,7 +638,7 @@ mod test {
 
     #[test]
     fn test_evict() {
-        let mut cache = Cache::new();
+        let mut cache = NeighborCache::new();
 
         // Fill the cache to capacity, with the entry for MOCK_IP_ADDR_2 being the
         // one that expires soonest.
@@ -527,7 +666,7 @@ mod test {
 
     #[test]
     fn test_resolution_failure() {
-        let mut cache = Cache::new();
+        let mut cache = NeighborCache::new();
         let t0 = Instant::ZERO;
 
         cache.start_resolution(key(MOCK_IP_ADDR_1), t0);
@@ -558,7 +697,7 @@ mod test {
 
     #[test]
     fn test_resolution_success() {
-        let mut cache = Cache::new();
+        let mut cache = NeighborCache::new();
         let t0 = Instant::ZERO;
 
         cache.start_resolution(key(MOCK_IP_ADDR_1), t0);
@@ -574,7 +713,7 @@ mod test {
 
     #[test]
     fn test_retransmit_other_iface() {
-        let mut cache = Cache::new();
+        let mut cache = NeighborCache::new();
         let t0 = Instant::ZERO;
 
         cache.start_resolution((IF_1, MOCK_IP_ADDR_1.into()), t0);
@@ -657,8 +796,8 @@ mod test {
 }
 
 #[cfg(feature = "defmt")]
-impl defmt::Format for Cache {
+impl defmt::Format for NeighborCache {
     fn format(&self, f: defmt::Formatter<'_>) {
-        defmt::write!(f, "Cache({=[?]})", self.storage.as_slice());
+        defmt::write!(f, "NeighborCache({=[?]})", self.storage.as_slice());
     }
 }

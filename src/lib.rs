@@ -53,7 +53,7 @@ pub mod iface;
 #[cfg(feature = "multicast")]
 mod multicast;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-pub mod neighbor;
+mod neighbor;
 #[cfg(feature = "packet-log")]
 mod packet_log;
 mod rand;
@@ -82,5 +82,7 @@ pub use xarxa_driver as driver;
 
 #[cfg(feature = "icmp-errors")]
 pub use icmp_error::IcmpError;
+#[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+pub use neighbor::{Neighbor, NeighborCache, NeighborState};
 pub use stack::Stack;
 pub use storage::Full;
