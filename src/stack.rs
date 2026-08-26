@@ -3471,24 +3471,35 @@ impl IfaceState<'_> {
             return Ipv6Address::LOCALHOST;
         };
 
-        for (addr, cidr) in self.ip_addrs.iter().filter_map(ipv6_candidate) {
-            if !is_candidate_source_address(dst_addr, &cidr.address()) {
-                continue;
-            }
-
+        // See RFC 6724 Section 5: Source Address Selection. The rules are a priority
+        // ordering, so the first one that tells the two candidates apart decides it and
+        // the rules below it never run. Returning out of each rule in turn is what keeps
+        // that ordering; a chain of separate overwrites would instead let a lower rule
+        // undo what a higher one had already settled.
+        fn prefer(
+            (candidate, candidate_cidr): (&IfaceAddr, &Ipv6Cidr),
+            (addr, cidr): (&IfaceAddr, &Ipv6Cidr),
+            dst_addr: &Ipv6Address,
+            now: Instant,
+        ) -> bool {
             // Rule 1: prefer the address that is the same as the output destination address.
-            if candidate_cidr.address() != *dst_addr && cidr.address() == *dst_addr {
-                (candidate, candidate_cidr) = (addr, cidr);
+            if cidr.address() == *dst_addr {
+                return true;
+            }
+            if candidate_cidr.address() == *dst_addr {
+                return false;
             }
 
             // Rule 2: prefer appropriate scope.
-            let candidate_addr = candidate_cidr.address();
-            if (candidate_addr.x_multicast_scope() as u8) < (cidr.address().x_multicast_scope() as u8) {
-                if (candidate_addr.x_multicast_scope() as u8) < (dst_addr.x_multicast_scope() as u8) {
-                    (candidate, candidate_cidr) = (addr, cidr);
-                }
-            } else if (cidr.address().x_multicast_scope() as u8) > (dst_addr.x_multicast_scope() as u8) {
-                (candidate, candidate_cidr) = (addr, cidr);
+            let candidate_scope = candidate_cidr.address().x_multicast_scope() as u8;
+            let addr_scope = cidr.address().x_multicast_scope() as u8;
+            let dst_scope = dst_addr.x_multicast_scope() as u8;
+            if candidate_scope != addr_scope {
+                return if addr_scope < candidate_scope {
+                    addr_scope >= dst_scope
+                } else {
+                    candidate_scope < dst_scope
+                };
             }
 
             // Rule 3: avoid deprecated addresses. A router retires a prefix by
@@ -3496,12 +3507,11 @@ impl IfaceState<'_> {
             // so through a prefix rotation the outgoing address is still assigned and
             // still shares its leading bits with the destinations it used to reach.
             // RFC 6724 orders this rule above rule 8 for that reason: a preferred
-            // address wins even when a deprecated one matches more closely.
+            // address wins even when a deprecated one matches more closely. It sits
+            // below rules 1 and 2, so it cannot hand back an address of the wrong
+            // scope, nor pass over the destination address itself.
             if candidate.is_preferred(now) != addr.is_preferred(now) {
-                if addr.is_preferred(now) {
-                    (candidate, candidate_cidr) = (addr, cidr);
-                }
-                continue;
+                return addr.is_preferred(now);
             }
 
             // Rule 4: prefer home addresses (TODO)
@@ -3510,7 +3520,15 @@ impl IfaceState<'_> {
             // Rule 6: prefer matching label (TODO)
             // Rule 7: prefer temporary addresses (TODO)
             // Rule 8: use longest matching prefix
-            if common_prefix_length(candidate_cidr, dst_addr) < common_prefix_length(cidr, dst_addr) {
+            common_prefix_length(cidr, dst_addr) > common_prefix_length(candidate_cidr, dst_addr)
+        }
+
+        for (addr, cidr) in self.ip_addrs.iter().filter_map(ipv6_candidate) {
+            if !is_candidate_source_address(dst_addr, &cidr.address()) {
+                continue;
+            }
+
+            if prefer((candidate, candidate_cidr), (addr, cidr), dst_addr, now) {
                 (candidate, candidate_cidr) = (addr, cidr);
             }
         }
@@ -4115,6 +4133,72 @@ pub(crate) mod test {
         assert_eq!(
             stack.ifaces.get(iface.index()).get_source_address_ipv6(&dst, now),
             incoming_addr
+        );
+    }
+
+    /// RFC 6724 Section 5 applies its rules in priority order: the first rule that
+    /// tells two candidates apart decides, and the ones below it never run. Rule 1
+    /// matches a source address that is the destination itself, so it settles the
+    /// comparison before rule 3 gets a say, and a deprecated address still wins when
+    /// it is the destination.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_source_address_rule_1_beats_rule_3() {
+        let (mut stack, rx, _tx) = test_stack(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+        let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let router_ll = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+        let outgoing = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        let incoming = Ipv6Address::new(0x2001, 0xdb9, 0, 0, 0, 0, 0, 0);
+        let outgoing_addr = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0xff, 0xfe00, 0x1);
+
+        let no_addrs: [IpCidr; 0] = [];
+        stack.iface(iface).set_ip_addrs(no_addrs).unwrap();
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+
+        // Both prefixes are live.
+        let now = Instant::from_secs(6);
+        for prefix in [outgoing, incoming] {
+            rx.borrow_mut().push_back(router_advert(
+                router_hw,
+                router_ll,
+                Duration::from_secs(1800),
+                prefix,
+                Duration::from_secs(7200),
+                Duration::from_secs(3600),
+            ));
+        }
+        stack.poll(now);
+
+        // The router retires the outgoing prefix: no longer preferred, still valid.
+        let now = Instant::from_secs(12);
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            outgoing,
+            Duration::from_secs(7200),
+            Duration::ZERO,
+        ));
+        stack.poll(now);
+        assert!(
+            stack
+                .iface(iface)
+                .ip_addrs()
+                .iter()
+                .any(|a| a.cidr.address() == IpAddress::Ipv6(outgoing_addr) && !a.is_preferred(now)),
+            "the outgoing prefix's address has to be deprecated for this test to mean anything"
+        );
+
+        // Talking to the deprecated address itself. Rule 1 matches it exactly, so rule 3
+        // must not go on to prefer the address that replaced it.
+        assert_eq!(
+            stack
+                .ifaces
+                .get(iface.index())
+                .get_source_address_ipv6(&outgoing_addr, now),
+            outgoing_addr,
+            "rule 3 must not override rule 1"
         );
     }
 
