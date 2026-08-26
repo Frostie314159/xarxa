@@ -1,12 +1,6 @@
-//! IP multicast group membership, with IGMP (IPv4) and MLD (IPv6).
-//!
-//! Join a group on an interface with
-//! [`Iface::join_multicast_group`](crate::iface::Iface::join_multicast_group). The
-//! stack then accepts packets sent to the group, reports the membership to the
-//! routers on the link, and answers their membership queries from
-//! [`Stack::poll`](crate::Stack::poll).
-//!
-//! Needs the `multicast` feature.
+// IP multicast group membership, with IGMP (IPv4) and MLD (IPv6). The public
+// surface is `Iface::join_multicast_group` and friends, plus `MulticastError`,
+// which `iface` re-exports.
 
 use crate::config::MULTICAST_GROUP_COUNT;
 use crate::storage::{Full, Vec};
@@ -18,7 +12,7 @@ use crate::stack::StackInner;
 use crate::time::{Duration, Instant};
 use crate::wire::*;
 
-/// Error type for `join_multicast_group`, `leave_multicast_group`.
+/// Error type for [`Iface::join_multicast_group`] and [`Iface::leave_multicast_group`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum MulticastError {

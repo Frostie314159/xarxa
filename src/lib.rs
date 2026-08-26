@@ -53,7 +53,7 @@ mod fragmentation;
 mod icmp_error;
 pub mod iface;
 #[cfg(feature = "multicast")]
-pub mod multicast;
+mod multicast;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 pub mod neighbor;
 #[cfg(feature = "packet-log")]

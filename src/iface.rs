@@ -4,6 +4,9 @@
 //! configuration: hardware address, IP addresses, and whatever address
 //! autoconfiguration is turned on for it.
 
+#[cfg(feature = "multicast")]
+pub use crate::multicast::MulticastError;
+
 use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
 use crate::driver::{Capabilities, ChecksumCapabilities, Driver, LinkState, PACKET_BUF_SIZE};
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
