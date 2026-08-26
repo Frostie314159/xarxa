@@ -33,6 +33,7 @@ default = [
     "multicast",
     "tcp-cubic",
     "tcp-timestamps",
+    "tcp-sack",
     "packetmeta-timestamp",
 ]
 
