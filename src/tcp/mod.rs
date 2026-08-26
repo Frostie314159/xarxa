@@ -915,7 +915,8 @@ impl<'d> TcpSocketState<'d> {
         // segment.
         #[cfg(feature = "tcp-sack")]
         if self.remote_has_sack {
-            let ack = reply_repr.ack_number.unwrap_or(TcpSeqNumber(0));
+            // NOTE(unwrap): ack_number is set to Some above.
+            let ack = reply_repr.ack_number.unwrap();
             reply_repr.sack_ranges = self.generate_sack_ranges(ack);
         }
 
@@ -1520,7 +1521,11 @@ impl<'d> TcpSocketState<'d> {
                 "assembler: too many holes to add {} octets at offset {}",
                 payload_len, payload_offset
             );
-            return None;
+            // The payload is dropped, but the segment still arrived out of
+            // order, so send the immediate duplicate ACK of RFC 5681 anyway.
+            // It restates the current ACK and the held SACK ranges, giving the
+            // sender its loss signal instead of leaving it to the RTO.
+            return Some(self.ack_reply(now, repr));
         };
 
         // assembler accepted segment, track sequence number for SACK generation
@@ -1617,6 +1622,11 @@ impl<'d> TcpSocketState<'d> {
         // The effective max segment size, taking into account our and remote's limits.
         // Per RFC 6691 §2 the advertised MSS counts payload only and excludes TCP options, so
         // subtract the options a data segment carries.
+        //
+        // This options length must mirror `TcpRepr::header_len()` for the data
+        // segment `dispatch` will build (which sizes the payload from
+        // `header_len()` directly), or the send decision drifts from the
+        // actual segment sizing.
         let local_mss = self.ip_mtu - ip_header_len - TCP_HEADER_LEN;
 
         #[cfg(feature = "tcp-timestamps")]
@@ -1744,8 +1754,9 @@ impl<'d> TcpSocketState<'d> {
 
     /// The number of SACK blocks the next emitted ACK will carry.
     ///
-    /// Matches count of what `generate_sack_ranges()` generates, as SACK ranges
-    ///  are filled with extra ranges from assembler if history is small.
+    /// Matches the count `generate_sack_ranges()` will produce: that function
+    /// fills any slots the history leaves open from the assembler, so the count
+    /// is the number of islands, capped at 3.
     #[cfg(feature = "tcp-sack")]
     fn sack_range_count(&self) -> usize {
         if self.remote_has_sack {
@@ -1764,6 +1775,11 @@ impl<'d> TcpSocketState<'d> {
     #[cfg(feature = "tcp-sack")]
     fn generate_sack_ranges(&mut self, ack: TcpSeqNumber) -> [Option<(u32, u32)>; 3] {
         if self.assembler.is_empty() {
+            // Also drop the triggering sequence number: with no islands held it
+            // can only go stale, and after a full sequence wrap a stale value
+            // could land inside an unrelated future island and be promoted to
+            // the first block.
+            self.local_rx_last_seq = None;
             self.local_sack_history = [None, None, None];
             return [None, None, None];
         }
@@ -11021,14 +11037,15 @@ mod test {
     ///
     /// The assembler now holds 4 islands and is full. Segment 10000 would open a
     /// fifth, so the assembler rejects it with `TooManyHolesError` and the payload
-    /// is discarded.
+    /// is discarded. The segment still arrived out of order, so the immediate
+    /// duplicate ACK of RFC 5681 goes out anyway, restating the held ranges.
     ///
     ///                          +-----------------+-----------------+-----------------+
     ///                          |   First Block   |  Second Block   |   Third Block   |
     /// +------------+----------+--------+--------+--------+--------+--------+--------+
     /// |   Segment  |    ACK   |  Left  |  Right |  Left  |  Right |  Left  |  Right |
     /// +------------+----------+--------+--------+--------+--------+--------+--------+
-    /// |   10000    | (no ACK) |        |        |        |        |        |        |
+    /// |   10000    |   5500   |  9000  |  9500  |  8000  |  8500  |  7000  |  7500  |
     /// |  transmit  |   5500   |  9000  |  9500  |  8000  |  8500  |  7000  |  7500  |
     /// +------------+----------+--------+--------+--------+--------+--------+--------+
     #[test]
@@ -11090,7 +11107,9 @@ mod test {
 
         let blocks_before = s.local_sack_history;
 
-        // The assembler should reject this segment with `TooManyHolesError`
+        // The assembler should reject this segment with `TooManyHolesError`.
+        // The payload is dropped, but the out-of-order arrival still triggers
+        // an immediate duplicate ACK restating the held ranges.
         let rejected = 10000;
         send!(
             s,
@@ -11099,7 +11118,14 @@ mod test {
                 ack_number: Some(LOCAL_SEQ + 1),
                 payload: &segment,
                 ..SEND_TEMPL
-            }
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 5500),
+                window_len: 5500,
+                sack_ranges: [block(9000, 9500), block(8000, 8500), block(7000, 7500)],
+                ..RECV_TEMPL
+            })
         );
 
         // Assembler must not hold the segment
