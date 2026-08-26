@@ -8,17 +8,17 @@
 //!
 //! Only Ethernet interfaces are supported.
 //!
-//! [`Iface::set_dhcpv4`]: crate::iface::Iface::set_dhcpv4
-//! [`Iface::dhcpv4_lease`]: crate::iface::Iface::dhcpv4_lease
-//! [`Iface::config_generation`]: crate::iface::Iface::config_generation
+//! [`Iface::set_dhcpv4`]: super::Iface::set_dhcpv4
+//! [`Iface::dhcpv4_lease`]: super::Iface::dhcpv4_lease
+//! [`Iface::config_generation`]: super::Iface::config_generation
 //! [`Stack::poll`]: crate::Stack::poll
 
 use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
 
+use super::{AddrOrigin, IfaceAddr, IfaceState};
 use crate::driver::ChecksumCapabilities;
 use crate::driver::PacketBuf;
-use crate::iface::{AddrOrigin, IfaceAddr, IfaceState};
 use crate::route::{Route, RouteOrigin};
 use crate::stack::StackInner;
 use crate::time::{Duration, Instant};
@@ -231,7 +231,7 @@ enum ClientState {
 ///
 /// Start from [`DhcpConfig::default`] and change the fields you need.
 ///
-/// [`Iface::set_dhcpv4`]: crate::iface::Iface::set_dhcpv4
+/// [`Iface::set_dhcpv4`]: super::Iface::set_dhcpv4
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[non_exhaustive]
@@ -854,8 +854,7 @@ mod test {
 
     use super::*;
     use crate::driver::Checksum;
-    use crate::iface::IfaceHandle;
-    use crate::iface::Medium;
+    use crate::iface::{IfaceHandle, Medium};
     use crate::stack::Stack;
     use crate::test_device::{Queue, Sent, TestDevice};
     use crate::wire::{

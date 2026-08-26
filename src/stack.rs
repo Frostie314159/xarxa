@@ -2650,13 +2650,13 @@ pub(crate) mod test {
 
     use super::*;
     use crate::driver::Checksum;
+    #[cfg(feature = "slaac")]
+    use crate::iface::slaac::{SlaacConfig, SlaacState};
     use crate::iface::{AddrOrigin, IfaceAddr};
     use crate::neighbor::MAX_MULTICAST_SOLICIT;
     use crate::raw::RawMode;
     #[cfg(feature = "slaac")]
     use crate::route::RouteOrigin;
-    #[cfg(feature = "slaac")]
-    use crate::slaac::{SlaacConfig, SlaacState};
     use crate::tcp::State as TcpState;
     use crate::test_device::{Queue, Room, Sent, TestDevice};
     use crate::time::Duration;

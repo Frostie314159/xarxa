@@ -3,6 +3,14 @@
 //! An interface is a [`Driver`] added to a [`Stack`], together with its
 //! configuration: hardware address, IP addresses, and whatever address
 //! autoconfiguration is turned on for it.
+//!
+//! The two autoconfiguration methods are [`dhcpv4`] and [`slaac`], each turned
+//! on per interface and driven by [`Stack::poll`].
+
+#[cfg(feature = "dhcpv4")]
+pub mod dhcpv4;
+#[cfg(feature = "slaac")]
+pub mod slaac;
 
 #[cfg(feature = "multicast")]
 pub use crate::multicast::MulticastError;
@@ -160,9 +168,9 @@ pub(crate) struct IfaceState<'d> {
     #[cfg(feature = "async")]
     pub(crate) config_waker: crate::waker::WakerRegistration,
     #[cfg(feature = "dhcpv4")]
-    pub(crate) dhcpv4: Option<crate::dhcpv4::Client>,
+    pub(crate) dhcpv4: Option<self::dhcpv4::Client>,
     #[cfg(feature = "slaac")]
-    pub(crate) slaac: Option<crate::slaac::Slaac>,
+    pub(crate) slaac: Option<self::slaac::Slaac>,
     #[cfg(feature = "multicast")]
     pub(crate) multicast: crate::multicast::State,
     #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
@@ -396,7 +404,7 @@ impl<'d> Iface<'_, 'd> {
     /// # Panics
     /// Panics if the interface is not an Ethernet interface.
     #[cfg(feature = "dhcpv4")]
-    pub fn set_dhcpv4(&mut self, config: Option<crate::dhcpv4::DhcpConfig>) {
+    pub fn set_dhcpv4(&mut self, config: Option<self::dhcpv4::DhcpConfig>) {
         assert!(
             matches!(self.state().hardware_addr, HardwareAddress::Ethernet(_)),
             "the DHCPv4 client needs an Ethernet interface"
@@ -404,7 +412,7 @@ impl<'d> Iface<'_, 'd> {
         let Iface { inner, ifaces, index } = self;
         let iface = ifaces.get_mut(*index);
         iface.dhcpv4_reset(inner);
-        iface.dhcpv4 = config.map(crate::dhcpv4::Client::new);
+        iface.dhcpv4 = config.map(self::dhcpv4::Client::new);
     }
 
     /// Turn IPv6 stateless address autoconfiguration on, with the given
@@ -420,7 +428,7 @@ impl<'d> Iface<'_, 'd> {
     /// # Panics
     /// Panics if the interface is not an Ethernet or IEEE 802.15.4 interface.
     #[cfg(feature = "slaac")]
-    pub fn set_slaac(&mut self, config: Option<crate::slaac::SlaacConfig>) {
+    pub fn set_slaac(&mut self, config: Option<self::slaac::SlaacConfig>) {
         assert!(
             self.state().has_link_layer(),
             "SLAAC needs an Ethernet or IEEE 802.15.4 interface"
@@ -428,18 +436,18 @@ impl<'d> Iface<'_, 'd> {
         let Iface { inner, ifaces, index } = self;
         let iface = ifaces.get_mut(*index);
         iface.slaac_reset(inner);
-        iface.slaac = config.map(crate::slaac::Slaac::new);
+        iface.slaac = config.map(self::slaac::Slaac::new);
     }
 
     /// What SLAAC has learned from the routers on the link, or `None` if SLAAC is off.
     #[cfg(feature = "slaac")]
-    pub fn slaac(&self) -> Option<&crate::slaac::SlaacState> {
+    pub fn slaac(&self) -> Option<&self::slaac::SlaacState> {
         self.state().slaac.as_ref().map(|s| s.state())
     }
 
     /// The lease the DHCPv4 client currently holds, if any.
     #[cfg(feature = "dhcpv4")]
-    pub fn dhcpv4_lease(&self) -> Option<&crate::dhcpv4::DhcpLease> {
+    pub fn dhcpv4_lease(&self) -> Option<&self::dhcpv4::DhcpLease> {
         self.state().dhcpv4.as_ref().and_then(|client| client.lease())
     }
 

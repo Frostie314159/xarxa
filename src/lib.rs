@@ -41,8 +41,6 @@ mod config {
     include!(concat!(env!("OUT_DIR"), "/config.rs"));
 }
 
-#[cfg(feature = "dhcpv4")]
-pub mod dhcpv4;
 #[cfg(feature = "dns")]
 pub mod dns;
 #[cfg(feature = "std")]
@@ -66,8 +64,6 @@ mod reassembly;
 pub mod route;
 #[cfg(feature = "medium-ieee802154")]
 mod sixlowpan;
-#[cfg(feature = "slaac")]
-pub mod slaac;
 mod stack;
 mod storage;
 #[cfg(feature = "tcp")]

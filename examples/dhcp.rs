@@ -19,8 +19,8 @@
 use std::os::unix::io::AsRawFd;
 
 use xarxa::Stack;
-use xarxa::dhcpv4::DhcpConfig;
 use xarxa::driver_impls::{TunTapDriver, wait};
+use xarxa::iface::dhcpv4::DhcpConfig;
 use xarxa::time::Instant;
 use xarxa::wire::{EthernetAddress, HardwareAddress};
 
