@@ -310,6 +310,12 @@ impl Slaac {
         matches!(self.phase, Phase::Start | Phase::Discovering if self.retry_rs_at <= now && self.num_solicitations > 0)
     }
 
+    /// Solicit again, keeping the prefixes and routes already learned. RFC 4861 §6.3.7.
+    pub(crate) fn restart(&mut self) {
+        self.phase = Phase::Start;
+        self.num_solicitations = MAX_RTR_SOLICITATIONS;
+    }
+
     /// Update router solicitation tracking state
     ///
     /// Must be called after sending a router solicitation on the interface.

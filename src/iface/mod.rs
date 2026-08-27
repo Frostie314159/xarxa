@@ -172,6 +172,9 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) dhcpv4: Option<self::dhcpv4::Client>,
     #[cfg(feature = "slaac")]
     pub(crate) slaac: Option<self::slaac::Slaac>,
+    /// Link state at the previous poll, for spotting the down-to-up edge.
+    #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
+    pub(crate) last_link_state: crate::driver::LinkState,
     #[cfg(feature = "multicast")]
     pub(crate) multicast: crate::multicast::State,
     #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
@@ -441,6 +444,17 @@ impl<'d> Iface<'_, 'd> {
         iface.slaac = config.map(self::slaac::Slaac::new);
     }
 
+    /// Solicit routers again, keeping the addresses and routes already configured.
+    ///
+    /// [`Stack::poll`] does this when the link comes back up; call it directly for a
+    /// driver that cannot report link state. Does nothing if SLAAC is off.
+    #[cfg(feature = "slaac")]
+    pub fn restart_slaac(&mut self) {
+        if let Some(slaac) = self.state_mut().slaac.as_mut() {
+            slaac.restart();
+        }
+    }
+
     /// What SLAAC has learned from the routers on the link, or `None` if SLAAC is off.
     #[cfg(feature = "slaac")]
     pub fn slaac(&self) -> Option<&self::slaac::SlaacState> {
@@ -455,8 +469,8 @@ impl<'d> Iface<'_, 'd> {
 
     /// Drop the DHCPv4 lease, if any, and look for a server again.
     ///
-    /// Call this when the link went down and came back up, so an address on the
-    /// new network is obtained right away. Does nothing if the client is off.
+    /// [`Stack::poll`] does this when the link comes back up; call it directly for a
+    /// driver that cannot report link state. Does nothing if the client is off.
     #[cfg(feature = "dhcpv4")]
     pub fn restart_dhcpv4(&mut self) {
         let Iface { inner, ifaces, index } = self;

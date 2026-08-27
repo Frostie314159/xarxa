@@ -478,6 +478,8 @@ impl<'d> Stack<'d> {
             dhcpv4: None,
             #[cfg(feature = "slaac")]
             slaac: None,
+            #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
+            last_link_state: crate::driver::LinkState::Down,
             #[cfg(feature = "multicast")]
             multicast: crate::multicast::State::new(),
             #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
@@ -840,13 +842,35 @@ impl<'d> Stack<'d> {
             #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
             self.inner.fragment_egress(self.ifaces.get_mut(index));
 
+            // A link coming back can mean a different network, so re-run both configuration
+            // protocols instead of trusting what was learned before it dropped.
+            #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
+            {
+                let iface = self.ifaces.get_mut(index);
+                let link_state = iface.driver.link_state();
+                let came_up = link_state != iface.last_link_state && link_state == crate::driver::LinkState::Up;
+                iface.last_link_state = link_state;
+                if came_up {
+                    #[cfg(feature = "dhcpv4")]
+                    iface.dhcpv4_reset(&mut self.inner);
+                    #[cfg(feature = "slaac")]
+                    if let Some(slaac) = iface.slaac.as_mut() {
+                        slaac.restart();
+                    }
+                }
+            }
+
             #[cfg(feature = "dhcpv4")]
             self.ifaces.get_mut(index).dhcpv4_dispatch(&mut self.inner);
 
             #[cfg(feature = "slaac")]
             {
                 let iface = self.ifaces.get_mut(index);
-                iface.ndisc_rs_egress(&mut self.inner);
+                // A solicitation counts as sent even if the driver refuses the frame, so
+                // don't spend the budget on a down link.
+                if iface.last_link_state == crate::driver::LinkState::Up {
+                    iface.ndisc_rs_egress(&mut self.inner);
+                }
                 if iface.slaac.as_ref().is_some_and(|s| s.sync_required(timestamp)) {
                     iface.sync_slaac_state(&mut self.inner);
                 }
@@ -2677,6 +2701,8 @@ pub(crate) mod test {
     #[cfg(feature = "slaac")]
     use crate::route::RouteOrigin;
     use crate::tcp::State as TcpState;
+    #[cfg(feature = "slaac")]
+    use crate::test_device::Link;
     use crate::test_device::{Queue, Room, Sent, TestDevice};
     use crate::time::Duration;
     use crate::udp::RecvError as UdpRecvError;
@@ -3278,6 +3304,280 @@ pub(crate) mod test {
     }
 
     /// A router advertisement that is not from a link-local source is ignored.
+    /// [`test_stack`], also handing out control of the link state the device reports.
+    #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
+    fn test_stack_with_link(medium: Medium) -> (Stack<'static>, Queue, Sent, Link) {
+        let driver = TestDevice::new(medium);
+        let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
+        stack
+            .iface(handle)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V6.into(), 64)])
+            .unwrap();
+        // Drain the solicited-node multicast reports the new addresses trigger.
+        stack.poll(Instant::ZERO);
+        tx.borrow_mut().clear();
+        (stack, rx, tx, link)
+    }
+
+    /// Take an interface that has settled into `Maintaining` through a link bounce, leaving
+    /// it just after the link comes back. Polling while down is what lets the stack observe
+    /// the falling edge.
+    #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
+    fn bounce_link(stack: &mut Stack<'static>, tx: &Sent, link: &Link, at: i64) {
+        link.set(crate::driver::LinkState::Down);
+        stack.poll(Instant::from_secs(at));
+        tx.borrow_mut().clear();
+        link.set(crate::driver::LinkState::Up);
+        stack.poll(Instant::from_secs(at + 1));
+    }
+
+    /// RFC 4861 section 6.3.7 stops solicitation once a router answers, but only "until the
+    /// next time one of the above events occurs".
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_resolicits_after_link_bounce() {
+        let (mut stack, rx, tx, link) = test_stack_with_link(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+        let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let router_ll = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+        let prefix = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+        stack.poll(Instant::from_secs(1));
+
+        // A router answers, so solicitation stops.
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        ));
+        stack.poll(Instant::from_secs(6));
+        tx.borrow_mut().clear();
+        stack.poll(Instant::from_secs(20));
+        assert!(tx.borrow().is_empty(), "a settled interface must not keep soliciting");
+
+        // The link drops and comes back: ask the network again.
+        bounce_link(&mut stack, &tx, &link, 30);
+        assert_eq!(tx.borrow().len(), 1, "the link coming back must trigger a solicitation");
+        let frame = tx.borrow()[0].clone();
+        let (msg_type, _, _, _) = parse_icmpv6_reply(
+            &frame[ETHERNET_HEADER_LEN..],
+            OUR_LINK_LOCAL,
+            IPV6_LINK_LOCAL_ALL_ROUTERS,
+        );
+        assert_eq!(msg_type, Icmpv6Message::RouterSolicit);
+    }
+
+    /// Solicitations are held back while the link is down. `ndisc_rs_egress` counts one as
+    /// sent whether or not the driver accepted the frame, so soliciting into a down link
+    /// would spend the budget on nothing and leave the interface silent once it came back.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_does_not_solicit_on_a_down_link() {
+        let (mut stack, _rx, tx, link) = test_stack_with_link(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+
+        link.set(crate::driver::LinkState::Down);
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+        for at in [1, 5, 9, 13] {
+            stack.poll(Instant::from_secs(at));
+        }
+        assert!(tx.borrow().is_empty(), "a down link must not be solicited");
+
+        // The budget was not spent while down, so all three still go out once it is back.
+        link.set(crate::driver::LinkState::Up);
+        for at in [20, 24, 28, 32] {
+            stack.poll(Instant::from_secs(at));
+        }
+        assert_eq!(tx.borrow().len(), 3, "the full budget survived the outage");
+        let frame = tx.borrow()[0].clone();
+        let (msg_type, _, _, _) = parse_icmpv6_reply(
+            &frame[ETHERNET_HEADER_LEN..],
+            OUR_LINK_LOCAL,
+            IPV6_LINK_LOCAL_ALL_ROUTERS,
+        );
+        assert_eq!(msg_type, Icmpv6Message::RouterSolicit);
+    }
+
+    /// A link that flaps produces an edge every time it settles, but router solicitations
+    /// still keep to `RTR_SOLICITATION_INTERVAL`: the retry timer decides when the next one
+    /// goes out, not the edge. Otherwise a driver reporting a noisy link -- and xarxa polls a
+    /// level rather than being handed an event -- could solicit on every poll.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_link_flap_keeps_solicitation_spacing() {
+        let (mut stack, rx, tx, link) = test_stack_with_link(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+        let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let router_ll = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+        let prefix = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+        stack.poll(Instant::from_secs(1));
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        ));
+        stack.poll(Instant::from_secs(6));
+
+        // First bounce: settled long enough that the retry timer has passed, so this
+        // solicits at once.
+        bounce_link(&mut stack, &tx, &link, 30);
+        assert_eq!(tx.borrow().len(), 1);
+
+        // Flapping again straight away must not produce another one.
+        link.set(crate::driver::LinkState::Down);
+        stack.poll(Instant::from_secs(32));
+        link.set(crate::driver::LinkState::Up);
+        stack.poll(Instant::from_secs(33));
+        assert_eq!(
+            tx.borrow().len(),
+            1,
+            "a flapping link must not outpace RTR_SOLICITATION_INTERVAL"
+        );
+
+        // Once the interval has passed, the refilled budget is spent normally.
+        stack.poll(Instant::from_secs(36));
+        assert_eq!(
+            tx.borrow().len(),
+            2,
+            "the retry timer, not the edge, releases the next one"
+        );
+    }
+
+    /// Re-soliciting is not the same as tearing SLAAC down: what a router already told us
+    /// stays valid until its lifetime says otherwise, so the addresses and routes have to
+    /// survive the bounce. Discarding them is `set_slaac(None)`, a different operation.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_link_bounce_keeps_configuration() {
+        let (mut stack, rx, tx, link) = test_stack_with_link(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+        let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let router_ll = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+        let prefix = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        let our_addr = IpCidr::new(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0xff, 0xfe00, 0x1).into(), 64);
+
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        ));
+        stack.poll(Instant::from_secs(6));
+        assert!(stack.iface(iface).has_ip_addr(our_addr.address()));
+        assert!(stack.routes().get_default_ipv6_route().is_some());
+
+        bounce_link(&mut stack, &tx, &link, 30);
+
+        assert!(
+            stack
+                .iface(iface)
+                .ip_addrs()
+                .iter()
+                .any(|a| a.cidr == our_addr && a.origin == AddrOrigin::Slaac),
+            "a link bounce must not discard an address whose lifetime is still running"
+        );
+        let route = stack.routes().get_default_ipv6_route().unwrap();
+        assert_eq!(route.origin, RouteOrigin::Slaac, "the default route must survive too");
+    }
+
+    /// The manual path, for a driver that cannot report link state.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_restart_by_hand() {
+        let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+        let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
+        let router_ll = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x2);
+        let prefix = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0);
+        let our_addr = IpCidr::new(Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0xff, 0xfe00, 0x1).into(), 64);
+
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+        // Solicit first: an advertisement only settles the state machine from
+        // `Discovering`, so it has to have asked before the answer arrives.
+        stack.poll(Instant::from_secs(1));
+        rx.borrow_mut().push_back(router_advert(
+            router_hw,
+            router_ll,
+            Duration::from_secs(1800),
+            prefix,
+            Duration::from_secs(7200),
+            Duration::from_secs(3600),
+        ));
+        stack.poll(Instant::from_secs(6));
+        tx.borrow_mut().clear();
+        stack.poll(Instant::from_secs(20));
+        assert!(tx.borrow().is_empty(), "a settled interface must not keep soliciting");
+
+        // The link never changed, so only an explicit call can restart discovery.
+        let now = Instant::from_secs(30);
+        stack.iface(iface).restart_slaac();
+        stack.poll(now);
+        assert_eq!(tx.borrow().len(), 1, "an explicit restart must solicit");
+        let frame = tx.borrow()[0].clone();
+        let (msg_type, _, _, _) = parse_icmpv6_reply(
+            &frame[ETHERNET_HEADER_LEN..],
+            OUR_LINK_LOCAL,
+            IPV6_LINK_LOCAL_ALL_ROUTERS,
+        );
+        assert_eq!(msg_type, Icmpv6Message::RouterSolicit);
+        // And it re-checks rather than discards, same as the link-up path.
+        assert!(stack.iface(iface).has_ip_addr(our_addr.address()));
+        assert!(stack.routes().get_default_ipv6_route().is_some());
+    }
+
+    /// With SLAAC off there is nothing to restart, so the call is a no-op.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_restart_without_slaac_is_a_noop() {
+        let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+
+        stack.iface(iface).restart_slaac();
+        stack.poll(Instant::from_secs(1));
+        assert!(tx.borrow().is_empty(), "no SLAAC, nothing to solicit");
+    }
+
+    /// Giving up after the solicitation budget is spent is the other dead end: a host that
+    /// started while no router was up never asked again.
+    #[test]
+    #[cfg(feature = "slaac")]
+    fn test_slaac_resolicits_after_giving_up() {
+        let (mut stack, _rx, tx, link) = test_stack_with_link(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+
+        stack.iface(iface).set_slaac(Some(SlaacConfig::default()));
+        // Nothing answers. The three solicitations RFC 4861 allows go out 4s apart, and then
+        // the budget is spent: the interface is left in `Discovering` with nothing to send.
+        for at in [1, 5, 9, 13, 20] {
+            stack.poll(Instant::from_secs(at));
+        }
+        assert_eq!(
+            tx.borrow().len(),
+            3,
+            "MAX_RTR_SOLICITATIONS solicitations, then silence"
+        );
+        tx.borrow_mut().clear();
+        stack.poll(Instant::from_secs(25));
+        assert!(tx.borrow().is_empty(), "the solicitation budget is spent");
+
+        bounce_link(&mut stack, &tx, &link, 30);
+        assert_eq!(tx.borrow().len(), 1, "the link coming back must restart discovery");
+    }
+
     #[test]
     #[cfg(feature = "slaac")]
     fn test_slaac_ignores_invalid_advert() {
