@@ -10,6 +10,8 @@ unix-like hosts, for running the stack on a PC:
 Both need the `std` feature.
 */
 
+#![allow(unsafe_code)]
+
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ip"))]
 mod tuntap;
 

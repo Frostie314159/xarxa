@@ -1,5 +1,3 @@
-#![allow(unsafe_code)]
-
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
