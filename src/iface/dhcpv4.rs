@@ -782,8 +782,7 @@ impl IfaceState<'_> {
         let Some(client) = &mut self.dhcpv4 else { return };
         trace!("DHCP reset");
         // A client that was already discovering keeps its backoff, so a flapping link
-        // cannot put a DISCOVER on the wire per flap. One that had a lease has just lost
-        // it, so it looks again straight away.
+        // cannot put a DISCOVER on the wire per flap.
         let retry_at = match &client.state {
             ClientState::Discovering(state) => state.retry_at,
             _ => Instant::from_millis(0),

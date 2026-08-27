@@ -172,8 +172,7 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) dhcpv4: Option<self::dhcpv4::Client>,
     #[cfg(feature = "slaac")]
     pub(crate) slaac: Option<self::slaac::Slaac>,
-    /// Link state at the previous poll, for spotting the down-to-up edge. Starts
-    /// `Down`, so an interface whose link is already up restarts once, harmlessly.
+    /// Link state at the previous poll, for spotting the down-to-up edge.
     #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
     pub(crate) last_link_state: crate::driver::LinkState,
     #[cfg(feature = "multicast")]

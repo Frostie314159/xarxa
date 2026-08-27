@@ -843,8 +843,7 @@ impl<'d> Stack<'d> {
             self.inner.fragment_egress(self.ifaces.get_mut(index));
 
             // A link coming back can mean a different network, so re-run both configuration
-            // protocols instead of trusting what was learned before it dropped. Done before
-            // the dispatches below so the first packet leaves in this poll.
+            // protocols instead of trusting what was learned before it dropped.
             #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
             {
                 let iface = self.ifaces.get_mut(index);
@@ -3335,9 +3334,7 @@ pub(crate) mod test {
     }
 
     /// RFC 4861 section 6.3.7 stops solicitation once a router answers, but only "until the
-    /// next time one of the above events occurs" -- one of which is the interface coming back
-    /// after a temporary failure. Without that, a re-association leaves the interface in
-    /// `Maintaining`, re-installing the prefix it remembers from before the outage.
+    /// next time one of the above events occurs".
     #[test]
     #[cfg(feature = "slaac")]
     fn test_slaac_resolicits_after_link_bounce() {

@@ -311,9 +311,6 @@ impl Slaac {
     }
 
     /// Solicit again, keeping the prefixes and routes already learned. RFC 4861 §6.3.7.
-    ///
-    /// `retry_rs_at` is left alone so a flapping link cannot solicit faster than
-    /// `RTR_SOLICITATION_INTERVAL`.
     pub(crate) fn restart(&mut self) {
         self.phase = Phase::Start;
         self.num_solicitations = MAX_RTR_SOLICITATIONS;
