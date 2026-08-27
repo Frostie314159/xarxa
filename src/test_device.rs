@@ -42,6 +42,9 @@ pub type SentMeta = Rc<RefCell<Vec<PacketMeta>>>;
 /// How many more frames the device accepts. `None` is unlimited.
 pub type Room = Rc<Cell<Option<usize>>>;
 
+/// Control over the link state the device reports, shared with the test.
+pub type Link = Rc<Cell<LinkState>>;
+
 /// A mock network device.
 ///
 /// Build one with [`TestDevice::new`] plus the `with_*` setters, then give it to
@@ -68,7 +71,7 @@ pub struct TestDevice {
     /// The hardware address it reports. Set by [`TestDevice::install`].
     pub hardware_addr: HardwareAddress,
     /// The link state it reports.
-    pub link: Rc<Cell<LinkState>>,
+    pub link: Link,
     /// Metadata stamped onto every received packet.
     #[cfg(feature = "packetmeta-id")]
     pub rx_meta: PacketMeta,

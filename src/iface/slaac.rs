@@ -310,6 +310,30 @@ impl Slaac {
         matches!(self.phase, Phase::Start | Phase::Discovering if self.retry_rs_at <= now && self.num_solicitations > 0)
     }
 
+    /// Re-enter router discovery without discarding what is already configured.
+    ///
+    /// RFC 4861 §6.3.7 has a host desist from soliciting once it holds a valid
+    /// advertisement, but only "until the next time one of the above events occurs" -- one of
+    /// which is the interface being reinitialized after a temporary failure. Without this,
+    /// `Phase::Maintaining` is terminal: after a link bounce the interface keeps re-installing
+    /// the prefix and router it remembers from before the outage, never asking whether they
+    /// are still real. A host that started while no router was up hits the same wall from
+    /// the other side: once the solicitation budget is spent nothing refills it, so it
+    /// stays in `Discovering` with `num_solicitations` at zero and never asks again.
+    ///
+    /// Prefixes, routes and observed state are kept. Discarding those instead is what
+    /// turning SLAAC off does, see [`Iface::set_slaac`](super::Iface::set_slaac).
+    ///
+    /// `retry_rs_at` is deliberately left alone. On an interface that has been settled a
+    /// while it is already in the past, so the next solicitation goes out at once; when one
+    /// was just sent it is in the future, and honouring it keeps a link that flaps from
+    /// soliciting faster than `RTR_SOLICITATION_INTERVAL`. Assigning `now` here instead
+    /// would let every edge jump that queue.
+    pub(crate) fn restart_discovery(&mut self) {
+        self.phase = Phase::Start;
+        self.num_solicitations = MAX_RTR_SOLICITATIONS;
+    }
+
     /// Update router solicitation tracking state
     ///
     /// Must be called after sending a router solicitation on the interface.
