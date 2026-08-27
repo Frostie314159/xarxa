@@ -210,6 +210,11 @@ impl<'d> Iface<'_, 'd> {
         self.state().driver.capabilities()
     }
 
+    /// The interface's driver.
+    pub fn driver_mut(&mut self) -> &mut dyn Driver {
+        &mut *self.state_mut().driver
+    }
+
     /// The link state reported by the device.
     pub fn link_state(&mut self) -> LinkState {
         self.state_mut().driver.link_state()
