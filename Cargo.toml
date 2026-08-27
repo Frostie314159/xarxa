@@ -57,8 +57,9 @@ alloc = []
 ## `driver_impls` module (`TunTapDriver`, `RawSocketDriver`, `wait`) and
 ## `Instant::now()`.
 std = ["dep:libc"]
-## Waker registration on sockets, for building `Future`s on top of the stack.
-async = []
+## Waker registration on sockets and on the driver, for building `Future`s on top
+## of the stack.
+async = ["xarxa-driver/async"]
 
 #! ### Protocol support
 ## Support interfaces that send and receive Ethernet frames, with the link-layer

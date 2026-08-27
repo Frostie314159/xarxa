@@ -9,10 +9,19 @@ pub mod config;
 mod buf;
 mod meta;
 
+#[cfg(feature = "async")]
+use core::task::Waker;
+
 pub use buf::PacketBuf;
 pub use meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]
 pub use meta::{Timestamp, TxTimestamp};
+
+/// Error returned by an operation the driver does not support.
+#[cfg(feature = "async")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Eq, PartialEq, Copy, Clone)]
+pub struct NotSupported;
 
 /// Link state of a network device.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -210,6 +219,28 @@ pub trait Driver {
         LinkState::Up
     }
 
+    /// Register a waker.
+    ///
+    /// The driver must wake it when:
+    /// - a frame has been received, so [`receive`](Self::receive) may return `Some`,
+    /// - there is room to transmit again, after [`can_transmit`](Self::can_transmit) returned `false`,
+    /// - the link state changed, so [`link_state`](Self::link_state) may return something new.
+    ///
+    /// Only one waker is kept. Registering another replaces it. Wakes are
+    /// allowed to be spurious.
+    ///
+    /// A registered waker is woken just one. The main loop must re-register it if
+    /// it wants to be woken again.
+    ///
+    /// Drivers that cannot wake anything return `Err(NotSupported)`, which is the
+    /// default implementation. Such a driver can only be polled, so a caller that
+    /// needs to sleep until the driver has something new cannot use it.
+    #[cfg(feature = "async")]
+    fn register_waker(&mut self, waker: &Waker) -> Result<(), NotSupported> {
+        let _ = waker;
+        Err(NotSupported)
+    }
+
     /// Poll for a received frame.
     ///
     /// Returns a buffer holding the received frame if one is available, transferring
@@ -281,6 +312,10 @@ impl<T: Driver + ?Sized> Driver for &mut T {
     }
     fn link_state(&mut self) -> LinkState {
         T::link_state(self)
+    }
+    #[cfg(feature = "async")]
+    fn register_waker(&mut self, waker: &Waker) -> Result<(), NotSupported> {
+        T::register_waker(self, waker)
     }
     fn receive(&mut self) -> Option<PacketBuf> {
         T::receive(self)
