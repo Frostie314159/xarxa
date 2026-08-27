@@ -166,14 +166,14 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) ip_addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT>,
     /// Bumped whenever the interface's addresses or routes change.
     pub(crate) config_generation: u32,
+    /// Woken on a link state change and on a configuration change.
     #[cfg(feature = "async")]
-    pub(crate) config_waker: crate::waker::WakerRegistration,
+    pub(crate) waker: crate::waker::WakerRegistration,
     #[cfg(feature = "dhcpv4")]
     pub(crate) dhcpv4: Option<self::dhcpv4::Client>,
     #[cfg(feature = "slaac")]
     pub(crate) slaac: Option<self::slaac::Slaac>,
-    /// Link state at the previous poll, for spotting the down-to-up edge.
-    #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
+    /// Link state at the previous poll, for spotting a change.
     pub(crate) last_link_state: crate::driver::LinkState,
     #[cfg(feature = "multicast")]
     pub(crate) multicast: crate::multicast::State,
@@ -393,14 +393,17 @@ impl<'d> Iface<'_, 'd> {
         self.state().config_generation
     }
 
-    /// Register a waker to be woken when [`config_generation`](Self::config_generation)
-    /// changes.
+    /// Register a waker to be woken when the interface changes state.
+    ///
+    /// It is woken when the link goes up or down, and when
+    /// [`config_generation`](Self::config_generation) changes: addresses or routes
+    /// added or removed, whether by hand or by DHCPv4 or SLAAC.
     ///
     /// Only one waker is kept. Registering another replaces it. A woken waker must
-    /// be registered again to be woken again.
+    /// be registered again to be woken again. Wakes are allowed to be spurious.
     #[cfg(feature = "async")]
-    pub fn register_config_waker(&mut self, waker: &core::task::Waker) {
-        self.state_mut().config_waker.register(waker)
+    pub fn register_waker(&mut self, waker: &core::task::Waker) {
+        self.state_mut().waker.register(waker)
     }
 
     /// Turn the DHCPv4 client on, with the given configuration, or off with `None`.
@@ -577,7 +580,7 @@ impl IfaceState<'_> {
         }
         self.config_generation = self.config_generation.wrapping_add(1);
         #[cfg(feature = "async")]
-        self.config_waker.wake();
+        self.waker.wake();
     }
 
     /// The interface's IP-layer MTU: the device MTU minus the Ethernet header on

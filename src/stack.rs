@@ -473,12 +473,11 @@ impl<'d> Stack<'d> {
             ip_addrs,
             config_generation: 0,
             #[cfg(feature = "async")]
-            config_waker: crate::waker::WakerRegistration::new(),
+            waker: crate::waker::WakerRegistration::new(),
             #[cfg(feature = "dhcpv4")]
             dhcpv4: None,
             #[cfg(feature = "slaac")]
             slaac: None,
-            #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
             last_link_state: crate::driver::LinkState::Down,
             #[cfg(feature = "multicast")]
             multicast: crate::multicast::State::new(),
@@ -842,20 +841,25 @@ impl<'d> Stack<'d> {
             #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
             self.inner.fragment_egress(self.ifaces.get_mut(index));
 
-            // A link coming back can mean a different network, so re-run both configuration
-            // protocols instead of trusting what was learned before it dropped.
-            #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
+            // Spot the link state edges: wake whoever waits on the interface, and on the
+            // way back up re-run both configuration protocols, since a link coming back
+            // can mean a different network and what was learned before it dropped may
+            // not hold there.
             {
                 let iface = self.ifaces.get_mut(index);
                 let link_state = iface.driver.link_state();
-                let came_up = link_state != iface.last_link_state && link_state == crate::driver::LinkState::Up;
-                iface.last_link_state = link_state;
-                if came_up {
-                    #[cfg(feature = "dhcpv4")]
-                    iface.dhcpv4_reset(&mut self.inner);
-                    #[cfg(feature = "slaac")]
-                    if let Some(slaac) = iface.slaac.as_mut() {
-                        slaac.restart();
+                if link_state != iface.last_link_state {
+                    iface.last_link_state = link_state;
+                    #[cfg(feature = "async")]
+                    iface.waker.wake();
+                    #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
+                    if link_state == crate::driver::LinkState::Up {
+                        #[cfg(feature = "dhcpv4")]
+                        iface.dhcpv4_reset(&mut self.inner);
+                        #[cfg(feature = "slaac")]
+                        if let Some(slaac) = iface.slaac.as_mut() {
+                            slaac.restart();
+                        }
                     }
                 }
             }
