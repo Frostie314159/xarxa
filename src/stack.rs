@@ -478,7 +478,7 @@ impl<'d> Stack<'d> {
             dhcpv4: None,
             #[cfg(feature = "slaac")]
             slaac: None,
-            #[cfg(feature = "slaac")]
+            #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
             last_link_state: crate::driver::LinkState::Down,
             #[cfg(feature = "multicast")]
             multicast: crate::multicast::State::new(),
@@ -842,31 +842,34 @@ impl<'d> Stack<'d> {
             #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
             self.inner.fragment_egress(self.ifaces.get_mut(index));
 
+            // A link coming back can mean a different network, so re-run both configuration
+            // protocols instead of trusting what was learned before it dropped. Done before
+            // the dispatches below so the first packet leaves in this poll.
+            #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
+            {
+                let iface = self.ifaces.get_mut(index);
+                let link_state = iface.driver.link_state();
+                let came_up = link_state != iface.last_link_state && link_state == crate::driver::LinkState::Up;
+                iface.last_link_state = link_state;
+                if came_up {
+                    #[cfg(feature = "dhcpv4")]
+                    iface.dhcpv4_reset(&mut self.inner);
+                    #[cfg(feature = "slaac")]
+                    if let Some(slaac) = iface.slaac.as_mut() {
+                        slaac.restart();
+                    }
+                }
+            }
+
             #[cfg(feature = "dhcpv4")]
             self.ifaces.get_mut(index).dhcpv4_dispatch(&mut self.inner);
 
             #[cfg(feature = "slaac")]
             {
                 let iface = self.ifaces.get_mut(index);
-                // An interface coming back up is one of the events RFC 4861 §6.3.7 solicits
-                // on, so ask the network again rather than trusting what was learned before the
-                // link dropped. Checked before the egress below so the solicitation leaves in
-                // this poll rather than the next one.
-                let link_state = iface.driver.link_state();
-                if link_state != iface.last_link_state {
-                    if link_state == crate::driver::LinkState::Up
-                        && let Some(slaac) = iface.slaac.as_mut()
-                    {
-                        slaac.restart_discovery();
-                    }
-                    iface.last_link_state = link_state;
-                }
-                // Nothing leaves a down link, and `ndisc_rs_egress` counts a solicitation as
-                // sent whether or not the driver took it, so soliciting here would spend the
-                // budget on frames that never went out and leave the interface quiet once the
-                // link returned. A driver that cannot report link state reads as `Up`, which
-                // is the default, so this only ever holds back a driver that said otherwise.
-                if link_state == crate::driver::LinkState::Up {
+                // A solicitation counts as sent even if the driver refuses the frame, so
+                // don't spend the budget on a down link.
+                if iface.last_link_state == crate::driver::LinkState::Up {
                     iface.ndisc_rs_egress(&mut self.inner);
                 }
                 if iface.slaac.as_ref().is_some_and(|s| s.sync_required(timestamp)) {
@@ -2699,7 +2702,7 @@ pub(crate) mod test {
     #[cfg(feature = "slaac")]
     use crate::route::RouteOrigin;
     use crate::tcp::State as TcpState;
-    #[cfg(feature = "slaac")]
+    #[cfg(any(feature = "slaac", feature = "dhcpv4"))]
     use crate::test_device::Link;
     use crate::test_device::{Queue, Room, Sent, TestDevice};
     use crate::time::Duration;
@@ -3303,7 +3306,7 @@ pub(crate) mod test {
 
     /// A router advertisement that is not from a link-local source is ignored.
     /// [`test_stack`], also handing out control of the link state the device reports.
-    #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
+    #[cfg(all(any(feature = "slaac", feature = "dhcpv4"), feature = "medium-ethernet"))]
     fn test_stack_with_link(medium: Medium) -> (Stack<'static>, Queue, Sent, Link) {
         let driver = TestDevice::new(medium);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
@@ -3323,12 +3326,39 @@ pub(crate) mod test {
     /// it just after the link comes back. Polling while down is what lets the stack observe
     /// the falling edge.
     #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
+    #[allow(dead_code)]
     fn bounce_link(stack: &mut Stack<'static>, tx: &Sent, link: &Link, at: i64) {
         link.set(crate::driver::LinkState::Down);
         stack.poll(Instant::from_secs(at));
         tx.borrow_mut().clear();
         link.set(crate::driver::LinkState::Up);
         stack.poll(Instant::from_secs(at + 1));
+    }
+
+    /// The same edge restarts the DHCPv4 client, so it asks again on the network it may
+    /// have moved to instead of waiting out its retry timer. That the restart itself drops
+    /// the lease is covered by `dhcpv4::test::test_restart`.
+    #[test]
+    #[cfg(feature = "dhcpv4")]
+    fn test_dhcpv4_restarts_after_link_bounce() {
+        let (mut stack, _rx, tx, link) = test_stack_with_link(Medium::Ethernet);
+        let iface = IfaceHandle::new(0);
+
+        stack
+            .iface(iface)
+            .set_dhcpv4(Some(crate::iface::dhcpv4::DhcpConfig::default()));
+        stack.poll(Instant::from_secs(0));
+        assert_eq!(tx.borrow().len(), 1, "DISCOVER");
+
+        // The retry timer holds the next one back for now.
+        stack.poll(Instant::from_secs(5));
+        assert_eq!(tx.borrow().len(), 1);
+
+        link.set(crate::driver::LinkState::Down);
+        stack.poll(Instant::from_secs(6));
+        link.set(crate::driver::LinkState::Up);
+        stack.poll(Instant::from_secs(7));
+        assert_eq!(tx.borrow().len(), 2, "the link coming back must restart discovery");
     }
 
     /// RFC 4861 section 6.3.7 stops solicitation once a router answers, but only "until the
@@ -3494,11 +3524,10 @@ pub(crate) mod test {
         assert_eq!(route.origin, RouteOrigin::Slaac, "the default route must survive too");
     }
 
-    /// The public escape hatch, for a driver that cannot report link state and so always
-    /// reads as `Up`. Nothing observes an edge here: the caller says when to re-check.
+    /// The manual path, for a driver that cannot report link state.
     #[test]
     #[cfg(feature = "slaac")]
-    fn test_slaac_restart_discovery_by_hand() {
+    fn test_slaac_restart_by_hand() {
         let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
         let iface = IfaceHandle::new(0);
         let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
@@ -3525,7 +3554,7 @@ pub(crate) mod test {
 
         // The link never changed, so only an explicit call can restart discovery.
         let now = Instant::from_secs(30);
-        stack.iface(iface).restart_slaac_discovery();
+        stack.iface(iface).restart_slaac();
         stack.poll(now);
         assert_eq!(tx.borrow().len(), 1, "an explicit restart must solicit");
         let frame = tx.borrow()[0].clone();
@@ -3540,15 +3569,14 @@ pub(crate) mod test {
         assert!(stack.routes().get_default_ipv6_route().is_some());
     }
 
-    /// Turning SLAAC off leaves nothing to restart, so the call is a no-op rather than a
-    /// panic. Worth pinning: it is reachable from any consumer holding an `Iface`.
+    /// With SLAAC off there is nothing to restart, so the call is a no-op.
     #[test]
     #[cfg(feature = "slaac")]
-    fn test_slaac_restart_discovery_without_slaac_is_a_noop() {
+    fn test_slaac_restart_without_slaac_is_a_noop() {
         let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
         let iface = IfaceHandle::new(0);
 
-        stack.iface(iface).restart_slaac_discovery();
+        stack.iface(iface).restart_slaac();
         stack.poll(Instant::from_secs(1));
         assert!(tx.borrow().is_empty(), "no SLAAC, nothing to solicit");
     }

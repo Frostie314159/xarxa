@@ -172,12 +172,9 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) dhcpv4: Option<self::dhcpv4::Client>,
     #[cfg(feature = "slaac")]
     pub(crate) slaac: Option<self::slaac::Slaac>,
-    /// Link state as of the previous poll, so a down->up edge can be spotted.
-    ///
-    /// Starts `Down` so the first poll reads as the interface coming up, which is what
-    /// RFC 4861 §6.3.7 solicits on. That edge is a no-op in practice: a fresh
-    /// `Slaac` is already in `Phase::Start` with a full solicitation budget.
-    #[cfg(feature = "slaac")]
+    /// Link state at the previous poll, for spotting the down-to-up edge. Starts
+    /// `Down`, so an interface whose link is already up restarts once, harmlessly.
+    #[cfg(any(feature = "dhcpv4", feature = "slaac"))]
     pub(crate) last_link_state: crate::driver::LinkState,
     #[cfg(feature = "multicast")]
     pub(crate) multicast: crate::multicast::State,
@@ -448,25 +445,14 @@ impl<'d> Iface<'_, 'd> {
         iface.slaac = config.map(self::slaac::Slaac::new);
     }
 
-    /// Ask the network for router advertisements again, keeping the addresses and
-    /// routes already configured.
+    /// Solicit routers again, keeping the addresses and routes already configured.
     ///
-    /// [`Stack::poll`] calls this by itself when the driver reports the link coming back
-    /// up, which is the case RFC 4861 §6.3.7 describes. Call it directly for a driver
-    /// that cannot report link state and so always reads as [`LinkState::Up`], or after
-    /// some other event that means the interface may have moved to a different network.
-    ///
-    /// Solicitations still keep to their normal spacing, so calling this repeatedly does
-    /// not send them any faster.
-    ///
-    /// Does nothing when SLAAC is off. To discard what SLAAC configured rather than
-    /// re-check it, use [`set_slaac`](Self::set_slaac).
-    ///
-    /// [`LinkState::Up`]: crate::driver::LinkState::Up
+    /// [`Stack::poll`] does this when the link comes back up; call it directly for a
+    /// driver that cannot report link state. Does nothing if SLAAC is off.
     #[cfg(feature = "slaac")]
-    pub fn restart_slaac_discovery(&mut self) {
+    pub fn restart_slaac(&mut self) {
         if let Some(slaac) = self.state_mut().slaac.as_mut() {
-            slaac.restart_discovery();
+            slaac.restart();
         }
     }
 
@@ -484,8 +470,8 @@ impl<'d> Iface<'_, 'd> {
 
     /// Drop the DHCPv4 lease, if any, and look for a server again.
     ///
-    /// Call this when the link went down and came back up, so an address on the
-    /// new network is obtained right away. Does nothing if the client is off.
+    /// [`Stack::poll`] does this when the link comes back up; call it directly for a
+    /// driver that cannot report link state. Does nothing if the client is off.
     #[cfg(feature = "dhcpv4")]
     pub fn restart_dhcpv4(&mut self) {
         let Iface { inner, ifaces, index } = self;
