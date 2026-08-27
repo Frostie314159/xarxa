@@ -1,0 +1,65 @@
+name: Docs
+
+on:
+  push:
+    branches: [main]
+
+env:
+  CARGO_BATCH_REV: ad0234a465b202794286f28125370df1dcfa507d
+  DOCSERVER_REV: f024dc8ca0dceb7f1211d2afa957c5cc80909682
+
+jobs:
+  doc:
+    runs-on: ubuntu-latest
+    if: github.repository == 'embassy-rs/xarxa'
+
+    # This will ensure at most one doc build job is running at a time
+    # If another job is already running, the new job will wait.
+    # If another job is already waiting, it'll be canceled.
+    # This means some commits will be skipped, but that's fine because
+    # we only care that the latest gets built.
+    concurrency: doc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: mv rust-toolchain-nightly.toml rust-toolchain.toml
+
+      - name: Restore tools cache
+        id: tools-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-batch
+            ~/.cargo/bin/docserver
+          key: tools-${{env.CARGO_BATCH_REV}}-${{env.DOCSERVER_REV}}
+
+      - name: Install docserver
+        run: |
+          command -v cargo-batch || cargo install --git https://github.com/embassy-rs/cargo-batch cargo --bin cargo-batch --locked --rev $CARGO_BATCH_REV
+          command -v docserver || cargo install --git https://github.com/embassy-rs/docserver --locked --rev $DOCSERVER_REV
+
+      # Save right after installing, not in a post-job step, so the tools stay
+      # cached even if the doc build below fails.
+      - name: Save tools cache
+        if: steps.tools-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-batch
+            ~/.cargo/bin/docserver
+          key: tools-${{env.CARGO_BATCH_REV}}-${{env.DOCSERVER_REV}}
+
+      - name: build
+        run: |
+          docserver build -i . -o webroot/crates/xarxa/git.zup --output-static webroot/static
+          docserver build -i xarxa-driver -o webroot/crates/xarxa-driver/git.zup
+
+      - name: upload
+        run: |
+          mkdir -p ~/.kube
+          echo "${{secrets.KUBECONFIG}}" > ~/.kube/config
+          POD=$(kubectl -n embassy get po -l app=docserver -o jsonpath={.items[0].metadata.name})
+          kubectl cp webroot/crates $POD:/data
+          kubectl cp webroot/static $POD:/data
