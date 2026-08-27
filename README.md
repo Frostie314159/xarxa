@@ -60,14 +60,9 @@ _xarxa_ makes the core work with the packet bytes directly instead. Why?
 
 ## Benchmarks
 
-_xarxa_ is faster and smaller than _smoltcp_. Code size and TCP perf don't quite reach lwIP.
+_xarxa_ is faster and smaller than _smoltcp_, and roughly matches lwIP.
 ![throughput](https://raw.githubusercontent.com/embassy-rs/xarxa-bench/refs/heads/main/bench-throughput.svg)
 ![codesize](https://raw.githubusercontent.com/embassy-rs/xarxa-bench/refs/heads/main/bench-codesize.svg)
-
-Notes:
-
-- lwIP TCP RX is zero-copy, which is why it's so much faster. The API is different, it hands the data to the user by *calling a callback synchronously from ingress code*. This is unfair against xarxa and smoltcp: they could also easily do zero-copy TCP RX if they were also allowed to have such a terrible API.
-- lwIP TCP TX is one-copy (it could be zero copy but it would again be unfair, since it forces the application to let the buffer live until the hardware is done with it). I haven't yet investigated why it's so fast even if it does one copy.
 
 Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-bench).
 
