@@ -781,12 +781,14 @@ impl IfaceState<'_> {
     pub(crate) fn dhcpv4_reset(&mut self, inner: &mut StackInner) {
         let Some(client) = &mut self.dhcpv4 else { return };
         trace!("DHCP reset");
-        let old = core::mem::replace(
-            &mut client.state,
-            ClientState::Discovering(DiscoverState {
-                retry_at: Instant::from_millis(0),
-            }),
-        );
+        // A client that was already discovering keeps its backoff, so a flapping link
+        // cannot put a DISCOVER on the wire per flap. One that had a lease has just lost
+        // it, so it looks again straight away.
+        let retry_at = match &client.state {
+            ClientState::Discovering(state) => state.retry_at,
+            _ => Instant::from_millis(0),
+        };
+        let old = core::mem::replace(&mut client.state, ClientState::Discovering(DiscoverState { retry_at }));
         if let ClientState::Renewing(state) = old {
             self.dhcpv4_apply(inner, None, Some(&state.lease));
         }
@@ -851,9 +853,10 @@ mod test {
 
     use super::*;
     use crate::driver::Checksum;
+    use crate::driver::LinkState;
     use crate::iface::{IfaceHandle, Medium};
     use crate::stack::Stack;
-    use crate::test_device::{Queue, Sent, TestDevice};
+    use crate::test_device::{Link, Queue, Sent, TestDevice};
     use crate::wire::{
         ArpPacket, DhcpOpCode, ETHERNET_HEADER_LEN, EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress,
         IpProtocol, Ipv4Packet,
@@ -869,13 +872,19 @@ mod test {
 
     /// A stack with one Ethernet interface, no addresses, DHCP on.
     fn test_stack() -> (Stack<'static>, Queue, Sent) {
+        let (stack, rx, tx, _link) = test_stack_with_checksum(ChecksumCapabilities::default());
+        (stack, rx, tx)
+    }
+
+    /// [`test_stack`], also handing out control of the link state the device reports.
+    fn test_stack_with_link() -> (Stack<'static>, Queue, Sent, Link) {
         test_stack_with_checksum(ChecksumCapabilities::default())
     }
 
     /// [`test_stack`], with a device that claims to handle the given checksums itself.
-    fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
+    fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent, Link) {
         let driver = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
-        let (rx, tx) = (driver.rx.clone(), driver.tx.clone());
+        let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
         let mut stack = Stack::new(1);
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         assert_eq!(handle, IFACE);
@@ -884,7 +893,7 @@ mod test {
         stack.poll(at(0));
         tx.borrow_mut().clear();
         stack.iface(handle).set_dhcpv4(Some(DhcpConfig::default()));
-        (stack, rx, tx)
+        (stack, rx, tx, link)
     }
 
     fn at(secs: i64) -> Instant {
@@ -1017,11 +1026,17 @@ mod test {
     /// Drive the client to BOUND: DISCOVER, OFFER, REQUEST, ACK. Returns the stack
     /// with the lease applied at `at(2)`.
     fn bound_stack() -> (Stack<'static>, Queue, Sent) {
+        let (stack, rx, tx, _link) = bound_stack_with(DhcpConfig::default());
+        (stack, rx, tx)
+    }
+
+    /// [`bound_stack`], also handing out control of the link state the device reports.
+    fn bound_stack_with_link() -> (Stack<'static>, Queue, Sent, Link) {
         bound_stack_with(DhcpConfig::default())
     }
 
-    fn bound_stack_with(config: DhcpConfig) -> (Stack<'static>, Queue, Sent) {
-        let (mut stack, rx, tx) = test_stack();
+    fn bound_stack_with(config: DhcpConfig) -> (Stack<'static>, Queue, Sent, Link) {
+        let (mut stack, rx, tx, link) = test_stack_with_link();
         stack.iface(IFACE).set_dhcpv4(Some(config));
 
         // First poll: DISCOVER, from 0.0.0.0 to broadcast.
@@ -1090,7 +1105,7 @@ mod test {
         assert_eq!(route.origin, RouteOrigin::Dhcpv4);
         assert_ne!(stack.iface(IFACE).config_generation(), generation);
 
-        (stack, rx, tx)
+        (stack, rx, tx, link)
     }
 
     /// The interface's IPv4 addresses, leaving out the automatic IPv6 link-local.
@@ -1154,7 +1169,7 @@ mod test {
         // cache entry (60 s) is still fresh.
         let mut config = DhcpConfig::default();
         config.max_lease_duration = Some(Duration::from_secs(60));
-        let (mut stack, rx, tx) = bound_stack_with(config);
+        let (mut stack, rx, tx, _link) = bound_stack_with(config);
 
         // Learn the server's MAC, so the renewal isn't parked on ARP.
         rx.borrow_mut().push_back(arp_request_from_server());
@@ -1280,6 +1295,49 @@ mod test {
         assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
     }
 
+    /// The same restart runs by itself when the link comes back, so a client that may
+    /// have moved networks does not keep using a lease from the old one.
+    #[test]
+    fn test_restart_on_link_up() {
+        let (mut stack, _rx, tx, link) = bound_stack_with_link();
+        assert!(stack.iface(IFACE).dhcpv4_lease().is_some());
+
+        link.set(LinkState::Down);
+        stack.poll(at(3));
+        link.set(LinkState::Up);
+        stack.poll(at(4));
+
+        assert!(
+            stack.iface(IFACE).dhcpv4_lease().is_none(),
+            "a lease must not survive the link going away"
+        );
+        let mut sent = parse_sent(tx.borrow().last().unwrap());
+        assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
+    }
+
+    /// Losing the lease means discovering at once, but flapping after that keeps the
+    /// retransmit backoff rather than putting a DISCOVER on the wire per flap.
+    #[test]
+    fn test_link_flap_keeps_discover_backoff() {
+        let (mut stack, _rx, tx, link) = bound_stack_with_link();
+
+        link.set(LinkState::Down);
+        stack.poll(at(3));
+        link.set(LinkState::Up);
+        stack.poll(at(4));
+        let after_first = tx.borrow().len();
+
+        link.set(LinkState::Down);
+        stack.poll(at(5));
+        link.set(LinkState::Up);
+        stack.poll(at(6));
+        assert_eq!(
+            tx.borrow().len(),
+            after_first,
+            "a flapping link must not outpace the DISCOVER backoff"
+        );
+    }
+
     #[test]
     fn test_extra_options() {
         let (mut stack, _rx, tx) = test_stack();
@@ -1360,7 +1418,7 @@ mod test {
         let mut caps = ChecksumCapabilities::default();
         caps.ipv4 = Checksum::None;
         caps.udp = Checksum::None;
-        let (mut stack, _rx, tx) = test_stack_with_checksum(caps);
+        let (mut stack, _rx, tx, _link) = test_stack_with_checksum(caps);
         stack.poll(at(0));
 
         let mut frame = tx.borrow()[0].clone();

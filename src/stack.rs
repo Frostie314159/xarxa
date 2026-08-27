@@ -2702,7 +2702,7 @@ pub(crate) mod test {
     #[cfg(feature = "slaac")]
     use crate::route::RouteOrigin;
     use crate::tcp::State as TcpState;
-    #[cfg(any(feature = "slaac", feature = "dhcpv4"))]
+    #[cfg(feature = "slaac")]
     use crate::test_device::Link;
     use crate::test_device::{Queue, Room, Sent, TestDevice};
     use crate::time::Duration;
@@ -3306,7 +3306,7 @@ pub(crate) mod test {
 
     /// A router advertisement that is not from a link-local source is ignored.
     /// [`test_stack`], also handing out control of the link state the device reports.
-    #[cfg(all(any(feature = "slaac", feature = "dhcpv4"), feature = "medium-ethernet"))]
+    #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
     fn test_stack_with_link(medium: Medium) -> (Stack<'static>, Queue, Sent, Link) {
         let driver = TestDevice::new(medium);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
@@ -3326,39 +3326,12 @@ pub(crate) mod test {
     /// it just after the link comes back. Polling while down is what lets the stack observe
     /// the falling edge.
     #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
-    #[allow(dead_code)]
     fn bounce_link(stack: &mut Stack<'static>, tx: &Sent, link: &Link, at: i64) {
         link.set(crate::driver::LinkState::Down);
         stack.poll(Instant::from_secs(at));
         tx.borrow_mut().clear();
         link.set(crate::driver::LinkState::Up);
         stack.poll(Instant::from_secs(at + 1));
-    }
-
-    /// The same edge restarts the DHCPv4 client, so it asks again on the network it may
-    /// have moved to instead of waiting out its retry timer. That the restart itself drops
-    /// the lease is covered by `dhcpv4::test::test_restart`.
-    #[test]
-    #[cfg(feature = "dhcpv4")]
-    fn test_dhcpv4_restarts_after_link_bounce() {
-        let (mut stack, _rx, tx, link) = test_stack_with_link(Medium::Ethernet);
-        let iface = IfaceHandle::new(0);
-
-        stack
-            .iface(iface)
-            .set_dhcpv4(Some(crate::iface::dhcpv4::DhcpConfig::default()));
-        stack.poll(Instant::from_secs(0));
-        assert_eq!(tx.borrow().len(), 1, "DISCOVER");
-
-        // The retry timer holds the next one back for now.
-        stack.poll(Instant::from_secs(5));
-        assert_eq!(tx.borrow().len(), 1);
-
-        link.set(crate::driver::LinkState::Down);
-        stack.poll(Instant::from_secs(6));
-        link.set(crate::driver::LinkState::Up);
-        stack.poll(Instant::from_secs(7));
-        assert_eq!(tx.borrow().len(), 2, "the link coming back must restart discovery");
     }
 
     /// RFC 4861 section 6.3.7 stops solicitation once a router answers, but only "until the
