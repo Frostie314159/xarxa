@@ -4,8 +4,7 @@
 
 use core::fmt;
 
-/// Maximum number of contiguous data ranges (and thus holes) tracked by an [`Assembler`].
-pub use crate::config::ASSEMBLER_MAX_SEGMENT_COUNT;
+use crate::config::ASSEMBLER_MAX_SEGMENT_COUNT;
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

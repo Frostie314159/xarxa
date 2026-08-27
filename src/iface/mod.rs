@@ -16,7 +16,8 @@ pub mod slaac;
 pub use crate::multicast::MulticastError;
 
 use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
-use crate::driver::{Capabilities, ChecksumCapabilities, Driver, LinkState, PACKET_BUF_SIZE};
+use crate::driver::config::PACKET_BUF_SIZE;
+use crate::driver::{Capabilities, ChecksumCapabilities, Driver, LinkState};
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 use crate::fragmentation::Fragmenter;
 use crate::stack::{Stack, StackInner};
@@ -298,7 +299,8 @@ impl<'d> Iface<'_, 'd> {
     ///
     /// Errors:
     /// - `Full` if the interface has no room for another address. Only possible
-    ///   without the `alloc` feature, where the `iface-addr-count-N` feature sets the limit.
+    ///   without the `alloc` feature, where the limit is
+    ///   [`IFACE_ADDR_COUNT`].
     pub fn add_ip_addr(&mut self, cidr: IpCidr) -> core::result::Result<Option<IpCidr>, Full> {
         assert!(
             cidr.address().is_unicast(),
@@ -342,8 +344,8 @@ impl<'d> Iface<'_, 'd> {
     ///
     /// Errors:
     /// - `Full` if the addresses do not fit. Only possible without the `alloc`
-    ///   feature, where the `iface-addr-count-N` feature sets the limit. The
-    ///   interface is left unchanged.
+    ///   feature, where the limit is [`IFACE_ADDR_COUNT`].
+    ///   The interface is left unchanged.
     pub fn set_ip_addrs(&mut self, new_addrs: impl IntoIterator<Item = IpCidr>) -> core::result::Result<(), Full> {
         #[allow(unused_mut)]
         let mut addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT> = Vec::new();

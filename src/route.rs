@@ -117,7 +117,7 @@ impl Routes {
     ///
     /// Errors:
     /// - `Full` if the table has no room. Only possible without the `alloc`
-    ///   feature, where the size is set by the `route-count-N` feature.
+    ///   feature, where the limit is [`ROUTE_COUNT`].
     pub fn add(&mut self, route: Route) -> Result<(), Full> {
         self.storage.push(route).map_err(|_| Full)
     }
@@ -166,7 +166,7 @@ impl Routes {
     ///
     /// Errors:
     /// - `Full` if the table has no room. Only possible without the `alloc`
-    ///   feature, where the `route-count-N` feature sets the limit.
+    ///   feature, where the limit is [`ROUTE_COUNT`].
     #[cfg(feature = "ipv4")]
     pub fn add_default_ipv4_route(&mut self, gateway: Ipv4Address, iface: IfaceHandle) -> Result<Option<Route>, Full> {
         let old = self.remove_default_ipv4_route();
@@ -181,7 +181,7 @@ impl Routes {
     ///
     /// Errors:
     /// - `Full` if the table has no room. Only possible without the `alloc`
-    ///   feature, where the `route-count-N` feature sets the limit.
+    ///   feature, where the limit is [`ROUTE_COUNT`].
     #[cfg(feature = "ipv6")]
     pub fn add_default_ipv6_route(&mut self, gateway: Ipv6Address, iface: IfaceHandle) -> Result<Option<Route>, Full> {
         let old = self.remove_default_ipv6_route();

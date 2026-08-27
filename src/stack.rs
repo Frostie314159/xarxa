@@ -420,7 +420,8 @@ impl<'d> Stack<'d> {
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another interface. Only possible
-    ///   without the `alloc` feature, where the `iface-count-N` feature sets the limit.
+    ///   without the `alloc` feature, where the limit is
+    ///   [`IFACE_COUNT`].
     #[cfg(feature = "alloc")]
     pub fn add_iface(&mut self, driver: alloc::boxed::Box<dyn Driver + 'd>) -> core::result::Result<IfaceHandle, Full> {
         self.add_iface_inner(driver.into())
@@ -439,7 +440,8 @@ impl<'d> Stack<'d> {
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another interface. Only possible
-    ///   without the `alloc` feature, where the `iface-count-N` feature sets the limit.
+    ///   without the `alloc` feature, where the limit is
+    ///   [`IFACE_COUNT`].
     pub fn add_iface_borrowed(&mut self, driver: &'d mut dyn Driver) -> core::result::Result<IfaceHandle, Full> {
         self.add_iface_inner(driver.into())
     }
@@ -548,7 +550,8 @@ impl<'d> Stack<'d> {
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another UDP socket. Only possible
-    ///   without the `alloc` feature, where the `udp-socket-count-N` feature sets the limit.
+    ///   without the `alloc` feature, where the limit is
+    ///   [`UDP_SOCKET_COUNT`].
     #[cfg(feature = "udp")]
     pub fn add_udp_socket(&mut self) -> core::result::Result<UdpHandle, Full> {
         Ok(UdpHandle::new(self.sockets.udp.add_with(|_| UdpSocketState::new())?))
@@ -584,7 +587,8 @@ impl<'d> Stack<'d> {
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another raw socket. Only possible
-    ///   without the `alloc` feature, where the `raw-socket-count-N` feature sets the limit.
+    ///   without the `alloc` feature, where the limit is
+    ///   [`RAW_SOCKET_COUNT`].
     #[cfg(feature = "raw")]
     pub fn add_raw_socket(&mut self) -> core::result::Result<RawHandle, Full> {
         Ok(RawHandle::new(self.sockets.raw.add_with(|_| RawSocketState::new())?))
@@ -626,7 +630,8 @@ impl<'d> Stack<'d> {
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another TCP socket. Only possible
-    ///   without the `alloc` feature, where the `tcp-socket-count-N` feature sets the limit.
+    ///   without the `alloc` feature, where the limit is
+    ///   [`TCP_SOCKET_COUNT`].
     #[cfg(all(feature = "tcp", feature = "alloc"))]
     pub fn add_tcp_socket(&mut self, rx_capacity: usize, tx_capacity: usize) -> core::result::Result<TcpHandle, Full> {
         self.add_tcp_socket_inner(
@@ -654,7 +659,8 @@ impl<'d> Stack<'d> {
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another TCP socket. Only possible
-    ///   without the `alloc` feature, where the `tcp-socket-count-N` feature sets the limit.
+    ///   without the `alloc` feature, where the limit is
+    ///   [`TCP_SOCKET_COUNT`].
     #[cfg(feature = "tcp")]
     pub fn add_tcp_socket_with_bufs(
         &mut self,
@@ -710,7 +716,8 @@ impl<'d> Stack<'d> {
     ///
     /// Errors:
     /// - `Full` if the stack has no room for another listener. Only possible
-    ///   without the `alloc` feature, where the `tcp-listener-count-N` feature sets the limit.
+    ///   without the `alloc` feature, where the limit is
+    ///   [`TCP_LISTENER_COUNT`].
     #[cfg(feature = "tcp-listener")]
     pub fn add_tcp_listener(&mut self) -> core::result::Result<TcpListenerHandle, Full> {
         Ok(TcpListenerHandle::new(
@@ -4651,7 +4658,7 @@ pub(crate) mod test {
                 100,
                 ip_mtu,
                 ip_mtu + 1,
-                crate::driver::PACKET_BUF_SIZE - LINK_HEADER_LEN,
+                crate::driver::config::PACKET_BUF_SIZE - LINK_HEADER_LEN,
             ] {
                 tx.borrow_mut().clear();
 

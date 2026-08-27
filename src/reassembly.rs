@@ -11,7 +11,8 @@ use core::fmt;
 use core::result::Result;
 
 use crate::config::REASSEMBLY_BUFFER_COUNT;
-use crate::driver::{PACKET_BUF_SIZE, PacketBuf};
+use crate::driver::PacketBuf;
+use crate::driver::config::PACKET_BUF_SIZE;
 use crate::stack::Stack;
 use crate::storage::Assembler;
 use crate::time::{Duration, Instant};

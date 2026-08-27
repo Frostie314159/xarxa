@@ -17,6 +17,9 @@ use byteorder::{ByteOrder, NetworkEndian};
 use heapless::Vec;
 
 use super::{AddrOrigin, IfaceAddr, IfaceState};
+use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
+#[cfg(feature = "dhcpv4-options")]
+use crate::config::DHCP_OPTIONS_BUF_SIZE;
 use crate::driver::ChecksumCapabilities;
 use crate::driver::PacketBuf;
 use crate::route::{Route, RouteOrigin};
@@ -41,12 +44,6 @@ const MIN_RENEW_TIMEOUT: Duration = Duration::from_secs(60);
 
 const DEFAULT_PARAMETER_REQUEST_LIST: &[u8] =
     &[field::OPT_SUBNET_MASK, field::OPT_ROUTER, field::OPT_DOMAIN_NAME_SERVER];
-
-/// The most DNS servers a client keeps from a lease. Set by the `dhcp-max-dns-server-count-N` feature.
-pub use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
-/// The size of the raw options buffer in a lease. Set by the `dhcp-options-buf-size-N` feature.
-#[cfg(feature = "dhcpv4-options")]
-pub use crate::config::DHCP_OPTIONS_BUF_SIZE;
 
 /// A lease obtained from a DHCP server.
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -80,8 +77,8 @@ pub struct DhcpServerInfo {
 
 /// The received options of a lease. See [`DhcpLease::options`].
 ///
-/// Options that don't fit in the buffer are dropped. The buffer size is set by
-/// the `dhcp-options-buf-size-N` feature.
+/// Options that don't fit in the buffer are dropped. The buffer size is
+/// [`DHCP_OPTIONS_BUF_SIZE`].
 #[cfg(feature = "dhcpv4-options")]
 #[derive(Clone)]
 pub struct DhcpLeaseOptions {

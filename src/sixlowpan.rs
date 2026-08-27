@@ -116,8 +116,9 @@ impl Iface<'_, '_> {
     ///
     /// Errors:
     /// - `Full` if the contexts do not fit. Only possible without the `alloc`
-    ///   feature, where the `sixlowpan-address-context-count-N` feature sets the
-    ///   limit. The interface is left unchanged.
+    ///   feature, where the limit is
+    ///   [`SIXLOWPAN_ADDRESS_CONTEXT_COUNT`].
+    ///   The interface is left unchanged.
     pub fn set_sixlowpan_address_context(
         &mut self,
         contexts: impl IntoIterator<Item = SixlowpanAddressContext>,

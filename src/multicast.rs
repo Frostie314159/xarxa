@@ -19,7 +19,7 @@ pub enum MulticastError {
     /// Cannot join/leave the given multicast group.
     Unaddressable,
     /// The group table is full. Only possible without the `alloc` feature, where
-    /// the size is set by the `multicast-group-count-N` feature.
+    /// the limit is [`MULTICAST_GROUP_COUNT`].
     TooManyGroups,
 }
 

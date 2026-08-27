@@ -14,7 +14,7 @@ use core::cmp::min;
 #[cfg(feature = "async")]
 use core::task::Waker;
 
-use crate::config::DNS_MAX_QUERY_COUNT;
+use crate::config::{DNS_MAX_NAME_SIZE, DNS_MAX_QUERY_COUNT, DNS_MAX_RESULT_COUNT, DNS_MAX_SERVER_COUNT};
 use crate::storage::{Full, Slab};
 use heapless::Vec;
 
@@ -26,13 +26,6 @@ use crate::wire::{self, IpAddress, IpEndpoint, IpListenEndpoint};
 
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
-
-/// Maximum length of a name, in wire format. Set by the `dns-max-name-size-N` feature.
-pub use crate::config::DNS_MAX_NAME_SIZE;
-/// Maximum number of addresses returned by one query. Set by the `dns-max-result-count-N` feature.
-pub use crate::config::DNS_MAX_RESULT_COUNT;
-/// Maximum number of DNS servers. Set by the `dns-max-server-count-N` feature.
-pub use crate::config::DNS_MAX_SERVER_COUNT;
 
 const DNS_PORT: u16 = 53;
 const MDNS_DNS_PORT: u16 = 5353;
@@ -54,8 +47,8 @@ pub enum StartQueryError {
     InvalidName,
     /// The name is longer than [`DNS_MAX_NAME_SIZE`] in wire format.
     NameTooLong,
-    /// Too many queries are in flight. The limit is set by the
-    /// `dns-max-query-count-N` feature.
+    /// Too many queries are in flight. The limit is
+    /// [`DNS_MAX_QUERY_COUNT`].
     NoFreeSlot,
 }
 

@@ -13,29 +13,9 @@ use core::ptr::NonNull;
 
 use portable_atomic::{AtomicU32, Ordering};
 
+use crate::config::PACKET_BUF_SIZE;
 use crate::meta::PacketMeta;
 
-/// Alignment of the buffer in a [`PacketBuf`], in bytes.
-///
-/// Set with the `packet-buf-align-N` cargo features.
-/// If several values are set, the highest wins.
-pub const PACKET_BUF_ALIGN: usize = cfg_select! {
-    feature = "packet-buf-align-32" => 32,
-    feature = "packet-buf-align-16" => 16,
-    feature = "packet-buf-align-8" => 8,
-    feature = "packet-buf-align-4" => 4,
-    feature = "packet-buf-align-2" => 2,
-    _ => 1,
-};
-
-/// Size of the buffer in a [`PacketBuf`].
-///
-/// Currently hardcoded to 1514 (max size of an Ethernet frame without FCS)
-/// rounded up to [`PACKET_BUF_ALIGN`].
-/// TODO: make configurable
-pub const PACKET_BUF_SIZE: usize = 1514usize.next_multiple_of(PACKET_BUF_ALIGN);
-
-/// Number of buffers in the pool.
 #[cfg(not(test))]
 const PACKET_BUF_COUNT: usize = crate::config::PACKET_BUF_COUNT;
 // The unit tests run in parallel threads of one process, all sharing the one
@@ -291,7 +271,7 @@ impl PacketBuf {
 
     /// The whole underlying storage, ignoring headroom and length.
     ///
-    /// The returned slice is aligned to [`PACKET_BUF_ALIGN`], and its length
+    /// The returned slice is aligned to [`PACKET_BUF_ALIGN`](crate::config::PACKET_BUF_ALIGN), and its length
     /// ([`PACKET_BUF_SIZE`]) is a multiple of it.
     pub fn storage_mut(&mut self) -> &mut [u8] {
         &mut self.inner_mut().data[..]
@@ -344,6 +324,7 @@ impl defmt::Format for PacketBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::PACKET_BUF_ALIGN;
 
     #[test]
     fn push_pull() {
