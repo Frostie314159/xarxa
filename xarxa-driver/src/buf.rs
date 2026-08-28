@@ -11,7 +11,7 @@ use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 
-use portable_atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::config::PACKET_BUF_SIZE;
 use crate::meta::PacketMeta;
@@ -80,6 +80,7 @@ static POOL: Pool = Pool {
 };
 
 /// Claim a free slot: the first zero bit of the bitmap, set with a CAS.
+#[cfg(target_has_atomic = "32")]
 fn alloc_slot() -> Option<usize> {
     for (w, word) in POOL.used.iter().enumerate() {
         let mut cur = word.load(Ordering::Relaxed);
@@ -106,8 +107,47 @@ fn alloc_slot() -> Option<usize> {
 }
 
 /// Give a slot back: clear its bit.
+#[cfg(target_has_atomic = "32")]
 fn free_slot(index: usize) {
     POOL.used[index / 32].fetch_and(!(1 << (index % 32)), Ordering::Release);
+}
+
+// Fallback for targets with 32-bit atomic load/store but no atomic
+// read-modify-write (e.g. thumbv6m): the whole bit update runs inside a
+// critical section, so a plain load + store can't race another one. The
+// Acquire load here still pairs with the Release store in `free_slot`, same
+// as the atomic version.
+
+/// Claim a free slot: the first zero bit of the bitmap.
+#[cfg(not(target_has_atomic = "32"))]
+fn alloc_slot() -> Option<usize> {
+    critical_section::with(|_| {
+        for (w, word) in POOL.used.iter().enumerate() {
+            let cur = word.load(Ordering::Acquire);
+            let bit = cur.trailing_ones() as usize;
+            if bit >= 32 {
+                continue;
+            }
+            let index = w * 32 + bit;
+            if index >= PACKET_BUF_COUNT {
+                // Only the last word can have bits past the end. Everything
+                // before it was full, so the pool is.
+                return None;
+            }
+            word.store(cur | (1 << bit), Ordering::Relaxed);
+            return Some(index);
+        }
+        None
+    })
+}
+
+/// Give a slot back: clear its bit.
+#[cfg(not(target_has_atomic = "32"))]
+fn free_slot(index: usize) {
+    critical_section::with(|_| {
+        let word = &POOL.used[index / 32];
+        word.store(word.load(Ordering::Relaxed) & !(1 << (index % 32)), Ordering::Release);
+    })
 }
 
 /// An owned network packet buffer.
