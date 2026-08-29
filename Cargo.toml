@@ -110,6 +110,9 @@ tcp-timestamps = ["tcp"]
 tcp-sack = ["tcp"]
 ## Automatically reply to pings (ICMP echo requests).
 icmp-ping-reply = []
+## Bind sockets to an interface with `bind_to_iface`. A bound socket only
+## receives packets that arrive on that interface, and only sends out of it.
+iface-bind = []
 ## Deliver incoming ICMP error messages (destination unreachable, packet too big, ...) to
 ## the sockets that provoked them.
 icmp-errors = []
@@ -456,6 +459,10 @@ required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6
 [[example]]
 name = "tcp_client"
 required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "tcp"]
+
+[[example]]
+name = "ping"
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "raw"]
 
 [[example]]
 name = "dns"

@@ -7,8 +7,9 @@ use super::{
     TcpSocketState, Tuple,
 };
 use crate::config::{TCP_LISTENER_BACKLOG, TCP_LISTENER_COUNT, TCP_SOCKET_COUNT};
+use crate::iface::IfaceHandle;
 use crate::rand::Rand;
-use crate::stack::{Stack, addr_score};
+use crate::stack::{IfaceBinding, Stack, addr_score};
 use crate::storage::{BoundedDeque, Slab};
 use crate::tcp::TcpSeqNumber;
 use crate::tcp::congestion::Controller as _;
@@ -52,6 +53,8 @@ pub(crate) struct TcpListenerState {
     /// address scopes the listen, from any address of any version down to one
     /// exact address.
     local: IpListenEndpoint,
+    /// The interface the listener is bound to. Zero-sized without `iface-bind`.
+    binding: IfaceBinding,
     /// The accept queue: SYNs waiting to be accepted, deduplicated by 4-tuple.
     queue: BoundedDeque<PendingSyn, TCP_LISTENER_BACKLOG>,
     #[cfg(feature = "async")]
@@ -62,22 +65,25 @@ impl TcpListenerState {
     pub(crate) fn new() -> TcpListenerState {
         TcpListenerState {
             local: IpListenEndpoint::UNSPECIFIED,
+            binding: IfaceBinding::Any,
             queue: BoundedDeque::new(),
             #[cfg(feature = "async")]
             accept_waker: WakerRegistration::new(),
         }
     }
 
-    /// Score this listener against a segment to (`dst_addr`, `dst_port`).
+    /// Score this listener against a segment to (`dst_addr`, `dst_port`)
+    /// arriving on `arrival`.
     ///
     /// `None` if the listener does not match, else how specific the match is: an
     /// exact local-address match outscores a per-version one, which outscores a
-    /// wildcard.
-    pub(crate) fn match_score(&self, dst_addr: &IpAddress, dst_port: u16) -> Option<u8> {
+    /// wildcard, and a listener bound to the arrival interface outscores an
+    /// unbound one.
+    pub(crate) fn match_score(&self, arrival: IfaceHandle, dst_addr: &IpAddress, dst_port: u16) -> Option<u8> {
         if self.local.port == 0 || dst_port != self.local.port {
             return None;
         }
-        addr_score(&self.local, dst_addr)
+        Some(self.binding.match_score(arrival)? + addr_score(&self.local, dst_addr)?)
     }
 
     /// Record a SYN aimed at this listener in the accept queue.
@@ -162,6 +168,7 @@ impl TcpListenerState {
 /// left to the caller's RST fallback.
 pub(crate) fn process_listeners(
     listeners: &mut Slab<TcpListenerState, TCP_LISTENER_COUNT>,
+    iface: IfaceHandle,
     src_addr: &IpAddress,
     dst_addr: &IpAddress,
     repr: &TcpRepr,
@@ -170,7 +177,7 @@ pub(crate) fn process_listeners(
         TcpControl::Syn if repr.ack_number.is_none() => {
             let mut best: Option<(usize, u8)> = None;
             for (index, listener) in listeners.iter() {
-                if let Some(score) = listener.match_score(dst_addr, repr.dst_port)
+                if let Some(score) = listener.match_score(iface, dst_addr, repr.dst_port)
                     && best.is_none_or(|(_, best_score)| score > best_score)
                 {
                     best = Some((index, score));
@@ -185,7 +192,7 @@ pub(crate) fn process_listeners(
         }
         TcpControl::Rst => listeners
             .iter_mut()
-            .any(|(_, listener)| listener.process_rst(src_addr, dst_addr, repr)),
+            .any(|(_, listener)| listener.binding.matches(iface) && listener.process_rst(src_addr, dst_addr, repr)),
         _ => false,
     }
 }
@@ -231,7 +238,8 @@ impl<'d> TcpListener<'_, 'd> {
     ///   (unless it is listening on this same endpoint, which is a no-op).
     /// - `Err(ListenError::InUse)` if another listener is bound to an identical
     ///   endpoint. Listeners on the same port with *different* specificity (one
-    ///   wildcard, one per-version, one per-address) may coexist.
+    ///   wildcard, one per-version, one per-address) may coexist, and so may
+    ///   listeners on identical endpoints bound to different interfaces.
     pub fn listen(&mut self, local_endpoint: impl Into<IpListenEndpoint>) -> Result<(), ListenError> {
         let local = local_endpoint.into();
         if local.port == 0 {
@@ -243,12 +251,48 @@ impl<'d> TcpListener<'_, 'd> {
             }
             return Err(ListenError::InvalidState);
         }
-        if self.listeners.iter().any(|(i, l)| i != self.index && l.local == local) {
+        let binding = self.inner().binding;
+        if self
+            .listeners
+            .iter()
+            .any(|(i, l)| i != self.index && l.local == local && l.binding == binding)
+        {
             return Err(ListenError::InUse);
         }
 
         self.inner_mut().local = local;
         Ok(())
+    }
+
+    /// Bind the listener to an interface, or unbind it with `None`.
+    ///
+    /// A listener bound to an interface only accepts connection attempts that arrive on that interface.
+    ///
+    /// When accepting a connection, the sockets inherit the binding.
+    ///
+    /// The listener must be closed. The binding is kept across
+    /// [`close`](Self::close).
+    ///
+    /// Two listeners on the same endpoint can coexist if they are bound to different interfaces,
+    /// or if one is not bound. In the latter case, the bound listener "wins" for incoming
+    /// connections coming from the bound interface.
+    ///
+    /// Returns `Err(ListenError::InvalidState)` if the listener is open.
+    #[cfg(feature = "iface-bind")]
+    pub fn bind_to_iface(&mut self, iface: Option<IfaceHandle>) -> Result<(), ListenError> {
+        if self.is_open() {
+            return Err(ListenError::InvalidState);
+        }
+        self.inner_mut().binding = iface.into();
+        Ok(())
+    }
+
+    /// Return the interface the listener is bound to, or `None`.
+    ///
+    /// See [`bind_to_iface`](Self::bind_to_iface).
+    #[cfg(feature = "iface-bind")]
+    pub fn bound_iface(&self) -> Option<IfaceHandle> {
+        self.inner().binding.iface()
     }
 
     /// Stop listening, dropping all queued SYNs.
@@ -379,6 +423,7 @@ impl<'d> TcpListener<'_, 'd> {
         }
         let state = self.listeners.get_mut(self.index);
         let syn = state.queue.pop_front().ok_or(AcceptError::Exhausted)?;
+        let binding = state.binding;
         trace!(
             "listener:{}: accepting {} into socket {}",
             state.local,
@@ -388,7 +433,7 @@ impl<'d> TcpListener<'_, 'd> {
 
         let s = self.tcp.get_mut(handle.index());
         s.reset();
-        Self::start_syn_received(s, syn, self.rand);
+        Self::start_syn_received(s, syn, binding, self.rand);
         Ok(())
     }
 
@@ -400,10 +445,11 @@ impl<'d> TcpListener<'_, 'd> {
         }
         let state = self.listeners.get_mut(self.index);
         let syn = state.queue.pop_front()?;
+        let binding = state.binding;
         trace!("listener:{}: accepting {}", state.local, syn.tuple);
 
         let mut s = TcpSocketState::new(rx_buffer, tx_buffer);
-        Self::start_syn_received(&mut s, syn, self.rand);
+        Self::start_syn_received(&mut s, syn, binding, self.rand);
 
         // Can't fail: checked for room above.
         Some(TcpHandle::new(unwrap!(self.tcp.add_with(|_| s))))
@@ -412,10 +458,15 @@ impl<'d> TcpListener<'_, 'd> {
     /// Set up a closed socket as the SYN-RECEIVED socket continuing `syn`. This
     /// mirrors what the SYN would have set up in a LISTEN-state socket: the
     /// SYN|ACK itself is built by the socket's dispatch from this state.
-    fn start_syn_received(s: &mut TcpSocketState<'d>, syn: PendingSyn, rand: &mut Rand) {
+    ///
+    /// The socket takes over the listener's interface binding (`binding`),
+    /// overwriting its own: the connection's traffic is on that link, and the
+    /// SYN|ACK and everything after must leave through it.
+    fn start_syn_received(s: &mut TcpSocketState<'d>, syn: PendingSyn, binding: IfaceBinding, rand: &mut Rand) {
         debug_assert_eq!(s.state, State::Closed);
         s.set_state(State::SynReceived);
         s.tuple = Some(syn.tuple);
+        s.binding = binding;
         s.local_seq_no = TcpSocketState::random_seq_no(rand);
         s.remote_seq_no = syn.remote_seq_no;
         s.remote_last_seq = s.local_seq_no;

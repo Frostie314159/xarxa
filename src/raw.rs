@@ -4,10 +4,10 @@
 //!
 //! Raw sockets can be bound in two modes:
 //!
-//! - **Ethernet mode** ([`RawMode::Ethernet`]): whole Ethernet frames on one interface.
-//!   The socket is bound to that interface, and optionally to an ethertype.
-//! - **IP mode** ([`RawMode::Ip`]): whole IP packets on all interfaces. The socket may be
-//!   bound to an IP version and/or an IP protocol, both optional.
+//! - **Ethernet mode** ([`RawMode::Ethernet`]): whole Ethernet frames, optionally
+//!   filtered by ethertype.
+//! - **IP mode** ([`RawMode::Ip`]): whole IP packets on all interfaces. The socket may
+//!   be bound to an IP version and/or an IP protocol, both optional.
 
 use crate::config::RAW_RX_QUEUE_COUNT;
 use crate::storage::BoundedDeque;
@@ -15,11 +15,10 @@ use core::fmt;
 
 use crate::driver::PacketBuf;
 use crate::driver::PacketMeta;
-#[cfg(feature = "medium-ethernet")]
 use crate::iface::IfaceHandle;
 #[cfg(feature = "medium-ethernet")]
 use crate::iface::Medium;
-use crate::stack::{Stack, TxContext};
+use crate::stack::{IfaceBinding, Stack, TxContext};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
 #[cfg(feature = "ipv4")]
@@ -41,17 +40,19 @@ define_handle! {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawMode {
-    /// Send and receive whole Ethernet frames on one interface.
+    /// Send and receive whole Ethernet frames.
+    ///
+    /// The socket receives frames from every Ethernet-medium interface and
+    /// sends out of the first one, unless it is bound to one interface with
+    /// `bind_to_iface` (feature `iface-bind`).
     #[cfg(feature = "medium-ethernet")]
     Ethernet {
-        /// The interface the socket sends and receives on. Its medium must be
-        /// [`Medium::Ethernet`].
-        iface: IfaceHandle,
         /// If set, only frames with this ethertype are received, and only frames
         /// with this ethertype may be sent.
         ethertype: Option<EthernetProtocol>,
     },
-    /// Send and receive whole IP packets, on all interfaces.
+    /// Send and receive whole IP packets, on all interfaces, or on the one
+    /// bound with `bind_to_iface` (feature `iface-bind`).
     Ip {
         /// If set, only packets of this IP version are received, and only packets
         /// of this version may be sent.
@@ -68,7 +69,8 @@ pub enum RawMode {
 pub enum BindError {
     /// The socket is already bound.
     InvalidState,
-    /// The interface of an Ethernet-mode bind is not an Ethernet-medium interface.
+    /// An Ethernet-mode bind on a socket bound to an interface whose medium is
+    /// not [`Medium::Ethernet`].
     #[cfg(feature = "medium-ethernet")]
     InvalidMedium,
 }
@@ -91,7 +93,8 @@ impl core::error::Error for BindError {}
 pub enum SendError {
     /// The socket is not bound.
     InvalidState,
-    /// (IP mode) There is no route to the packet's destination.
+    /// There is no route to the packet's destination (IP mode), or no Ethernet
+    /// interface to send on (Ethernet mode).
     Unaddressable,
     /// The packet does not fit in a packet buffer.
     BufferFull,
@@ -149,6 +152,8 @@ impl core::error::Error for RecvError {}
 #[derive(Debug)]
 pub(crate) struct RawSocketState {
     mode: Option<RawMode>,
+    /// The interface the socket is bound to. Zero-sized without `iface-bind`.
+    binding: IfaceBinding,
     rx_queue: BoundedDeque<PacketBuf, RAW_RX_QUEUE_COUNT>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
@@ -167,6 +172,7 @@ impl RawSocketState {
     pub(crate) fn new() -> RawSocketState {
         RawSocketState {
             mode: None,
+            binding: IfaceBinding::Any,
             rx_queue: BoundedDeque::new(),
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -239,21 +245,53 @@ impl RawSocket<'_, '_> {
         self.state.mode
     }
 
+    /// Bind the socket to an interface, or unbind it with `None`.
+    ///
+    /// A socket bound to an interface only sends and receives packets on it:
+    /// - Destinations must be on-link on that iface, or have a route through it.
+    /// - Broadcast and multicast destinations go out on that iface only
+    ///
+    /// In Ethernet mode the bound interface's medium must be
+    /// [`Medium::Ethernet`], checked at [`bind`](Self::bind).
+    ///
+    /// The socket must be unbound (no mode set). The binding is kept across
+    /// [`close`](Self::close).
+    ///
+    /// Returns `Err(BindError::InvalidState)` if the socket is bound.
+    #[cfg(feature = "iface-bind")]
+    pub fn bind_to_iface(&mut self, iface: Option<IfaceHandle>) -> Result<(), BindError> {
+        if self.is_open() {
+            return Err(BindError::InvalidState);
+        }
+        self.state.binding = iface.into();
+        Ok(())
+    }
+
+    /// Return the interface the socket is bound to, or `None`.
+    ///
+    /// See [`bind_to_iface`](Self::bind_to_iface).
+    #[cfg(feature = "iface-bind")]
+    pub fn bound_iface(&self) -> Option<IfaceHandle> {
+        self.state.binding.iface()
+    }
+
     /// Bind the socket to the given mode.
     ///
     /// Returns `Err(BindError::InvalidState)` if the socket is already bound (see
     /// [is_open](#method.is_open)), and `Err(BindError::InvalidMedium)` if an
-    /// Ethernet-mode bind names an interface whose medium is not
+    /// Ethernet-mode bind is made on a socket bound (with `bind_to_iface`,
+    /// feature `iface-bind`) to an interface whose medium is not
     /// [`Medium::Ethernet`].
     ///
     /// # Panics
-    /// Panics if an Ethernet-mode bind names a stale interface handle.
+    /// Panics if the socket is bound to a stale interface handle.
     pub fn bind(&mut self, mode: RawMode) -> Result<(), BindError> {
         if self.is_open() {
             return Err(BindError::InvalidState);
         }
         #[cfg(feature = "medium-ethernet")]
-        if let RawMode::Ethernet { iface, .. } = mode
+        if let RawMode::Ethernet { .. } = mode
+            && let Some(iface) = self.state.binding.iface()
             && self.tx.ifaces.get(iface.index()).medium() != Medium::Ethernet
         {
             return Err(BindError::InvalidMedium);
@@ -422,15 +460,18 @@ impl RawSocket<'_, '_> {
     /// user is responsible for every header field, including the IPv4 header
     /// checksum.
     ///
-    /// In Ethernet mode the frame is transmitted on the bound interface as-is. In IP
-    /// mode the destination address is read from the IP header, and the packet is
-    /// routed like any other egress packet. If the destination's neighbor is
-    /// unresolved, the packet is queued inside the stack and sent when resolution
-    /// completes. This still counts as a successful send.
+    /// In Ethernet mode the frame is transmitted as-is, on the bound interface
+    /// if the socket is bound to one, else on the first Ethernet interface. In
+    /// IP mode the destination address is read from the IP header, and the
+    /// packet is routed like any other egress packet (through the bound
+    /// interface only, if the socket is bound to one). If the destination's
+    /// neighbor is unresolved, the packet is queued inside the stack and sent
+    /// when resolution completes. This still counts as a successful send.
     ///
     /// Returns `Err(SendError::InvalidState)` if the socket is not bound.
-    /// Returns `Err(SendError::Unaddressable)` if (IP mode) there is no route to
-    /// the packet's destination.
+    /// Returns `Err(SendError::Unaddressable)` if there is no route to the
+    /// packet's destination (IP mode) or no Ethernet interface to send on
+    /// (Ethernet mode).
     /// Returns `Err(SendError::Malformed)` if the packet fails basic validation (too
     /// short for an Ethernet header in Ethernet mode, malformed IP header in IP
     /// mode), or does not match the socket's bind filters.
@@ -439,8 +480,7 @@ impl RawSocket<'_, '_> {
     /// Returns `Err(SendError::NoBuffer)` if every packet buffer is in use.
     ///
     /// # Panics
-    /// Panics if the socket is bound (Ethernet mode) to an interface that has been
-    /// removed.
+    /// Panics if the socket is bound to an interface that has been removed.
     pub fn send_with(&mut self, max_size: usize, f: impl FnOnce(&mut [u8]) -> usize) -> Result<(), SendError> {
         self.send_with_meta(max_size, PacketMeta::default(), f)
     }
@@ -469,16 +509,26 @@ impl RawSocket<'_, '_> {
             RawMode::Ip { .. } => LINK_HEADER_LEN,
         };
 
-        // An Ethernet-mode socket knows its interface up front, so it can ask for
-        // room before building. An IP-mode packet names its destination inside,
-        // so it is built first and routed after.
+        // Ethernet frames carry no routing information: a bound socket sends on
+        // its interface, an unbound one on the first Ethernet interface. The
+        // interface is known up front, so ask it for room before building. An
+        // IP-mode packet names its destination inside, so it is built first and
+        // routed after.
         #[cfg(feature = "medium-ethernet")]
-        if let RawMode::Ethernet { iface, .. } = mode
-            && !self.tx.can_transmit(iface)
-        {
-            self.tx.inner.set_tx_starved();
-            return Err(SendError::DeviceBusy);
-        }
+        let eth_iface = match mode {
+            RawMode::Ethernet { .. } => {
+                let iface = match self.state.binding.iface() {
+                    Some(iface) => iface,
+                    None => self.tx.first_ethernet_iface().ok_or(SendError::Unaddressable)?,
+                };
+                if !self.tx.can_transmit(iface) {
+                    self.tx.inner.set_tx_starved();
+                    return Err(SendError::DeviceBusy);
+                }
+                Some(iface)
+            }
+            RawMode::Ip { .. } => None,
+        };
 
         let Some(mut buf) = PacketBuf::try_new() else {
             self.tx.inner.set_tx_starved();
@@ -496,7 +546,7 @@ impl RawSocket<'_, '_> {
 
         match mode {
             #[cfg(feature = "medium-ethernet")]
-            RawMode::Ethernet { iface, ethertype } => {
+            RawMode::Ethernet { ethertype } => {
                 {
                     let Ok(frame) = EthernetFrame::new_checked(&mut buf) else {
                         return Err(SendError::Malformed);
@@ -506,7 +556,7 @@ impl RawSocket<'_, '_> {
                     }
                 }
                 trace!("raw: sending {} octet frame", buf.len());
-                self.tx.transmit_ethernet(iface, buf);
+                self.tx.transmit_ethernet(unwrap!(eth_iface), buf);
                 Ok(())
             }
             RawMode::Ip { version, protocol } => {
@@ -516,7 +566,10 @@ impl RawSocket<'_, '_> {
                 if version.is_some_and(|v| v != dst_addr.version()) || protocol.is_some_and(|p| p != next_header) {
                     return Err(SendError::Malformed);
                 }
-                let route = self.tx.route(&dst_addr).ok_or(SendError::Unaddressable)?;
+                let route = self
+                    .tx
+                    .route(self.state.binding, &dst_addr)
+                    .ok_or(SendError::Unaddressable)?;
                 if !self.tx.can_transmit(route.iface) {
                     self.tx.inner.set_tx_starved();
                     return Err(SendError::DeviceBusy);
@@ -531,13 +584,13 @@ impl RawSocket<'_, '_> {
 
 impl Stack<'_> {
     /// Offer an ingress Ethernet frame to the raw sockets. `buf` is the whole
-    /// frame, Ethernet header included.
+    /// frame, Ethernet header included. `iface` is the interface it arrived on.
     ///
-    /// The first socket bound to the frame's interface (and to its ethertype, if
-    /// the socket has an ethertype filter) receives it. If `stack_wants` is set
-    /// (the stack itself processes this ethertype), the socket receives a copy and
-    /// the original is returned for further processing. Otherwise the socket takes
-    /// the buffer zero-copy and `None` is returned.
+    /// The first Ethernet-mode socket whose interface binding and ethertype
+    /// filter match receives it. If `stack_wants` is set (the stack itself
+    /// processes this ethertype), the socket receives a copy and the original is
+    /// returned for further processing. Otherwise the socket takes the buffer
+    /// zero-copy and `None` is returned.
     #[cfg(feature = "medium-ethernet")]
     pub(crate) fn process_raw_ethernet(
         &mut self,
@@ -548,14 +601,12 @@ impl Stack<'_> {
     ) -> Option<PacketBuf> {
         for (_, socket) in self.sockets.raw.iter_mut() {
             let Some(RawMode::Ethernet {
-                iface: bound_iface,
                 ethertype: bound_ethertype,
             }) = socket.mode
             else {
                 continue;
             };
-            #[allow(unreachable_patterns)]
-            if bound_iface != iface {
+            if !socket.binding.matches(iface) {
                 continue;
             }
             if bound_ethertype.is_some_and(|t| t != ethertype) {
@@ -577,18 +628,21 @@ impl Stack<'_> {
     }
 
     /// Offer an ingress IP packet to the raw sockets. `buf` is the whole packet,
-    /// IP header included, already trimmed of link-layer padding.
+    /// IP header included, already trimmed of link-layer padding. `iface` is the
+    /// interface it arrived on.
     ///
-    /// The first socket whose version/protocol filters match receives it. If
-    /// `stack_wants` is set (the stack itself processes this protocol), the socket
-    /// receives a copy and the original is returned for further processing.
-    /// Otherwise the socket takes the buffer zero-copy and `None` is returned.
+    /// The first socket whose interface/version/protocol filters match receives
+    /// it. If `stack_wants` is set (the stack itself processes this protocol),
+    /// the socket receives a copy and the original is returned for further
+    /// processing. Otherwise the socket takes the buffer zero-copy and `None` is
+    /// returned.
     ///
     /// The returned flag records whether a socket received (a copy of) the packet.
     /// The stack suppresses its own error replies (ICMP port unreachable) for
     /// packets an application is handling through a raw socket.
     pub(crate) fn process_raw_ip(
         &mut self,
+        iface: IfaceHandle,
         version: IpVersion,
         protocol: IpProtocol,
         stack_wants: bool,
@@ -602,6 +656,9 @@ impl Stack<'_> {
             else {
                 continue;
             };
+            if !socket.binding.matches(iface) {
+                continue;
+            }
             if bound_version.is_some_and(|v| v != version) {
                 continue;
             }
@@ -780,28 +837,54 @@ mod test {
 
     #[test]
     fn test_bind_ethernet() {
+        // An unbound Ethernet-mode bind is fine: the socket covers every
+        // Ethernet interface.
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let handle = stack.add_raw_socket().unwrap();
+        let mut socket = stack.raw_socket(handle);
+        assert_eq!(
+            socket.bind(RawMode::Ethernet {
+                ethertype: Some(ETHERTYPE_CUSTOM)
+            }),
+            Ok(())
+        );
+        assert!(socket.is_open());
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface_ethernet() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
         let (eth_iface, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (ip_iface, _) = add_test_iface(&mut stack, Medium::Ip, vec![]);
 
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
+
+        // An Ethernet-mode socket may only be bound to an Ethernet-medium
+        // interface.
+        socket.bind_to_iface(Some(ip_iface)).unwrap();
         assert_eq!(
-            socket.bind(RawMode::Ethernet {
-                iface: ip_iface,
-                ethertype: None
-            }),
+            socket.bind(RawMode::Ethernet { ethertype: None }),
             Err(BindError::InvalidMedium)
         );
         assert!(!socket.is_open());
+
+        socket.bind_to_iface(Some(eth_iface)).unwrap();
+        assert_eq!(socket.bound_iface(), Some(eth_iface));
         assert_eq!(
             socket.bind(RawMode::Ethernet {
-                iface: eth_iface,
                 ethertype: Some(ETHERTYPE_CUSTOM)
             }),
             Ok(())
         );
         assert!(socket.is_open());
+
+        // The binding cannot change while the socket is bound, and is kept
+        // across close.
+        assert_eq!(socket.bind_to_iface(None), Err(BindError::InvalidState));
+        socket.close();
+        assert_eq!(socket.bound_iface(), Some(eth_iface));
     }
 
     #[test]
@@ -904,7 +987,7 @@ mod test {
 
         // Not a stack protocol: the first matching socket takes the buffer.
         let packet = ipv4_packet(IP_PROTO, b"abcd");
-        let res = stack.process_raw_ip(IpVersion::Ipv4, IP_PROTO, false, buf_from(&packet));
+        let res = stack.process_raw_ip(IfaceHandle::new(0), IpVersion::Ipv4, IP_PROTO, false, buf_from(&packet));
         assert!(res.is_none());
         assert!(!stack.raw_socket(h_icmp).can_recv());
         assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &packet[..]);
@@ -912,7 +995,13 @@ mod test {
         // A stack-handled protocol: the matching socket gets a copy, the original
         // is handed back for further processing.
         let packet = ipv4_packet(IpProtocol::Icmp, b"ping");
-        let res = stack.process_raw_ip(IpVersion::Ipv4, IpProtocol::Icmp, true, buf_from(&packet));
+        let res = stack.process_raw_ip(
+            IfaceHandle::new(0),
+            IpVersion::Ipv4,
+            IpProtocol::Icmp,
+            true,
+            buf_from(&packet),
+        );
         let (res_buf, handled) = res.unwrap();
         assert_eq!(&*res_buf, &packet[..]);
         assert!(handled);
@@ -921,7 +1010,13 @@ mod test {
 
         // Version filter: an IPv6 packet skips the IPv4-bound socket.
         let packet = ipv6_packet(IpProtocol::Icmp, b"six");
-        let res = stack.process_raw_ip(IpVersion::Ipv6, IpProtocol::Icmp, false, buf_from(&packet));
+        let res = stack.process_raw_ip(
+            IfaceHandle::new(0),
+            IpVersion::Ipv6,
+            IpProtocol::Icmp,
+            false,
+            buf_from(&packet),
+        );
         assert!(res.is_none());
         assert!(!stack.raw_socket(h_icmp).can_recv());
         assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &packet[..]);
@@ -929,7 +1024,7 @@ mod test {
         // No socket matches: the buffer is handed back.
         stack.raw_socket(h_any).close();
         let packet = ipv4_packet(IP_PROTO, b"nobody");
-        let res = stack.process_raw_ip(IpVersion::Ipv4, IP_PROTO, false, buf_from(&packet));
+        let res = stack.process_raw_ip(IfaceHandle::new(0), IpVersion::Ipv4, IP_PROTO, false, buf_from(&packet));
         let (res_buf, handled) = res.unwrap();
         assert_eq!(&*res_buf, &packet[..]);
         assert!(!handled);
@@ -952,7 +1047,7 @@ mod test {
         let handle = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(handle)
-            .bind(RawMode::Ethernet { iface, ethertype: None })
+            .bind(RawMode::Ethernet { ethertype: None })
             .unwrap();
 
         // Zero-copy ingress: the socket takes the very buffer the driver filled.
@@ -991,30 +1086,24 @@ mod test {
         stack
             .raw_socket(h_custom)
             .bind(RawMode::Ethernet {
-                iface: iface_a,
                 ethertype: Some(ETHERTYPE_CUSTOM),
             })
             .unwrap();
         stack
             .raw_socket(h_any)
-            .bind(RawMode::Ethernet {
-                iface: iface_a,
-                ethertype: None,
-            })
+            .bind(RawMode::Ethernet { ethertype: None })
             .unwrap();
 
-        // Frame on another interface: no socket matches.
+        // Unbound sockets receive from every Ethernet interface; the first
+        // matching socket takes the frame.
         let frame = eth_frame(ETHERTYPE_CUSTOM, b"hello");
-        let res = stack.process_raw_ethernet(iface_b, ETHERTYPE_CUSTOM, false, buf_from(&frame));
-        assert_eq!(&*res.unwrap(), &frame[..]);
-        assert!(!stack.raw_socket(h_custom).can_recv());
-        assert!(!stack.raw_socket(h_any).can_recv());
-
-        // Frame on the bound interface: the first matching socket takes it.
         let res = stack.process_raw_ethernet(iface_a, ETHERTYPE_CUSTOM, false, buf_from(&frame));
         assert!(res.is_none());
         assert_eq!(&*stack.raw_socket(h_custom).recv().unwrap(), &frame[..]);
         assert!(!stack.raw_socket(h_any).can_recv());
+        let res = stack.process_raw_ethernet(iface_b, ETHERTYPE_CUSTOM, false, buf_from(&frame));
+        assert!(res.is_none());
+        assert_eq!(&*stack.raw_socket(h_custom).recv().unwrap(), &frame[..]);
 
         // A stack-handled ethertype skips the filtered socket, and the wildcard
         // socket gets a copy while the original is handed back.
@@ -1025,10 +1114,36 @@ mod test {
         assert_eq!(&*stack.raw_socket(h_any).recv().unwrap(), &frame[..]);
     }
 
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface_ethernet_demux() {
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let (iface_a, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
+        let (iface_b, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
+
+        let handle = stack.add_raw_socket().unwrap();
+        stack.raw_socket(handle).bind_to_iface(Some(iface_a)).unwrap();
+        stack
+            .raw_socket(handle)
+            .bind(RawMode::Ethernet { ethertype: None })
+            .unwrap();
+
+        // A frame on another interface does not match a bound socket.
+        let frame = eth_frame(ETHERTYPE_CUSTOM, b"hello");
+        let res = stack.process_raw_ethernet(iface_b, ETHERTYPE_CUSTOM, false, buf_from(&frame));
+        assert_eq!(&*res.unwrap(), &frame[..]);
+        assert!(!stack.raw_socket(handle).can_recv());
+
+        // One on the bound interface does.
+        let res = stack.process_raw_ethernet(iface_a, ETHERTYPE_CUSTOM, false, buf_from(&frame));
+        assert!(res.is_none());
+        assert_eq!(&*stack.raw_socket(handle).recv().unwrap(), &frame[..]);
+    }
+
     #[test]
     fn test_send_ethernet() {
         let mut stack = Stack::new(0x1234_5678_dead_beef);
-        let (iface, tx) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
+        let (_iface, tx) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let handle = stack.add_raw_socket().unwrap();
 
         // Not bound yet.
@@ -1041,7 +1156,6 @@ mod test {
         stack
             .raw_socket(handle)
             .bind(RawMode::Ethernet {
-                iface,
                 ethertype: Some(ETHERTYPE_CUSTOM),
             })
             .unwrap();
@@ -1055,6 +1169,52 @@ mod test {
         let wrong = eth_frame(EthernetProtocol::Ipv4, b"hello");
         assert_eq!(stack.raw_socket(handle).send_slice(&wrong), Err(SendError::Malformed));
         assert_eq!(tx.borrow().len(), 1);
+    }
+
+    #[test]
+    fn test_send_ethernet_unbound_iface_selection() {
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let handle = stack.add_raw_socket().unwrap();
+        stack
+            .raw_socket(handle)
+            .bind(RawMode::Ethernet { ethertype: None })
+            .unwrap();
+
+        // No Ethernet interface at all: nothing to send on.
+        let frame = eth_frame(ETHERTYPE_CUSTOM, b"hello");
+        assert_eq!(
+            stack.raw_socket(handle).send_slice(&frame),
+            Err(SendError::Unaddressable)
+        );
+
+        // An unbound socket sends out the first Ethernet-medium interface. An
+        // IP-medium one added earlier is skipped.
+        let (_ip_iface, ip_tx) = add_test_iface(&mut stack, Medium::Ip, vec![]);
+        let (_eth_iface, eth_tx) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
+        stack.raw_socket(handle).send_slice(&frame).unwrap();
+        assert!(ip_tx.borrow().is_empty());
+        assert_eq!(eth_tx.borrow().len(), 1);
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface_ethernet_send() {
+        // A bound socket sends out its interface, not the first one.
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let (_eth_a, tx_a) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
+        let (eth_b, tx_b) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
+
+        let handle = stack.add_raw_socket().unwrap();
+        stack.raw_socket(handle).bind_to_iface(Some(eth_b)).unwrap();
+        stack
+            .raw_socket(handle)
+            .bind(RawMode::Ethernet { ethertype: None })
+            .unwrap();
+
+        let frame = eth_frame(ETHERTYPE_CUSTOM, b"hello");
+        stack.raw_socket(handle).send_slice(&frame).unwrap();
+        assert!(tx_a.borrow().is_empty());
+        assert_eq!(tx_b.borrow().len(), 1);
     }
 
     #[test]
@@ -1105,6 +1265,63 @@ mod test {
             Err(SendError::BufferFull)
         );
         assert_eq!(tx.borrow().len(), 1);
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface_ip() {
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let (if0, tx0) = add_test_iface(
+            &mut stack,
+            Medium::Ip,
+            vec![IpCidr::new(IpAddress::v4(10, 0, 0, 1), 24)],
+        );
+        let (if1, tx1) = add_test_iface(
+            &mut stack,
+            Medium::Ip,
+            vec![IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24)],
+        );
+
+        let handle = stack.add_raw_socket().unwrap();
+        stack.raw_socket(handle).bind_to_iface(Some(if1)).unwrap();
+        stack
+            .raw_socket(handle)
+            .bind(RawMode::Ip {
+                version: None,
+                protocol: None,
+            })
+            .unwrap();
+
+        // Ingress filter: a packet arriving on another interface is not
+        // delivered, one on the bound interface is.
+        let packet = ipv4_packet(IP_PROTO, b"abcd");
+        let res = stack.process_raw_ip(if0, IpVersion::Ipv4, IP_PROTO, false, buf_from(&packet));
+        assert!(res.is_some_and(|(_, handled)| !handled));
+        assert!(!stack.raw_socket(handle).can_recv());
+        let res = stack.process_raw_ip(if1, IpVersion::Ipv4, IP_PROTO, false, buf_from(&packet));
+        assert!(res.is_none());
+        assert_eq!(&*stack.raw_socket(handle).recv().unwrap(), &packet[..]);
+
+        // Egress routes through the bound interface: the destination is
+        // on-link for it, so the packet goes out of it.
+        stack.raw_socket(handle).send_slice(&packet).unwrap();
+        assert!(tx0.borrow().is_empty());
+        assert_eq!(tx1.borrow().len(), 1);
+
+        // Bound to the other interface, the same destination has no route.
+        stack.raw_socket(handle).close();
+        stack.raw_socket(handle).bind_to_iface(Some(if0)).unwrap();
+        stack
+            .raw_socket(handle)
+            .bind(RawMode::Ip {
+                version: None,
+                protocol: None,
+            })
+            .unwrap();
+        assert_eq!(
+            stack.raw_socket(handle).send_slice(&packet),
+            Err(SendError::Unaddressable)
+        );
     }
 
     #[test]

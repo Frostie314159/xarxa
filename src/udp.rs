@@ -29,7 +29,7 @@ use crate::driver::PacketMeta;
 #[cfg(feature = "icmp-errors")]
 use crate::icmp_error::IcmpError;
 use crate::iface::IfaceHandle;
-use crate::stack::{Stack, TxContext, addr_score, alloc_ephemeral_port};
+use crate::stack::{IfaceBinding, Stack, TxContext, addr_score, alloc_ephemeral_port};
 use crate::storage::Slab;
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -195,6 +195,8 @@ pub(crate) struct UdpSocketState {
     /// (only matching datagrams are delivered) and are the default destination
     /// for sends. Unspecified parts match any remote.
     remote: IpListenEndpoint,
+    /// The interface the socket is bound to. Zero-sized without `iface-bind`.
+    binding: IfaceBinding,
     rx_queue: BoundedDeque<PacketBuf, UDP_RX_QUEUE_COUNT>,
     hop_limit: Option<u8>,
     /// The last ICMP error reported against this socket, with the remote endpoint
@@ -219,6 +221,7 @@ impl UdpSocketState {
         UdpSocketState {
             local: IpListenEndpoint::UNSPECIFIED,
             remote: IpListenEndpoint::UNSPECIFIED,
+            binding: IfaceBinding::Any,
             rx_queue: BoundedDeque::new(),
             hop_limit: None,
             #[cfg(feature = "icmp-errors")]
@@ -251,8 +254,13 @@ impl UdpSocketState {
     /// `dst_is_bcast` relaxes the local-address filter: sockets bound to a
     /// specific address also accept broadcast/multicast traffic on their port.
     /// It never relaxes the IP version.
+    ///
+    /// `arrival` is the interface the packet came in on, checked against the
+    /// socket's interface binding. `None` skips that check: ICMP errors are
+    /// delivered regardless of the interface they arrive on.
     fn match_score(
         &self,
+        arrival: Option<IfaceHandle>,
         src_addr: &IpAddress,
         src_port: u16,
         dst_addr: &IpAddress,
@@ -263,7 +271,11 @@ impl UdpSocketState {
         if self.local.port != dst_port {
             return None;
         }
-        let mut score = match addr_score(&self.local, dst_addr) {
+        let mut score = match arrival {
+            Some(arrival) => self.binding.match_score(arrival)?,
+            None => 0,
+        };
+        score += match addr_score(&self.local, dst_addr) {
             Some(score) => score,
             // Bound to one address, and this is broadcast/multicast traffic on
             // its port: it gets it anyway, as long as the version is its own.
@@ -425,6 +437,39 @@ impl UdpSocket<'_, '_> {
         self.inner_mut().hop_limit = hop_limit
     }
 
+    /// Bind the socket to an interface, or unbind it with `None`.
+    ///
+    /// A socket bound to an interface only sends and receives packets on it:
+    /// - Destinations must be on-link on that iface, or have a route through it.
+    /// - Broadcast and multicast destinations go out on that iface only
+    /// - Local addresses will be picked from that iface only.
+    ///
+    /// The socket must be closed. The binding is kept across
+    /// [`close`](Self::close), so a socket stays bound to its interface when
+    /// it is bound again.
+    ///
+    /// Two sockets with otherwise identical tuples may coexist if they are
+    /// bound to different interfaces. On ingress, a socket bound to the
+    /// arrival interface wins over an unbound one with an equal tuple.
+    ///
+    /// Returns `Err(BindError::InvalidState)` if the socket is open.
+    #[cfg(feature = "iface-bind")]
+    pub fn bind_to_iface(&mut self, iface: Option<IfaceHandle>) -> Result<(), BindError> {
+        if self.is_open() {
+            return Err(BindError::InvalidState);
+        }
+        self.inner_mut().binding = iface.into();
+        Ok(())
+    }
+
+    /// Return the interface the socket is bound to, or `None`.
+    ///
+    /// See [`bind_to_iface`](Self::bind_to_iface).
+    #[cfg(feature = "iface-bind")]
+    pub fn bound_iface(&self) -> Option<IfaceHandle> {
+        self.inner().binding.iface()
+    }
+
     /// Bind the socket, fixing (parts of) its 4-tuple.
     ///
     /// Every UDP socket is identified by the (local address, local port, remote
@@ -486,6 +531,8 @@ impl UdpSocket<'_, '_> {
             return Err(BindError::Unaddressable);
         }
 
+        let binding = self.inner().binding;
+
         // A fully-specified remote resolves a wildcard local address via a route
         // lookup. A connected socket always has a concrete local address.
         if let Some(remote_addr) = remote.concrete_addr()
@@ -494,19 +541,21 @@ impl UdpSocket<'_, '_> {
         {
             local.addr = Some(
                 self.tx
-                    .get_source_address(&remote_addr)
+                    .get_source_address(binding, &remote_addr)
                     .ok_or(BindError::Unaddressable)?,
             );
         }
 
         // Only an *identical* 4-tuple conflicts: any difference (a wildcard vs.
         // an exact part included) is resolved by demux picking the most
-        // specific match, so nothing is shadowed.
+        // specific match, so nothing is shadowed. The interface binding is part
+        // of the identity: same-tuple sockets bound to different interfaces
+        // coexist, and a packet arrives on exactly one interface.
         let (sockets, index) = (&self.sockets, self.index);
         let in_use = |local: IpListenEndpoint| {
             sockets
                 .iter()
-                .any(|(i, s)| i != index && s.local == local && s.remote == remote)
+                .any(|(i, s)| i != index && s.local == local && s.remote == remote && s.binding == binding)
         };
 
         if local.port == 0 {
@@ -734,6 +783,7 @@ impl UdpSocket<'_, '_> {
         let mut meta = meta.into();
         let local = self.inner().local;
         let remote = self.inner().remote;
+        let binding = self.inner().binding;
         let hop_limit = self.inner().hop_limit.unwrap_or(64);
 
         if local.port == 0 {
@@ -766,7 +816,10 @@ impl UdpSocket<'_, '_> {
         // Route the destination first: the source address may come from the
         // egress interface, and the packet is only built once that interface has
         // room for it.
-        let route = self.tx.route(&meta.endpoint.addr).ok_or(SendError::Unaddressable)?;
+        let route = self
+            .tx
+            .route(binding, &meta.endpoint.addr)
+            .ok_or(SendError::Unaddressable)?;
 
         // Pick the source address: explicit in the metadata, else the socket's bound
         // address (only a concrete one is an address, the wildcards are filters),
@@ -891,7 +944,7 @@ impl Stack<'_> {
         // sockets specific in *different* parts) go to the earliest socket.
         let mut best: Option<(usize, u8)> = None;
         for (index, socket) in self.sockets.udp.iter() {
-            if let Some(score) = socket.match_score(&src_addr, src_port, &dst_addr, dst_port, dst_is_bcast)
+            if let Some(score) = socket.match_score(Some(iface), &src_addr, src_port, &dst_addr, dst_port, dst_is_bcast)
                 && best.is_none_or(|(_, best_score)| score > best_score)
             {
                 best = Some((index, score));
@@ -951,7 +1004,7 @@ pub(crate) fn process_icmp_error(
 ) {
     let mut best: Option<(usize, u8)> = None;
     for (index, socket) in sockets.iter() {
-        if let Some(score) = socket.match_score(&remote.addr, remote.port, &local.addr, local.port, false)
+        if let Some(score) = socket.match_score(None, &remote.addr, remote.port, &local.addr, local.port, false)
             && best.is_none_or(|(_, best_score)| score > best_score)
         {
             best = Some((index, score));
@@ -1070,16 +1123,21 @@ mod test {
 
     /// Like [`deliver`], with an explicit destination address.
     fn deliver_to(stack: &mut Stack, src_addr: Ipv4Address, src_port: u16, dst_addr: Ipv4Address, payload: &[u8]) {
+        deliver_on(stack, IfaceHandle::new(0), src_addr, src_port, dst_addr, payload)
+    }
+
+    /// Like [`deliver_to`], with an explicit arrival interface.
+    fn deliver_on(
+        stack: &mut Stack,
+        iface: IfaceHandle,
+        src_addr: Ipv4Address,
+        src_port: u16,
+        dst_addr: Ipv4Address,
+        payload: &[u8],
+    ) {
         let mut buf = queued_packet_from(src_addr, src_port, dst_addr, payload);
         buf.pull_front(IPV4_HEADER_LEN);
-        stack.process_udp(
-            IfaceHandle::new(0),
-            src_addr.into(),
-            dst_addr.into(),
-            IPV4_HEADER_LEN,
-            false,
-            buf,
-        );
+        stack.process_udp(iface, src_addr.into(), dst_addr.into(), IPV4_HEADER_LEN, false, buf);
     }
 
     #[test]
@@ -1601,5 +1659,179 @@ mod test {
         // ...recv_slice drops it.
         assert_eq!(socket.recv_slice(&mut slice).err(), Some(RecvError::Truncated));
         assert!(!socket.can_recv());
+    }
+
+    #[cfg(feature = "iface-bind")]
+    const LOCAL2_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 2, 1);
+    #[cfg(feature = "iface-bind")]
+    const REMOTE2_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 2, 2);
+
+    /// A stack with two IP-medium interfaces on different subnets:
+    /// interface 0 owns `LOCAL_ADDR`, interface 1 owns `LOCAL2_ADDR`.
+    #[cfg(feature = "iface-bind")]
+    fn stack_with_two_ifaces() -> (
+        Stack<'static>,
+        IfaceHandle,
+        IfaceHandle,
+        crate::test_device::Sent,
+        crate::test_device::Sent,
+    ) {
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let d0 = TestDevice::new(Medium::Ip);
+        let tx0 = d0.tx.clone();
+        let if0 = d0.install(&mut stack, HardwareAddress::Ip);
+        stack
+            .iface(if0)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
+        let d1 = TestDevice::new(Medium::Ip);
+        let tx1 = d1.tx.clone();
+        let if1 = d1.install(&mut stack, HardwareAddress::Ip);
+        stack
+            .iface(if1)
+            .add_ip_addr(IpCidr::new(LOCAL2_ADDR.into(), 24))
+            .unwrap();
+        (stack, if0, if1, tx0, tx1)
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface() {
+        let (mut stack, handle) = stack_with_socket();
+        let iface = IfaceHandle::new(0);
+        let mut socket = stack.udp_socket(handle);
+        assert_eq!(socket.bound_iface(), None);
+        socket.bind_to_iface(Some(iface)).unwrap();
+        assert_eq!(socket.bound_iface(), Some(iface));
+
+        // The binding cannot change while the socket is open, and is kept
+        // across close.
+        socket.bind(LOCAL_PORT, ANY).unwrap();
+        assert_eq!(socket.bind_to_iface(None), Err(BindError::InvalidState));
+        socket.close();
+        assert_eq!(socket.bound_iface(), Some(iface));
+        socket.bind_to_iface(None).unwrap();
+        assert_eq!(socket.bound_iface(), None);
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface_demux() {
+        let (mut stack, if0, if1, _, _) = stack_with_two_ifaces();
+        let handle = stack.add_udp_socket().unwrap();
+        stack.udp_socket(handle).bind_to_iface(Some(if1)).unwrap();
+        stack.udp_socket(handle).bind(LOCAL_PORT, ANY).unwrap();
+
+        // Arrives on the wrong interface: not delivered.
+        deliver_on(&mut stack, if0, REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, b"no");
+        assert!(!stack.udp_socket(handle).can_recv());
+
+        // On the bound interface: delivered.
+        deliver_on(&mut stack, if1, REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, b"yes");
+        assert_eq!(&*stack.udp_socket(handle).recv().unwrap(), b"yes");
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface_demux_scoring() {
+        // A socket bound to the arrival interface wins over an unbound one with
+        // an equal tuple. Traffic on other interfaces goes to the unbound one.
+        let (mut stack, if0, if1, _, _) = stack_with_two_ifaces();
+        let h_any = stack.add_udp_socket().unwrap();
+        let h_bound = stack.add_udp_socket().unwrap();
+        stack.udp_socket(h_any).bind(LOCAL_PORT, ANY).unwrap();
+        stack.udp_socket(h_bound).bind_to_iface(Some(if0)).unwrap();
+        stack.udp_socket(h_bound).bind(LOCAL_PORT, ANY).unwrap();
+
+        deliver_on(&mut stack, if0, REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, b"bound");
+        assert_eq!(&*stack.udp_socket(h_bound).recv().unwrap(), b"bound");
+        assert!(!stack.udp_socket(h_any).can_recv());
+
+        deliver_on(&mut stack, if1, REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, b"any");
+        assert_eq!(&*stack.udp_socket(h_any).recv().unwrap(), b"any");
+        assert!(!stack.udp_socket(h_bound).can_recv());
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface_conflicts() {
+        // The binding is part of the socket's identity: identical tuples bound
+        // to different interfaces (or one bound, one not) coexist. Only the
+        // identical tuple with the identical binding conflicts.
+        let (mut stack, if0, if1, _, _) = stack_with_two_ifaces();
+        let h1 = stack.add_udp_socket().unwrap();
+        let h2 = stack.add_udp_socket().unwrap();
+        let h3 = stack.add_udp_socket().unwrap();
+
+        stack.udp_socket(h1).bind_to_iface(Some(if0)).unwrap();
+        stack.udp_socket(h1).bind(LOCAL_PORT, ANY).unwrap();
+        stack.udp_socket(h2).bind_to_iface(Some(if1)).unwrap();
+        stack.udp_socket(h2).bind(LOCAL_PORT, ANY).unwrap();
+        stack.udp_socket(h3).bind(LOCAL_PORT, ANY).unwrap();
+
+        stack.udp_socket(h3).close();
+        stack.udp_socket(h3).bind_to_iface(Some(if0)).unwrap();
+        assert_eq!(stack.udp_socket(h3).bind(LOCAL_PORT, ANY), Err(BindError::InUse));
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface_send() {
+        let (mut stack, _, if1, tx0, tx1) = stack_with_two_ifaces();
+        let handle = stack.add_udp_socket().unwrap();
+        stack.udp_socket(handle).bind_to_iface(Some(if1)).unwrap();
+        stack.udp_socket(handle).bind(LOCAL_PORT, ANY).unwrap();
+
+        // The destination is on-link for interface 0 only: a socket bound to
+        // interface 1 has no route to it.
+        assert_eq!(
+            stack.udp_socket(handle).send_slice(b"hi", (REMOTE_ADDR, REMOTE_PORT)),
+            Err(SendError::Unaddressable)
+        );
+
+        // A destination on the bound interface's subnet goes out of it.
+        stack
+            .udp_socket(handle)
+            .send_slice(b"hi", (REMOTE2_ADDR, REMOTE_PORT))
+            .unwrap();
+        assert!(tx0.borrow().is_empty());
+        assert_eq!(tx1.borrow().len(), 1);
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface_send_broadcast() {
+        // Broadcast carries no routing information. Unbound it goes out the
+        // first interface; bound, out the bound one.
+        let (mut stack, _, if1, tx0, tx1) = stack_with_two_ifaces();
+        let handle = stack.add_udp_socket().unwrap();
+        stack.udp_socket(handle).bind_to_iface(Some(if1)).unwrap();
+        stack.udp_socket(handle).bind(LOCAL_PORT, ANY).unwrap();
+
+        stack
+            .udp_socket(handle)
+            .send_slice(b"hi", (Ipv4Address::BROADCAST, REMOTE_PORT))
+            .unwrap();
+        assert!(tx0.borrow().is_empty());
+        assert_eq!(tx1.borrow().len(), 1);
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface_resolves_source() {
+        // A bind with a fully-specified remote resolves its wildcard local
+        // address from the bound interface.
+        let (mut stack, _, if1, _, _) = stack_with_two_ifaces();
+        let handle = stack.add_udp_socket().unwrap();
+        stack.udp_socket(handle).bind_to_iface(Some(if1)).unwrap();
+        stack.udp_socket(handle).bind(0, (REMOTE2_ADDR, REMOTE_PORT)).unwrap();
+        assert_eq!(stack.udp_socket(handle).local_endpoint().addr, Some(LOCAL2_ADDR.into()));
+
+        // A remote only reachable through another interface does not resolve.
+        stack.udp_socket(handle).close();
+        assert_eq!(
+            stack.udp_socket(handle).bind(0, (REMOTE_ADDR, REMOTE_PORT)),
+            Err(BindError::Unaddressable)
+        );
     }
 }

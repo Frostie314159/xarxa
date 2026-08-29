@@ -18,6 +18,7 @@ use crate::config::ROUTE_COUNT;
 use crate::storage::{Full, Vec};
 
 use crate::iface::IfaceHandle;
+use crate::stack::IfaceBinding;
 use crate::time::Instant;
 use crate::wire::{IpAddress, IpCidr};
 #[cfg(feature = "ipv4")]
@@ -218,7 +219,11 @@ impl Routes {
 
     /// Look up the route for `addr`: the most specific matching prefix that has not
     /// expired.
-    pub(crate) fn lookup(&self, addr: &IpAddress, timestamp: Instant) -> Option<&Route> {
+    ///
+    /// A bound socket (`binding`) only considers routes that go out of its
+    /// interface. Without the `iface-bind` feature the binding is always
+    /// `Any` and the filter compiles out.
+    pub(crate) fn lookup(&self, binding: IfaceBinding, addr: &IpAddress, timestamp: Instant) -> Option<&Route> {
         assert!(addr.is_unicast());
 
         self.storage
@@ -227,6 +232,11 @@ impl Routes {
             .filter(|route| {
                 if let Some(expires_at) = route.expires_at
                     && timestamp > expires_at
+                {
+                    return false;
+                }
+                if let Some(iface) = binding.iface()
+                    && route.iface != iface
                 {
                     return false;
                 }
@@ -267,8 +277,58 @@ mod test {
     /// Look up and return (via_router, iface).
     fn lookup(routes: &Routes, addr: Ipv6Address, at_millis: i64) -> Option<(IpAddress, IfaceHandle)> {
         routes
-            .lookup(&addr.into(), Instant::from_millis(at_millis))
+            .lookup(IfaceBinding::Any, &addr.into(), Instant::from_millis(at_millis))
             .map(|route| (route.via_router, route.iface))
+    }
+
+    /// A lookup with an interface binding only considers that interface's
+    /// routes.
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_lookup_iface_bound() {
+        let mut routes = Routes::new();
+        // The same prefix, reachable through two interfaces via different routers.
+        for (via, iface) in [(ADDR_1A, IF_0), (ADDR_1B, IF_1)] {
+            routes
+                .add(Route {
+                    cidr: cidr_2().into(),
+                    via_router: via.into(),
+                    iface,
+                    origin: RouteOrigin::Manual,
+                    preferred_until: None,
+                    expires_at: None,
+                })
+                .unwrap();
+        }
+
+        let at = Instant::from_millis(0);
+        assert_eq!(
+            routes
+                .lookup(IfaceBinding::Iface(IF_0), &ADDR_2A.into(), at)
+                .map(|r| r.via_router),
+            Some(ADDR_1A.into())
+        );
+        assert_eq!(
+            routes
+                .lookup(IfaceBinding::Iface(IF_1), &ADDR_2A.into(), at)
+                .map(|r| r.via_router),
+            Some(ADDR_1B.into())
+        );
+        // No route through the bound interface: no match, even though an
+        // unconstrained lookup has one.
+        let mut routes2 = Routes::new();
+        routes2
+            .add(Route {
+                cidr: cidr_2().into(),
+                via_router: ADDR_1A.into(),
+                iface: IF_0,
+                origin: RouteOrigin::Manual,
+                preferred_until: None,
+                expires_at: None,
+            })
+            .unwrap();
+        assert!(routes2.lookup(IfaceBinding::Any, &ADDR_2A.into(), at).is_some());
+        assert!(routes2.lookup(IfaceBinding::Iface(IF_1), &ADDR_2A.into(), at).is_none());
     }
 
     #[test]

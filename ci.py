@@ -44,7 +44,7 @@ SOCKETS = [
 
 # Everything that adds code paths to a media/protocol/socket combination,
 # without being a combination axis of its own.
-COMBO_EXTRAS = "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,multicast"
+COMBO_EXTRAS = "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,multicast,iface-bind"
 
 # The other axes are checked against the full feature set only; combining them
 # with all of the above would be thousands of builds for no extra coverage.
@@ -61,6 +61,8 @@ EXTRAS = [
     "icmp-errors",
     "icmp-ping-reply",
     "async,icmp-errors",
+    "iface-bind",
+    "iface-bind,defmt",
     "packetmeta-id",
     "packetmeta-timestamp",
     "packetmeta-timestamp,defmt",
@@ -93,7 +95,7 @@ EXTRAS = [
 # The whole API, minus the features that are mutually exclusive with another.
 FULL = (
     "medium-ethernet,medium-ip,medium-ieee802154,ipv4,ipv6,raw,udp,tcp,tcp-listener,"
-    "std,log,async,icmp-errors,icmp-ping-reply,multicast,slaac,dhcpv4,dhcpv4-options,"
+    "std,log,async,icmp-errors,icmp-ping-reply,iface-bind,multicast,slaac,dhcpv4,dhcpv4-options,"
     "dns,mdns,packetmeta-timestamp,tcp-timestamps,tcp-sack,ipv4-fragmentation,ipv4-reassembly,"
     "sixlowpan-fragmentation,sixlowpan-reassembly"
 )

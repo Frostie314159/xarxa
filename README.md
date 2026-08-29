@@ -101,7 +101,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Supports all binding modes Linux supports, including unconnected (receives from any IP) and connected sockets (receives from one fixed remote IP+port).
 - Raw sockets (feature `raw`)
   - **zero-copy** on both TX and RX
-  - Ethernet-layer raw sockets transmit/receive raw Ethernet frames. No routing, you choose the interface manually.
+  - Ethernet-layer raw sockets transmit/receive raw Ethernet frames. No routing.
   - IP-layer raw sockets transmit/receive raw IP packets. The stack handles routing same as other socket types.
   - IP headers are byte-copied instead of parsed+re-emitted, so all fields and options are kept, even those unsupported by _xarxa_.
 - TCP sockets (feature `tcp`)
@@ -123,6 +123,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Join and leave multicast groups per interface.
   - IGMPv1/IGMPv2 (IPv4) and MLDv2 (IPv6): membership is reported on join and leave, and in response to router queries.
   - The IPv6 solicited-node groups of the interface's addresses are joined automatically.
+- Bind sockets to an interface, like Linux's `SO_BINDTODEVICE`. (feature `iface-bind`)
 - Packet metadata
   - Support for hardware timestamping on both RX and TX. Allows implementing protocols like PTP, NTP. (feature `packetmeta-timestamp`)
   - Opaque ID for correlating packets through the stack. (feature `packetmeta-id`)

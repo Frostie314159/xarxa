@@ -111,6 +111,59 @@ pub(crate) struct TxContext<'a, 'd> {
     pub(crate) ifaces: &'a mut Slab<IfaceState<'d>, IFACE_COUNT>,
 }
 
+/// The interface a socket is bound to, if any.
+///
+/// The `Iface` variant only exists with the `iface-bind` feature. This way
+/// this is zero-sized when not enabled and costs no code size.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum IfaceBinding {
+    /// Not bound: all interfaces.
+    #[default]
+    Any,
+    /// Bound to one interface.
+    #[cfg(feature = "iface-bind")]
+    Iface(IfaceHandle),
+}
+
+impl IfaceBinding {
+    /// The bound interface, or `None`.
+    pub(crate) fn iface(self) -> Option<IfaceHandle> {
+        match self {
+            IfaceBinding::Any => None,
+            #[cfg(feature = "iface-bind")]
+            IfaceBinding::Iface(iface) => Some(iface),
+        }
+    }
+
+    /// Whether a packet arriving on (or, in [`TxContext::route`], leaving
+    /// through) `arrival` passes the binding.
+    pub(crate) fn matches(self, arrival: IfaceHandle) -> bool {
+        self.match_score(arrival).is_some()
+    }
+
+    /// Score the binding against a packet's arrival interface, for demux.
+    ///
+    /// `None` if the binding excludes the interface, else how specific the
+    /// binding is: bound outscores unbound, like the other exact tuple parts.
+    pub(crate) fn match_score(self, arrival: IfaceHandle) -> Option<u8> {
+        match self.iface() {
+            None => Some(0),
+            Some(bound) => (bound == arrival).then_some(1),
+        }
+    }
+}
+
+#[cfg(feature = "iface-bind")]
+impl From<Option<IfaceHandle>> for IfaceBinding {
+    fn from(iface: Option<IfaceHandle>) -> Self {
+        match iface {
+            Some(iface) => IfaceBinding::Iface(iface),
+            None => IfaceBinding::Any,
+        }
+    }
+}
+
 /// A complete egress routing decision for one destination, produced by
 /// [`TxContext::route`]: the interface the packet goes out of, the next hop to
 /// resolve on that link, and the interface's IP MTU.
@@ -151,10 +204,11 @@ impl TxContext<'_, '_> {
     }
 
     /// Get a source address for sending to the given destination, selected from the
-    /// interface the packet would go out of.
+    /// interface the packet would go out of, honoring the socket's interface
+    /// binding.
     #[cfg(any(feature = "udp", feature = "tcp"))]
-    pub(crate) fn get_source_address(&self, dst_addr: &IpAddress) -> Option<IpAddress> {
-        let route = self.route(dst_addr)?;
+    pub(crate) fn get_source_address(&self, binding: IfaceBinding, dst_addr: &IpAddress) -> Option<IpAddress> {
+        let route = self.route(binding, dst_addr)?;
         self.ifaces
             .get(route.iface.index())
             .get_source_address(dst_addr, self.inner.now)
@@ -194,20 +248,30 @@ impl TxContext<'_, '_> {
     /// Make the egress routing decision for a destination: the interface the
     /// destination is on-link for (next hop: the destination itself), else the
     /// interface and gateway named by the matching route.
-    pub(crate) fn route(&self, dst_addr: &IpAddress) -> Option<EgressRoute> {
+    ///
+    /// A bound socket (`binding`) routes only through its interface: the
+    /// destination must be on-link for it or have a route through it, and
+    /// broadcast/multicast destinations go straight out of it. A binding whose
+    /// interface was removed routes nothing.
+    pub(crate) fn route(&self, binding: IfaceBinding, dst_addr: &IpAddress) -> Option<EgressRoute> {
+        // The interfaces the packet may go out of: the bound one, or all of
+        // them. The routing-table lookup applies the same constraint.
+        let mut candidates = self.ifaces.iter().filter(|(_, iface)| binding.matches(iface.handle));
+
         if !dst_addr.is_unicast() {
             // Broadcast and multicast destinations carry nothing to route on, so
-            // they go out the first interface. The next hop is the destination
-            // itself, resolved to a broadcast/multicast hardware address.
-            // TODO: let the send API pick the interface.
-            return self.ifaces.iter().next().map(|(_, iface)| EgressRoute {
+            // they go out the first interface (for a bound socket, its own). The
+            // next hop is the destination itself, resolved to a
+            // broadcast/multicast hardware address.
+            // TODO: let the send API pick the interface for unbound sockets.
+            return candidates.next().map(|(_, iface)| EgressRoute {
                 iface: iface.handle,
                 next_hop: *dst_addr,
                 ip_mtu: iface.ip_mtu(),
             });
         }
 
-        if let Some((_, iface)) = self.ifaces.iter().find(|(_, iface)| iface.in_same_network(dst_addr)) {
+        if let Some((_, iface)) = candidates.find(|(_, iface)| iface.in_same_network(dst_addr)) {
             return Some(EgressRoute {
                 iface: iface.handle,
                 next_hop: *dst_addr,
@@ -215,12 +279,22 @@ impl TxContext<'_, '_> {
             });
         }
 
-        let route = self.inner.routes.lookup(dst_addr, self.inner.now)?;
+        let route = self.inner.routes.lookup(binding, dst_addr, self.inner.now)?;
         Some(EgressRoute {
             iface: route.iface,
             next_hop: route.via_router,
             ip_mtu: self.ifaces.get(route.iface.index()).ip_mtu(),
         })
+    }
+
+    /// The first Ethernet-medium interface, for unbound Ethernet-mode raw
+    /// sockets, whose frames carry no routing information.
+    #[cfg(all(feature = "raw", feature = "medium-ethernet"))]
+    pub(crate) fn first_ethernet_iface(&self) -> Option<IfaceHandle> {
+        self.ifaces
+            .iter()
+            .find(|(_, iface)| iface.medium() == Medium::Ethernet)
+            .map(|(_, iface)| iface.handle)
     }
 
     /// [`route`](Self::route) for a locally-generated reply to an ingress packet
@@ -246,7 +320,7 @@ impl TxContext<'_, '_> {
             });
         }
 
-        self.route(dst_addr)
+        self.route(IfaceBinding::Any, dst_addr)
     }
 
     /// Transmit a fully-built IP payload, with the L4 header but not the IP header.
@@ -1135,7 +1209,7 @@ impl<'d> Stack<'d> {
             let stack_wants = matches!(next_header, IpProtocol::Icmp | IpProtocol::Udp | IpProtocol::Tcp);
             #[cfg(feature = "multicast")]
             let stack_wants = stack_wants || next_header == IpProtocol::Igmp;
-            self.process_raw_ip(IpVersion::Ipv4, next_header, stack_wants, buf)
+            self.process_raw_ip(iface, IpVersion::Ipv4, next_header, stack_wants, buf)
         }) else {
             return;
         };
@@ -1218,7 +1292,7 @@ impl<'d> Stack<'d> {
         let mut matched = false;
         let mut reply_repr = None;
         for (_, socket) in self.sockets.tcp.iter_mut() {
-            if socket.accepts(&src_addr, &dst_addr, &tcp_repr) {
+            if socket.binding_matches(iface) && socket.accepts(&src_addr, &dst_addr, &tcp_repr) {
                 matched = true;
                 reply_repr = socket.process(self.inner.now, &src_addr, &dst_addr, &tcp_repr);
                 break;
@@ -1237,7 +1311,7 @@ impl<'d> Stack<'d> {
         // Nothing is replied, the handshake starts when the connection is
         // accepted.
         #[cfg(feature = "tcp-listener")]
-        if crate::tcp::process_listeners(&mut self.sockets.tcp_listeners, &src_addr, &dst_addr, &tcp_repr) {
+        if crate::tcp::process_listeners(&mut self.sockets.tcp_listeners, iface, &src_addr, &dst_addr, &tcp_repr) {
             return;
         }
 
@@ -1464,7 +1538,7 @@ impl<'d> Stack<'d> {
         #[cfg(feature = "raw")]
         let Some((mut buf, handled_by_raw)) = ({
             let stack_wants = matches!(next_header, IpProtocol::Icmpv6 | IpProtocol::Udp | IpProtocol::Tcp);
-            self.process_raw_ip(IpVersion::Ipv6, next_header, stack_wants, buf)
+            self.process_raw_ip(iface, IpVersion::Ipv6, next_header, stack_wants, buf)
         }) else {
             return;
         };
@@ -2330,7 +2404,7 @@ impl StackInner {
             dst
         } else {
             self.routes
-                .lookup(&dst, self.now)
+                .lookup(IfaceBinding::Any, &dst, self.now)
                 .map(|route| route.via_router)
                 .unwrap_or(dst)
         };
@@ -4613,10 +4687,7 @@ pub(crate) mod test {
         let raw = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(raw)
-            .bind(RawMode::Ethernet {
-                iface: IfaceHandle::new(0),
-                ethertype: None,
-            })
+            .bind(RawMode::Ethernet { ethertype: None })
             .unwrap();
         let raw_ip = stack.add_raw_socket().unwrap();
         stack
@@ -4978,7 +5049,7 @@ pub(crate) mod test {
                 buf.copy_from_slice(&datagram);
 
                 let mut cx = stack.tx_context();
-                let route = cx.route(&REMOTE_V4.into()).unwrap();
+                let route = cx.route(IfaceBinding::Any, &REMOTE_V4.into()).unwrap();
                 cx.transmit_ip(&route, buf, OUR_V4.into(), REMOTE_V4.into(), IpProtocol::Udp, 64);
 
                 let frames = tx.borrow();

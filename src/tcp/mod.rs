@@ -14,8 +14,9 @@ use crate::driver::ChecksumCapabilities;
 use crate::driver::PacketBuf;
 #[cfg(feature = "icmp-errors")]
 use crate::icmp_error::IcmpError;
+use crate::iface::IfaceHandle;
 use crate::rand::Rand;
-use crate::stack::{EgressRoute, Stack, TxContext, alloc_ephemeral_port};
+use crate::stack::{EgressRoute, IfaceBinding, Stack, TxContext, alloc_ephemeral_port};
 use crate::storage::Slab;
 use crate::time::{Duration, Instant};
 #[cfg(feature = "async")]
@@ -527,6 +528,9 @@ pub(crate) struct TcpSocketState<'d> {
     hop_limit: Option<u8>,
     /// Current 4-tuple (local and remote endpoints).
     tuple: Option<Tuple>,
+    /// The interface the socket is bound to. Zero-sized without `iface-bind`.
+    /// User configuration, kept across `reset` like the hop limit.
+    binding: IfaceBinding,
     /// The last ICMP error reported against this connection. A single slot: a
     /// newer error overwrites an unread older one.
     #[cfg(feature = "icmp-errors")]
@@ -654,6 +658,7 @@ impl<'d> TcpSocketState<'d> {
             keep_alive: None,
             hop_limit: None,
             tuple: None,
+            binding: IfaceBinding::Any,
             #[cfg(feature = "icmp-errors")]
             icmp_error: None,
             local_seq_no: TcpSeqNumber::default(),
@@ -932,6 +937,12 @@ impl<'d> TcpSocketState<'d> {
         self.challenge_ack_timer = now + Duration::from_secs(1);
 
         Some(self.ack_reply(now, repr))
+    }
+
+    /// Whether a segment arriving on `arrival` passes the socket's interface
+    /// binding. Checked by ingress demux alongside [`accepts`](Self::accepts).
+    pub(crate) fn binding_matches(&self, arrival: IfaceHandle) -> bool {
+        self.binding.matches(arrival)
     }
 
     pub(crate) fn accepts(&self, src_addr: &IpAddress, dst_addr: &IpAddress, repr: &TcpRepr) -> bool {
@@ -1919,7 +1930,7 @@ impl<'d> TcpSocketState<'d> {
         // emit, socket unaffected. The address may come back (e.g. a DHCP
         // renewal), and the retransmit timer owns recovery in the meantime.
         let route = if cx.has_ip_addr(tuple.local.addr) {
-            cx.route(&tuple.remote.addr)
+            cx.route(self.binding, &tuple.remote.addr)
         } else {
             debug!(
                 "source address {} not assigned to any interface, dropping packet",
@@ -2577,6 +2588,38 @@ impl<'d> TcpSocket<'_, 'd> {
         self.inner_mut().hop_limit = hop_limit
     }
 
+    /// Bind the socket to an interface, or unbind it with `None`.
+    ///
+    /// A socket bound to an interface only sends and receives packets on it:
+    /// - Destinations must be on-link on that iface, or have a route through it.
+    /// - Broadcast and multicast destinations go out on that iface only
+    /// - Local addresses will be picked from that iface only.
+    ///
+    /// The socket must be closed (see [`is_open`](Self::is_open)). The binding
+    /// is kept across connections, so a reused socket stays bound to its interface.
+    /// Accepting a connection into the socket overwrites it with the listener's binding.
+    ///
+    /// Two sockets with otherwise identical tuples may coexist if they are
+    /// bound to different interfaces.
+    ///
+    /// Returns `Err(ConnectError::InvalidState)` if the socket is open.
+    #[cfg(feature = "iface-bind")]
+    pub fn bind_to_iface(&mut self, iface: Option<IfaceHandle>) -> Result<(), ConnectError> {
+        if self.is_open() {
+            return Err(ConnectError::InvalidState);
+        }
+        self.inner_mut().binding = iface.into();
+        Ok(())
+    }
+
+    /// Return the interface the socket is bound to, or `None`.
+    ///
+    /// See [`bind_to_iface`](Self::bind_to_iface).
+    #[cfg(feature = "iface-bind")]
+    pub fn bound_iface(&self) -> Option<IfaceHandle> {
+        self.inner().binding.iface()
+    }
+
     /// Return the local endpoint, or None if not connected.
     #[inline]
     pub fn local_endpoint(&self) -> Option<IpEndpoint> {
@@ -2632,6 +2675,8 @@ impl<'d> TcpSocket<'_, 'd> {
             return Err(ConnectError::Unaddressable);
         }
 
+        let binding = self.inner().binding;
+
         // Resolve the local address up front: conflicts are decided on the full,
         // concrete 4-tuple. An unspecified local address is selected from the
         // remote like a missing one, but restricts the IP version first.
@@ -2644,16 +2689,20 @@ impl<'d> TcpSocket<'_, 'd> {
                     return Err(ConnectError::Unaddressable);
                 }
                 self.tx
-                    .get_source_address(&remote_endpoint.addr)
+                    .get_source_address(binding, &remote_endpoint.addr)
                     .ok_or(ConnectError::Unaddressable)?
             }
         };
         let mut local_endpoint = IpEndpoint::new(local_addr, local.port);
 
+        // The interface binding is part of the identity: same-tuple sockets
+        // bound to different interfaces coexist, and a segment arrives on
+        // exactly one interface.
         let (sockets, index) = (&self.sockets, self.index);
         let tuple_in_use = |local: IpEndpoint| {
             sockets.iter().any(|(i, s)| {
                 i != index
+                    && s.binding == binding
                     && s.tuple
                         == Some(Tuple {
                             local,
@@ -3470,6 +3519,7 @@ mod test {
     fn listener_deliver_to(stack: &mut Stack, dst_addr: Ipv4Address, repr: &TcpRepr) -> bool {
         process_listeners(
             &mut stack.sockets.tcp_listeners,
+            IfaceHandle::new(0),
             &IpAddress::from(REMOTE_ADDR),
             &IpAddress::from(dst_addr),
             repr,
@@ -3624,6 +3674,189 @@ mod test {
             Some(IpEndpoint::new(REMOTE_ADDR.into(), REMOTE_PORT + 1))
         );
         assert!(stack.sockets.tcp.get(sh.index()).tx_buffer.is_empty());
+    }
+
+    // =========================================================================================//
+    // Tests for interface binding.
+    // =========================================================================================//
+
+    #[cfg(feature = "iface-bind")]
+    const LOCAL2_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 2, 1);
+    #[cfg(feature = "iface-bind")]
+    const REMOTE2_ADDR: IpvXAddress = IpvXAddress::new(192, 168, 2, 2);
+
+    /// A stack with two IP-medium interfaces on different subnets:
+    /// interface 0 owns `LOCAL_ADDR`, interface 1 owns `LOCAL2_ADDR`.
+    #[cfg(feature = "iface-bind")]
+    fn stack_with_two_ifaces() -> (
+        Stack<'static>,
+        IfaceHandle,
+        IfaceHandle,
+        crate::test_device::Sent,
+        crate::test_device::Sent,
+    ) {
+        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let d0 = TestDevice::new(Medium::Ip);
+        let tx0 = d0.tx.clone();
+        let if0 = d0.install(&mut stack, HardwareAddress::Ip);
+        stack
+            .iface(if0)
+            .add_ip_addr(IpCidr::new(LOCAL_ADDR.into(), 24))
+            .unwrap();
+        let d1 = TestDevice::new(Medium::Ip);
+        let tx1 = d1.tx.clone();
+        let if1 = d1.install(&mut stack, HardwareAddress::Ip);
+        stack
+            .iface(if1)
+            .add_ip_addr(IpCidr::new(LOCAL2_ADDR.into(), 24))
+            .unwrap();
+        (stack, if0, if1, tx0, tx1)
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_bind_to_iface() {
+        let (mut stack, if0, if1, tx0, tx1) = stack_with_two_ifaces();
+        let h = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        assert_eq!(stack.tcp_socket(h).bound_iface(), None);
+        stack.tcp_socket(h).bind_to_iface(Some(if1)).unwrap();
+        assert_eq!(stack.tcp_socket(h).bound_iface(), Some(if1));
+
+        // The remote is on-link for interface 0 only: a socket bound to
+        // interface 1 has no route to it.
+        assert_eq!(
+            stack.tcp_socket(h).connect((REMOTE_ADDR, REMOTE_PORT), 0),
+            Err(ConnectError::Unaddressable)
+        );
+
+        // A remote on the bound interface's subnet connects, with the local
+        // address resolved from the bound interface.
+        stack.tcp_socket(h).connect((REMOTE2_ADDR, REMOTE_PORT), 0).unwrap();
+        assert_eq!(
+            stack.tcp_socket(h).local_endpoint().map(|e| e.addr),
+            Some(LOCAL2_ADDR.into())
+        );
+
+        // The binding cannot change while the socket is open.
+        assert_eq!(stack.tcp_socket(h).bind_to_iface(None), Err(ConnectError::InvalidState));
+
+        // Ingress demux only matches the socket on the bound interface.
+        assert!(stack.sockets.tcp.get(h.index()).binding_matches(if1));
+        assert!(!stack.sockets.tcp.get(h.index()).binding_matches(if0));
+
+        // The SYN goes out of the bound interface.
+        stack.poll(Instant::from_millis(0));
+        assert!(tx0.borrow().is_empty());
+        assert_eq!(tx1.borrow().len(), 1);
+    }
+
+    #[cfg(feature = "iface-bind")]
+    #[test]
+    fn test_connect_conflicts_iface_bound() {
+        // The binding is part of the socket's identity: the identical 4-tuple
+        // bound to different interfaces (or one bound, one not) coexists.
+        let (mut stack, _, if1, _, _) = stack_with_two_ifaces();
+        let local = (LOCAL2_ADDR, LOCAL_PORT);
+        let remote = (REMOTE2_ADDR, REMOTE_PORT);
+
+        let h1 = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        stack.tcp_socket(h1).bind_to_iface(Some(if1)).unwrap();
+        stack.tcp_socket(h1).connect(remote, local).unwrap();
+
+        let h2 = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        stack.tcp_socket(h2).connect(remote, local).unwrap();
+
+        let h3 = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        stack.tcp_socket(h3).bind_to_iface(Some(if1)).unwrap();
+        assert_eq!(stack.tcp_socket(h3).connect(remote, local), Err(ConnectError::InUse));
+    }
+
+    /// Like [`listener_deliver`], with an explicit arrival interface.
+    #[cfg(all(feature = "tcp-listener", feature = "iface-bind"))]
+    fn listener_deliver_on(stack: &mut Stack, iface: IfaceHandle, repr: &TcpRepr) -> bool {
+        process_listeners(
+            &mut stack.sockets.tcp_listeners,
+            iface,
+            &IpAddress::from(REMOTE_ADDR),
+            &IpAddress::from(LOCAL_ADDR),
+            repr,
+        )
+    }
+
+    #[cfg(all(feature = "tcp-listener", feature = "iface-bind"))]
+    #[test]
+    fn test_listener_bind_to_iface() {
+        let mut stack = test_stack();
+        let if0 = IfaceHandle::new(0);
+        let if1 = IfaceHandle::new(1);
+
+        let h = stack.add_tcp_listener().unwrap();
+        stack.tcp_listener(h).bind_to_iface(Some(if0)).unwrap();
+        assert_eq!(stack.tcp_listener(h).bound_iface(), Some(if0));
+        stack.tcp_listener(h).listen(LOCAL_PORT).unwrap();
+        assert_eq!(
+            stack.tcp_listener(h).bind_to_iface(None),
+            Err(ListenError::InvalidState)
+        );
+
+        // A SYN arriving on another interface is not recorded.
+        assert!(!listener_deliver_on(&mut stack, if1, &syn_repr()));
+        assert!(!stack.tcp_listener(h).can_accept());
+
+        // On the bound interface it is, and the accepted socket inherits the
+        // binding, overwriting the socket's own.
+        assert!(listener_deliver_on(&mut stack, if0, &syn_repr()));
+        let sh = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        stack.tcp_socket(sh).bind_to_iface(Some(if1)).unwrap();
+        stack.tcp_listener(h).accept_with_socket(sh).unwrap();
+        assert_eq!(stack.tcp_socket(sh).bound_iface(), Some(if0));
+
+        // The binding survives close, and is part of the listen identity: an
+        // identical endpoint bound to another interface (or unbound) coexists,
+        // the identical binding conflicts.
+        stack.tcp_listener(h).close();
+        assert_eq!(stack.tcp_listener(h).bound_iface(), Some(if0));
+        stack.tcp_listener(h).listen(LOCAL_PORT).unwrap();
+        let h2 = stack.add_tcp_listener().unwrap();
+        stack.tcp_listener(h2).listen(LOCAL_PORT).unwrap();
+        stack.tcp_listener(h2).close();
+        stack.tcp_listener(h2).bind_to_iface(Some(if0)).unwrap();
+        assert_eq!(stack.tcp_listener(h2).listen(LOCAL_PORT), Err(ListenError::InUse));
+        stack.tcp_listener(h2).bind_to_iface(Some(if1)).unwrap();
+        stack.tcp_listener(h2).listen(LOCAL_PORT).unwrap();
+    }
+
+    #[cfg(all(feature = "tcp-listener", feature = "iface-bind"))]
+    #[test]
+    fn test_listener_bind_to_iface_scoring() {
+        // A listener bound to the arrival interface wins the SYN over an
+        // unbound one with an equal endpoint.
+        let mut stack = test_stack();
+        let if0 = IfaceHandle::new(0);
+        let if1 = IfaceHandle::new(1);
+
+        let h_any = stack.add_tcp_listener().unwrap();
+        stack.tcp_listener(h_any).listen(LOCAL_PORT).unwrap();
+        let h_bound = stack.add_tcp_listener().unwrap();
+        stack.tcp_listener(h_bound).bind_to_iface(Some(if0)).unwrap();
+        stack.tcp_listener(h_bound).listen(LOCAL_PORT).unwrap();
+
+        assert!(listener_deliver_on(&mut stack, if0, &syn_repr()));
+        assert!(stack.tcp_listener(h_bound).can_accept());
+        assert!(!stack.tcp_listener(h_any).can_accept());
+
+        assert!(listener_deliver_on(&mut stack, if1, &syn_repr()));
+        assert!(stack.tcp_listener(h_any).can_accept());
     }
 
     #[cfg(feature = "tcp-listener")]
