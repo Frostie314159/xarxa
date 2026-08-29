@@ -31,7 +31,8 @@ default = [
     "ipv4-fragmentation",
     "ipv4-reassembly",
     "ipv6",
-    "raw",
+    "raw-ethernet",
+    "raw-ip",
     "udp",
     "tcp",
     "tcp-listener",
@@ -82,8 +83,12 @@ ipv4-fragmentation = ["ipv4"]
 ipv4-reassembly = ["ipv4"]
 ## Support IPv6 (and, with `medium-ethernet`, NDISC).
 ipv6 = []
-## Raw sockets.
-raw = []
+# Raw socket machinery shared by both modes. Private, do not enable directly.
+_raw = []
+## Ethernet-mode raw sockets: send and receive whole Ethernet frames. Needs `medium-ethernet`.
+raw-ethernet = ["_raw", "medium-ethernet"]
+## IP-mode raw sockets: send and receive whole IP packets.
+raw-ip = ["_raw"]
 ## UDP sockets.
 udp = []
 ## TCP sockets.
@@ -462,7 +467,7 @@ required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6
 
 [[example]]
 name = "ping"
-required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "raw"]
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "raw-ip"]
 
 [[example]]
 name = "dns"
@@ -478,7 +483,7 @@ required-features = ["std", "log", "medium-ethernet", "ipv4", "dhcpv4", "dhcpv4-
 
 [[example]]
 name = "multicast"
-required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "multicast", "raw", "udp"]
+required-features = ["std", "log", "medium-ethernet", "medium-ip", "ipv4", "ipv6", "multicast", "udp"]
 
 [[example]]
 name = "multicast6"

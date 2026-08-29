@@ -33,13 +33,15 @@ MEDIA = [
 PROTOS = ["ipv4", "ipv6", "ipv4,ipv6"]
 SOCKETS = [
     "",
-    "raw",
+    "raw-ethernet",
+    "raw-ip",
+    "raw-ethernet,raw-ip",
     "udp",
     "tcp",
-    "raw,udp",
-    "raw,tcp",
+    "raw-ethernet,raw-ip,udp",
+    "raw-ethernet,raw-ip,tcp",
     "udp,tcp",
-    "raw,udp,tcp",
+    "raw-ethernet,raw-ip,udp,tcp",
 ]
 
 # Everything that adds code paths to a media/protocol/socket combination,
@@ -48,7 +50,7 @@ COMBO_EXTRAS = "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,m
 
 # The other axes are checked against the full feature set only; combining them
 # with all of the above would be thousands of builds for no extra coverage.
-EXTRAS_BASE = "medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp"
+EXTRAS_BASE = "medium-ethernet,medium-ip,ipv4,ipv6,raw-ethernet,raw-ip,udp,tcp"
 EXTRAS = [
     "",
     "defmt",
@@ -94,7 +96,7 @@ EXTRAS = [
 
 # The whole API, minus the features that are mutually exclusive with another.
 FULL = (
-    "medium-ethernet,medium-ip,medium-ieee802154,ipv4,ipv6,raw,udp,tcp,tcp-listener,"
+    "medium-ethernet,medium-ip,medium-ieee802154,ipv4,ipv6,raw-ethernet,raw-ip,udp,tcp,tcp-listener,"
     "std,log,async,icmp-errors,icmp-ping-reply,iface-bind,multicast,slaac,dhcpv4,dhcpv4-options,"
     "dns,mdns,packetmeta-timestamp,tcp-timestamps,tcp-sack,ipv4-fragmentation,ipv4-reassembly,"
     "sixlowpan-fragmentation,sixlowpan-reassembly"

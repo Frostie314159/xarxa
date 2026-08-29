@@ -904,7 +904,8 @@ impl StackInner {
     feature = "medium-ip",
     feature = "ipv4",
     feature = "ipv6",
-    feature = "raw",
+    feature = "raw-ethernet",
+    feature = "raw-ip",
     feature = "udp",
     feature = "tcp"
 ))]

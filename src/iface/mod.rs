@@ -603,7 +603,7 @@ impl IfaceState<'_> {
     #[cfg(any(
         feature = "udp",
         feature = "tcp",
-        feature = "raw",
+        feature = "_raw",
         feature = "ipv4-fragmentation",
         feature = "sixlowpan-fragmentation",
         feature = "medium-ethernet",
@@ -622,7 +622,7 @@ impl IfaceState<'_> {
     #[cfg(any(
         feature = "udp",
         feature = "tcp",
-        feature = "raw",
+        feature = "_raw",
         feature = "medium-ethernet",
         feature = "medium-ieee802154"
     ))]

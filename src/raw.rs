@@ -2,12 +2,13 @@
 //!
 //! A raw socket sends and receives whole packets, headers included.
 //!
-//! Raw sockets can be bound in two modes:
+//! Raw sockets can be bound in two modes, each behind its own cargo feature:
 //!
-//! - **Ethernet mode** ([`RawMode::Ethernet`]): whole Ethernet frames, optionally
-//!   filtered by ethertype.
-//! - **IP mode** ([`RawMode::Ip`]): whole IP packets on all interfaces. The socket may
-//!   be bound to an IP version and/or an IP protocol, both optional.
+//! - **Ethernet mode** (`RawMode::Ethernet`, feature `raw-ethernet`): whole Ethernet
+//!   frames, optionally filtered by ethertype.
+//! - **IP mode** (`RawMode::Ip`, feature `raw-ip`): whole IP packets on all
+//!   interfaces. The socket may be bound to an IP version and/or an IP protocol,
+//!   both optional.
 
 use crate::config::RAW_RX_QUEUE_COUNT;
 use crate::storage::BoundedDeque;
@@ -16,17 +17,18 @@ use core::fmt;
 use crate::driver::PacketBuf;
 use crate::driver::PacketMeta;
 use crate::iface::IfaceHandle;
-#[cfg(feature = "medium-ethernet")]
+#[cfg(feature = "raw-ethernet")]
 use crate::iface::Medium;
 use crate::stack::{IfaceBinding, Stack, TxContext};
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
-#[cfg(feature = "ipv4")]
+#[cfg(all(feature = "raw-ip", feature = "ipv4"))]
 use crate::wire::Ipv4Packet;
-#[cfg(feature = "ipv6")]
+#[cfg(all(feature = "raw-ip", feature = "ipv6"))]
 use crate::wire::Ipv6Packet;
-#[cfg(feature = "medium-ethernet")]
+#[cfg(feature = "raw-ethernet")]
 use crate::wire::{EthernetFrame, EthernetProtocol};
+#[cfg(feature = "raw-ip")]
 use crate::wire::{IpAddress, IpProtocol, IpVersion, LINK_HEADER_LEN};
 
 define_handle! {
@@ -40,19 +42,20 @@ define_handle! {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RawMode {
-    /// Send and receive whole Ethernet frames.
+    /// Send and receive whole Ethernet frames. Feature `raw-ethernet`.
     ///
     /// The socket receives frames from every Ethernet-medium interface and
     /// sends out of the first one, unless it is bound to one interface with
     /// `bind_to_iface` (feature `iface-bind`).
-    #[cfg(feature = "medium-ethernet")]
+    #[cfg(feature = "raw-ethernet")]
     Ethernet {
         /// If set, only frames with this ethertype are received, and only frames
         /// with this ethertype may be sent.
         ethertype: Option<EthernetProtocol>,
     },
     /// Send and receive whole IP packets, on all interfaces, or on the one
-    /// bound with `bind_to_iface` (feature `iface-bind`).
+    /// bound with `bind_to_iface` (feature `iface-bind`). Feature `raw-ip`.
+    #[cfg(feature = "raw-ip")]
     Ip {
         /// If set, only packets of this IP version are received, and only packets
         /// of this version may be sent.
@@ -71,7 +74,7 @@ pub enum BindError {
     InvalidState,
     /// An Ethernet-mode bind on a socket bound to an interface whose medium is
     /// not [`Medium::Ethernet`].
-    #[cfg(feature = "medium-ethernet")]
+    #[cfg(feature = "raw-ethernet")]
     InvalidMedium,
 }
 
@@ -79,7 +82,7 @@ impl fmt::Display for BindError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BindError::InvalidState => write!(f, "invalid state"),
-            #[cfg(feature = "medium-ethernet")]
+            #[cfg(feature = "raw-ethernet")]
             BindError::InvalidMedium => write!(f, "invalid medium"),
         }
     }
@@ -211,6 +214,7 @@ fn copy_packet(buf: &PacketBuf) -> Option<PacketBuf> {
 
 /// Parse the destination address and protocol out of an outgoing IP packet,
 /// verifying that the IP header is well-formed. Returns `None` if it is not.
+#[cfg(feature = "raw-ip")]
 fn parse_ip_headers(buf: &mut [u8]) -> Option<(IpAddress, IpProtocol)> {
     if buf.is_empty() {
         return None;
@@ -289,7 +293,7 @@ impl RawSocket<'_, '_> {
         if self.is_open() {
             return Err(BindError::InvalidState);
         }
-        #[cfg(feature = "medium-ethernet")]
+        #[cfg(feature = "raw-ethernet")]
         if let RawMode::Ethernet { .. } = mode
             && let Some(iface) = self.state.binding.iface()
             && self.tx.ifaces.get(iface.index()).medium() != Medium::Ethernet
@@ -504,8 +508,9 @@ impl RawSocket<'_, '_> {
         // Ethernet frames go out as-is. IP packets get an Ethernet header prepended
         // on Ethernet mediums, so they need headroom for it.
         let headroom = match mode {
-            #[cfg(feature = "medium-ethernet")]
+            #[cfg(feature = "raw-ethernet")]
             RawMode::Ethernet { .. } => 0,
+            #[cfg(feature = "raw-ip")]
             RawMode::Ip { .. } => LINK_HEADER_LEN,
         };
 
@@ -514,7 +519,7 @@ impl RawSocket<'_, '_> {
         // interface is known up front, so ask it for room before building. An
         // IP-mode packet names its destination inside, so it is built first and
         // routed after.
-        #[cfg(feature = "medium-ethernet")]
+        #[cfg(feature = "raw-ethernet")]
         let eth_iface = match mode {
             RawMode::Ethernet { .. } => {
                 let iface = match self.state.binding.iface() {
@@ -527,6 +532,7 @@ impl RawSocket<'_, '_> {
                 }
                 Some(iface)
             }
+            #[cfg(feature = "raw-ip")]
             RawMode::Ip { .. } => None,
         };
 
@@ -545,7 +551,7 @@ impl RawSocket<'_, '_> {
         buf.set_len(size);
 
         match mode {
-            #[cfg(feature = "medium-ethernet")]
+            #[cfg(feature = "raw-ethernet")]
             RawMode::Ethernet { ethertype } => {
                 {
                     let Ok(frame) = EthernetFrame::new_checked(&mut buf) else {
@@ -559,6 +565,7 @@ impl RawSocket<'_, '_> {
                 self.tx.transmit_ethernet(unwrap!(eth_iface), buf);
                 Ok(())
             }
+            #[cfg(feature = "raw-ip")]
             RawMode::Ip { version, protocol } => {
                 let Some((dst_addr, next_header)) = parse_ip_headers(&mut buf) else {
                     return Err(SendError::Malformed);
@@ -591,7 +598,7 @@ impl Stack<'_> {
     /// processes this ethertype), the socket receives a copy and the original is
     /// returned for further processing. Otherwise the socket takes the buffer
     /// zero-copy and `None` is returned.
-    #[cfg(feature = "medium-ethernet")]
+    #[cfg(feature = "raw-ethernet")]
     pub(crate) fn process_raw_ethernet(
         &mut self,
         iface: IfaceHandle,
@@ -640,6 +647,7 @@ impl Stack<'_> {
     /// The returned flag records whether a socket received (a copy of) the packet.
     /// The stack suppresses its own error replies (ICMP port unreachable) for
     /// packets an application is handling through a raw socket.
+    #[cfg(feature = "raw-ip")]
     pub(crate) fn process_raw_ip(
         &mut self,
         iface: IfaceHandle,
@@ -715,6 +723,8 @@ impl<'d> RawSocketIter<'_, 'd> {
 
 #[cfg(all(
     test,
+    feature = "raw-ethernet",
+    feature = "raw-ip",
     feature = "medium-ethernet",
     feature = "medium-ip",
     feature = "ipv4",

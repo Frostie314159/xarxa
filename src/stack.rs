@@ -1,7 +1,7 @@
 //! The network stack.
 
 use crate::config::IFACE_COUNT;
-#[cfg(feature = "raw")]
+#[cfg(feature = "_raw")]
 use crate::config::RAW_SOCKET_COUNT;
 #[cfg(feature = "tcp-listener")]
 use crate::config::TCP_LISTENER_COUNT;
@@ -20,7 +20,7 @@ use crate::iface::{Iface, IfaceHandle, IfaceIter, IfaceState, Medium};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use crate::neighbor::{Answer as NeighborAnswer, Key as NeighborKey, NeighborCache, PendingQueue, ProbeEvent};
 use crate::rand::Rand;
-#[cfg(feature = "raw")]
+#[cfg(feature = "_raw")]
 use crate::raw::{RawHandle, RawSocket, RawSocketIter, RawSocketState};
 #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
 use crate::reassembly::FragmentsBuffer;
@@ -49,7 +49,7 @@ pub struct Stack<'d> {
 pub(crate) struct Sockets<'d> {
     #[cfg(feature = "udp")]
     pub(crate) udp: Slab<UdpSocketState, UDP_SOCKET_COUNT>,
-    #[cfg(feature = "raw")]
+    #[cfg(feature = "_raw")]
     pub(crate) raw: Slab<RawSocketState, RAW_SOCKET_COUNT>,
     #[cfg(feature = "tcp")]
     pub(crate) tcp: Slab<TcpSocketState<'d>, TCP_SOCKET_COUNT>,
@@ -77,14 +77,14 @@ pub(crate) struct StackInner {
     pub(crate) ipv4_id: u16,
     /// Set when a socket send failed for lack of a packet buffer or device room.
     /// `Stack::poll` wakes the send wakers of every packet socket when set.
-    #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
+    #[cfg(all(feature = "async", any(feature = "udp", feature = "_raw")))]
     pub(crate) tx_starved: bool,
 }
 
 impl StackInner {
     /// Note that a socket send was held back for lack of a packet buffer or
     /// device room, so `Stack::poll` wakes the packet sockets' send wakers.
-    #[cfg(any(feature = "udp", feature = "raw"))]
+    #[cfg(any(feature = "udp", feature = "_raw"))]
     pub(crate) fn set_tx_starved(&mut self) {
         #[cfg(feature = "async")]
         {
@@ -230,7 +230,7 @@ impl TxContext<'_, '_> {
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
-    #[cfg(any(feature = "udp", feature = "tcp", feature = "raw"))]
+    #[cfg(any(feature = "udp", feature = "tcp", feature = "_raw"))]
     pub(crate) fn can_transmit(&mut self, iface: IfaceHandle) -> bool {
         self.ifaces.get_mut(iface.index()).can_transmit_new_packet()
     }
@@ -289,7 +289,7 @@ impl TxContext<'_, '_> {
 
     /// The first Ethernet-medium interface, for unbound Ethernet-mode raw
     /// sockets, whose frames carry no routing information.
-    #[cfg(all(feature = "raw", feature = "medium-ethernet"))]
+    #[cfg(feature = "raw-ethernet")]
     pub(crate) fn first_ethernet_iface(&self) -> Option<IfaceHandle> {
         self.ifaces
             .iter()
@@ -363,14 +363,14 @@ impl TxContext<'_, '_> {
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
-    #[cfg(all(feature = "raw", feature = "medium-ethernet"))]
+    #[cfg(feature = "raw-ethernet")]
     pub(crate) fn transmit_ethernet(&mut self, iface: IfaceHandle, buf: PacketBuf) {
         let iface = self.ifaces.get_mut(iface.index());
         self.inner.transmit_raw(iface, buf);
     }
 
     /// Transmit a fully-built IP packet (IP header included, emitted as-is).
-    #[cfg(feature = "raw")]
+    #[cfg(feature = "raw-ip")]
     pub(crate) fn transmit_raw_ip(&mut self, route: &EgressRoute, buf: PacketBuf, dst_addr: IpAddress) {
         let iface = self.ifaces.get_mut(route.iface.index());
         let ethertype = match dst_addr {
@@ -448,14 +448,14 @@ impl<'d> Stack<'d> {
                 routes: Routes::new(),
                 #[cfg(feature = "ipv4-fragmentation")]
                 ipv4_id,
-                #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
+                #[cfg(all(feature = "async", any(feature = "udp", feature = "_raw")))]
                 tx_starved: false,
             },
             ifaces: Slab::new(),
             sockets: Sockets {
                 #[cfg(feature = "udp")]
                 udp: Slab::new(),
-                #[cfg(feature = "raw")]
+                #[cfg(feature = "_raw")]
                 raw: Slab::new(),
                 #[cfg(feature = "tcp")]
                 tcp: Slab::new(),
@@ -664,7 +664,7 @@ impl<'d> Stack<'d> {
     /// - `Full` if the stack has no room for another raw socket. Only possible
     ///   without the `alloc` feature, where the limit is
     ///   [`RAW_SOCKET_COUNT`].
-    #[cfg(feature = "raw")]
+    #[cfg(feature = "_raw")]
     pub fn add_raw_socket(&mut self) -> core::result::Result<RawHandle, Full> {
         Ok(RawHandle::new(self.sockets.raw.add_with(|_| RawSocketState::new())?))
     }
@@ -673,7 +673,7 @@ impl<'d> Stack<'d> {
     ///
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
-    #[cfg(feature = "raw")]
+    #[cfg(feature = "_raw")]
     pub fn remove_raw_socket(&mut self, handle: RawHandle) {
         self.sockets.raw.remove(handle.index());
     }
@@ -682,7 +682,7 @@ impl<'d> Stack<'d> {
     ///
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
-    #[cfg(feature = "raw")]
+    #[cfg(feature = "_raw")]
     pub fn raw_socket(&mut self, handle: RawHandle) -> RawSocket<'_, 'd> {
         RawSocket {
             state: self.sockets.raw.get_mut(handle.index()),
@@ -850,7 +850,7 @@ impl<'d> Stack<'d> {
     /// Iterate over the raw sockets added to the stack.
     ///
     /// See [`RawSocketIter`] for how to use it.
-    #[cfg(feature = "raw")]
+    #[cfg(feature = "_raw")]
     pub fn raw_sockets(&mut self) -> RawSocketIter<'_, 'd> {
         RawSocketIter { stack: self, next: 0 }
     }
@@ -983,13 +983,13 @@ impl<'d> Stack<'d> {
 
         // Sends held back for lack of a buffer or device room since the last poll
         // may succeed now: wake their tasks so they retry.
-        #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
+        #[cfg(all(feature = "async", any(feature = "udp", feature = "_raw")))]
         if core::mem::take(&mut self.inner.tx_starved) {
             #[cfg(feature = "udp")]
             for (_, socket) in self.sockets.udp.iter_mut() {
                 socket.wake_tx();
             }
-            #[cfg(feature = "raw")]
+            #[cfg(feature = "_raw")]
             for (_, socket) in self.sockets.raw.iter_mut() {
                 socket.wake_tx();
             }
@@ -1067,7 +1067,7 @@ impl<'d> Stack<'d> {
         // Offer the whole frame to Ethernet-mode raw sockets. Ethertypes the stack
         // itself processes are copied to the socket, everything else is consumed
         // by it.
-        #[cfg(feature = "raw")]
+        #[cfg(feature = "raw-ethernet")]
         let Some(mut buf) = ({
             let stack_wants = matches!(
                 ethertype,
@@ -1204,7 +1204,7 @@ impl<'d> Stack<'d> {
         // Offer the whole packet to IP-mode raw sockets. Protocols the stack itself
         // processes are copied to the socket, everything else is consumed by it.
         #[cfg_attr(not(feature = "udp"), allow(unused_variables))]
-        #[cfg(feature = "raw")]
+        #[cfg(feature = "raw-ip")]
         let Some((mut buf, handled_by_raw)) = ({
             let stack_wants = matches!(next_header, IpProtocol::Icmp | IpProtocol::Udp | IpProtocol::Tcp);
             #[cfg(feature = "multicast")]
@@ -1214,7 +1214,7 @@ impl<'d> Stack<'d> {
             return;
         };
         #[cfg_attr(not(feature = "udp"), allow(unused_variables))]
-        #[cfg(not(feature = "raw"))]
+        #[cfg(not(feature = "raw-ip"))]
         let handled_by_raw = false;
 
         // Strip the IP header.
@@ -1535,7 +1535,7 @@ impl<'d> Stack<'d> {
         // Offer the whole packet to IP-mode raw sockets. Protocols the stack itself
         // processes are copied to the socket, everything else is consumed by it.
         #[cfg_attr(not(feature = "udp"), allow(unused_variables))]
-        #[cfg(feature = "raw")]
+        #[cfg(feature = "raw-ip")]
         let Some((mut buf, handled_by_raw)) = ({
             let stack_wants = matches!(next_header, IpProtocol::Icmpv6 | IpProtocol::Udp | IpProtocol::Tcp);
             self.process_raw_ip(iface, IpVersion::Ipv6, next_header, stack_wants, buf)
@@ -1543,7 +1543,7 @@ impl<'d> Stack<'d> {
             return;
         };
         #[cfg_attr(not(feature = "udp"), allow(unused_variables))]
-        #[cfg(not(feature = "raw"))]
+        #[cfg(not(feature = "raw-ip"))]
         let handled_by_raw = false;
 
         // Strip the IP header (and any extension headers).
@@ -2763,7 +2763,8 @@ fn ndisc_lladdr_option(
     feature = "medium-ip",
     feature = "ipv4",
     feature = "ipv6",
-    feature = "raw",
+    feature = "raw-ethernet",
+    feature = "raw-ip",
     feature = "udp",
     feature = "tcp"
 ))]
@@ -4675,7 +4676,7 @@ pub(crate) mod test {
     /// A device with no room holds socket sends back with `DeviceBusy`, and never
     /// loses a packet: the same send goes through once there is room.
     #[test]
-    #[cfg(all(feature = "medium-ethernet", feature = "ipv4", feature = "udp", feature = "raw"))]
+    #[cfg(all(feature = "raw-ethernet", feature = "ipv4", feature = "udp", feature = "raw-ip"))]
     fn test_device_full_holds_sends_back() {
         let (mut stack, rx, tx, room) = test_stack_with_room(Medium::Ethernet);
         let remote_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
@@ -5065,7 +5066,7 @@ pub(crate) mod test {
     /// larger than the MTU. While the fragments of one are still going out, the
     /// device is busy for the sockets.
     #[test]
-    #[cfg(all(feature = "raw", feature = "ipv4-fragmentation"))]
+    #[cfg(all(feature = "raw-ip", feature = "ipv4-fragmentation"))]
     fn test_raw_socket_tx_fragmentation() {
         for medium in [Medium::Ip, Medium::Ethernet] {
             // An MTU whose IP payload is not a multiple of the fragment alignment on
@@ -5153,7 +5154,7 @@ pub(crate) mod test {
     /// The fragments of an incoming IPv4 packet are reassembled before the packet
     /// is offered to the raw sockets, which see only the whole packet.
     #[test]
-    #[cfg(all(feature = "raw", feature = "ipv4-reassembly"))]
+    #[cfg(all(feature = "raw-ip", feature = "ipv4-reassembly"))]
     fn test_raw_socket_rx_fragmentation() {
         for medium in [Medium::Ip, Medium::Ethernet] {
             let (mut stack, rx, _tx) = test_stack(medium);
@@ -5241,7 +5242,7 @@ pub(crate) mod test {
     /// whole.
     #[test]
     #[cfg(all(
-        feature = "raw",
+        feature = "raw-ip",
         feature = "udp",
         feature = "ipv4-fragmentation",
         feature = "ipv4-reassembly"
@@ -5290,7 +5291,7 @@ pub(crate) mod test {
     /// Fragments of a packet that never completes are dropped when the reassembly
     /// timeout expires, and `poll` asks to be called then.
     #[test]
-    #[cfg(all(feature = "raw", feature = "ipv4-reassembly"))]
+    #[cfg(all(feature = "raw-ip", feature = "ipv4-reassembly"))]
     fn test_ipv4_reassembly_timeout() {
         let (mut stack, rx, _tx) = test_stack(Medium::Ip);
         let handle = stack.add_raw_socket().unwrap();

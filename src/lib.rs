@@ -53,7 +53,7 @@ mod neighbor;
 #[cfg(feature = "packet-log")]
 mod packet_log;
 mod rand;
-#[cfg(feature = "raw")]
+#[cfg(feature = "_raw")]
 pub mod raw;
 #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
 mod reassembly;

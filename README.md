@@ -99,10 +99,10 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - UDP sockets (feature `udp`)
   - **zero-copy** on both TX and RX
   - Supports all binding modes Linux supports, including unconnected (receives from any IP) and connected sockets (receives from one fixed remote IP+port).
-- Raw sockets (feature `raw`)
+- Raw sockets
   - **zero-copy** on both TX and RX
-  - Ethernet-layer raw sockets transmit/receive raw Ethernet frames. No routing.
-  - IP-layer raw sockets transmit/receive raw IP packets. The stack handles routing same as other socket types.
+  - Ethernet-layer raw sockets transmit/receive raw Ethernet frames. No routing. (feature `raw-ethernet`)
+  - IP-layer raw sockets transmit/receive raw IP packets. The stack handles routing same as other socket types. (feature `raw-ip`)
   - IP headers are byte-copied instead of parsed+re-emitted, so all fields and options are kept, even those unsupported by _xarxa_.
 - TCP sockets (feature `tcp`)
   - Full TCP implementation
