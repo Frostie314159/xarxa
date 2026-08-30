@@ -79,7 +79,14 @@ pub(crate) struct StackInner {
     /// `Stack::poll` wakes the send wakers of every packet socket when set.
     #[cfg(all(feature = "async", any(feature = "udp", feature = "_raw")))]
     pub(crate) tx_starved: bool,
+    /// The stack's hostname. Empty when unset.
+    #[cfg(feature = "hostname")]
+    pub(crate) hostname: heapless::String<HOSTNAME_MAX_LEN>,
 }
+
+/// Maximum hostname length, in bytes. The DNS label limit (RFC 1035 §2.3.4).
+#[cfg(feature = "hostname")]
+const HOSTNAME_MAX_LEN: usize = 63;
 
 impl StackInner {
     /// Note that a socket send was held back for lack of a packet buffer or
@@ -90,6 +97,12 @@ impl StackInner {
         {
             self.tx_starved = true;
         }
+    }
+
+    /// The hostname to send in outgoing DHCP messages. `None` when unset.
+    #[cfg(all(feature = "dhcpv4", feature = "hostname"))]
+    pub(crate) fn hostname(&self) -> Option<&str> {
+        if self.hostname.is_empty() { None } else { Some(&self.hostname) }
     }
 
     /// Forget everything the link layer learned about an interface: its neighbor
@@ -450,6 +463,8 @@ impl<'d> Stack<'d> {
                 ipv4_id,
                 #[cfg(all(feature = "async", any(feature = "udp", feature = "_raw")))]
                 tx_starved: false,
+                #[cfg(feature = "hostname")]
+                hostname: heapless::String::new(),
             },
             ifaces: Slab::new(),
             sockets: Sockets {
@@ -466,6 +481,33 @@ impl<'d> Stack<'d> {
             },
             #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
             fragments: FragmentsBuffer::new(),
+        }
+    }
+
+    /// The stack's hostname, or `None` if not set.
+    #[cfg(feature = "hostname")]
+    pub fn hostname(&self) -> Option<&str> {
+        if self.inner.hostname.is_empty() {
+            None
+        } else {
+            Some(&self.inner.hostname)
+        }
+    }
+
+    /// Set the stack's hostname.
+    ///
+    /// If set, it is sent to the DHCP server in outgoing DHCP messages, as the
+    /// host name option.
+    ///
+    /// An empty string clears the hostname.
+    ///
+    /// # Panics
+    /// Panics if `hostname` is longer than 63 bytes.
+    #[cfg(feature = "hostname")]
+    pub fn set_hostname(&mut self, hostname: &str) {
+        self.inner.hostname.clear();
+        if self.inner.hostname.push_str(hostname).is_err() {
+            panic!("hostname too long, max is {} bytes", HOSTNAME_MAX_LEN);
         }
     }
 

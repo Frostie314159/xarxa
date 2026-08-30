@@ -448,6 +448,7 @@ impl Client {
     #[allow(clippy::too_many_arguments)]
     fn build(
         config: &DhcpConfig,
+        #[cfg(feature = "hostname")] hostname: Option<&str>,
         message_type: DhcpMessageType,
         transaction_id: u32,
         ethernet_addr: EthernetAddress,
@@ -494,6 +495,10 @@ impl Client {
                 kind: field::OPT_CLIENT_ID,
                 data: &client_id,
             })?;
+            #[cfg(feature = "hostname")]
+            if let Some(hostname) = hostname {
+                options.emit(DhcpOption::hostname(hostname.as_bytes()))?;
+            }
             if let Some(requested_ip) = requested_ip {
                 options.emit(DhcpOption {
                     kind: field::OPT_REQUESTED_IP,
@@ -672,6 +677,8 @@ impl IfaceState<'_> {
                 state.retry_at = now + DISCOVER_TIMEOUT;
                 let buf = Client::build(
                     &client.config,
+                    #[cfg(feature = "hostname")]
+                    inner.hostname(),
                     DhcpMessageType::Discover,
                     client.transaction_id,
                     ethernet_addr,
@@ -704,6 +711,8 @@ impl IfaceState<'_> {
                 state.retry += 1;
                 let buf = Client::build(
                     &client.config,
+                    #[cfg(feature = "hostname")]
+                    inner.hostname(),
                     DhcpMessageType::Request,
                     client.transaction_id,
                     ethernet_addr,
@@ -758,6 +767,8 @@ impl IfaceState<'_> {
                 client.transaction_id = Client::random_transaction_id(inner);
                 let buf = Client::build(
                     &client.config,
+                    #[cfg(feature = "hostname")]
+                    inner.hostname(),
                     DhcpMessageType::Request,
                     client.transaction_id,
                     ethernet_addr,
@@ -1149,6 +1160,34 @@ mod test {
         assert!(ipv4_addrs(&mut stack).is_empty());
         assert!(stack.routes().get_default_ipv4_route().is_none());
         assert_ne!(stack.iface(IFACE).config_generation(), generation);
+    }
+
+    #[test]
+    #[cfg(feature = "hostname")]
+    fn test_hostname_option() {
+        let (mut stack, _rx, tx) = test_stack();
+
+        // No hostname set: no host name option in the DISCOVER.
+        stack.poll(at(0));
+        assert_eq!(tx.borrow().len(), 1);
+        let mut sent = parse_sent(&tx.borrow()[0]);
+        assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
+        {
+            let packet = DhcpPacket::new_checked(&mut sent.dhcp).unwrap();
+            assert_eq!(packet.option(field::OPT_HOST_NAME), None);
+        }
+
+        // Hostname set: the retried DISCOVER carries it.
+        stack.set_hostname("xarxa-device");
+        assert_eq!(stack.hostname(), Some("xarxa-device"));
+        stack.poll(at(10));
+        assert_eq!(tx.borrow().len(), 2);
+        let mut sent = parse_sent(&tx.borrow()[1]);
+        assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
+        {
+            let packet = DhcpPacket::new_checked(&mut sent.dhcp).unwrap();
+            assert_eq!(packet.option(field::OPT_HOST_NAME), Some(&b"xarxa-device"[..]));
+        }
     }
 
     #[test]

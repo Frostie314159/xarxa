@@ -38,6 +38,7 @@ default = [
     "tcp-listener",
     "dhcpv4",
     "dhcpv4-options",
+    "hostname",
     "slaac",
     "dns",
     "mdns",
@@ -100,6 +101,9 @@ dhcpv4 = ["ipv4", "medium-ethernet"]
 ## Allow reading received DHCP options.
 ## Requires a small buffer. Size is set by the `dhcp-options-buf-size-N` features.
 dhcpv4-options = ["dhcpv4"]
+## Give the stack a hostname, with `Stack::set_hostname`. If set, it is sent
+## to the DHCP server in outgoing DHCP messages.
+hostname = []
 ## IPv6 stateless address autoconfiguration (SLAAC). Needs `ipv6`, and
 ## `medium-ethernet` or `medium-ieee802154`.
 slaac = ["ipv6"]

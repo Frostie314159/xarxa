@@ -88,6 +88,7 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - IPv4 (feature `ipv4`)
   - DHCP client (feature `dhcpv4`)
     - Raw access to all lease options by option number. (feature `dhcpv4-options`)
+    - Sends the stack's hostname to the server, if set. (feature `hostname`)
   - Fragmentation (feature `ipv4-fragmentation`)
   - Reassembly (feature `ipv4-reassembly`)
 - IPv6 (feature `ipv6`)
