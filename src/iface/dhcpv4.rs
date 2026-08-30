@@ -781,13 +781,12 @@ impl IfaceState<'_> {
     pub(crate) fn dhcpv4_reset(&mut self, inner: &mut StackInner) {
         let Some(client) = &mut self.dhcpv4 else { return };
         trace!("DHCP reset");
-        // A client that was already discovering keeps its backoff, so a flapping link
-        // cannot put a DISCOVER on the wire per flap.
-        let retry_at = match &client.state {
-            ClientState::Discovering(state) => state.retry_at,
-            _ => Instant::from_millis(0),
-        };
-        let old = core::mem::replace(&mut client.state, ClientState::Discovering(DiscoverState { retry_at }));
+        let old = core::mem::replace(
+            &mut client.state,
+            ClientState::Discovering(DiscoverState {
+                retry_at: Instant::from_millis(0),
+            }),
+        );
         if let ClientState::Renewing(state) = old {
             self.dhcpv4_apply(inner, None, Some(&state.lease));
         }
@@ -1314,10 +1313,11 @@ mod test {
         assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
     }
 
-    /// Losing the lease means discovering at once, but flapping after that keeps the
-    /// retransmit backoff rather than putting a DISCOVER on the wire per flap.
+    /// Every link-up sends a DISCOVER right away, even mid-backoff: a DISCOVER
+    /// spent on a down link never reached the wire, and waiting out its timeout
+    /// delays the lease by up to `DISCOVER_TIMEOUT` after the link comes up.
     #[test]
-    fn test_link_flap_keeps_discover_backoff() {
+    fn test_link_up_discovers_at_once() {
         let (mut stack, _rx, tx, link) = bound_stack_with_link();
 
         link.set(LinkState::Down);
@@ -1325,16 +1325,16 @@ mod test {
         link.set(LinkState::Up);
         stack.poll(at(4));
         let after_first = tx.borrow().len();
+        let mut sent = parse_sent(tx.borrow().last().unwrap());
+        assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
 
         link.set(LinkState::Down);
         stack.poll(at(5));
         link.set(LinkState::Up);
         stack.poll(at(6));
-        assert_eq!(
-            tx.borrow().len(),
-            after_first,
-            "a flapping link must not outpace the DISCOVER backoff"
-        );
+        assert_eq!(tx.borrow().len(), after_first + 1, "each link-up sends a fresh DISCOVER");
+        let mut sent = parse_sent(tx.borrow().last().unwrap());
+        assert_eq!(message_type(&mut sent), DhcpMessageType::Discover);
     }
 
     #[test]

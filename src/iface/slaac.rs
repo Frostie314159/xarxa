@@ -314,6 +314,7 @@ impl Slaac {
     pub(crate) fn restart(&mut self) {
         self.phase = Phase::Start;
         self.num_solicitations = MAX_RTR_SOLICITATIONS;
+        self.retry_rs_at = Instant::from_millis(0);
     }
 
     /// Update router solicitation tracking state

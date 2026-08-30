@@ -3483,13 +3483,12 @@ pub(crate) mod test {
         assert_eq!(msg_type, Icmpv6Message::RouterSolicit);
     }
 
-    /// A link that flaps produces an edge every time it settles, but router solicitations
-    /// still keep to `RTR_SOLICITATION_INTERVAL`: the retry timer decides when the next one
-    /// goes out, not the edge. Otherwise a driver reporting a noisy link -- and xarxa polls a
-    /// level rather than being handed an event -- could solicit on every poll.
+    /// Every link-up solicits at once, even mid-interval: the link coming back can
+    /// mean a new network, and holding the solicitation for the rest of
+    /// `RTR_SOLICITATION_INTERVAL` just delays learning it.
     #[test]
     #[cfg(feature = "slaac")]
-    fn test_slaac_link_flap_keeps_solicitation_spacing() {
+    fn test_slaac_link_up_solicits_at_once() {
         let (mut stack, rx, tx, link) = test_stack_with_link(Medium::Ethernet);
         let iface = IfaceHandle::new(0);
         let router_hw = EthernetAddress([0x02, 0, 0, 0, 0, 0x02]);
@@ -3513,24 +3512,16 @@ pub(crate) mod test {
         bounce_link(&mut stack, &tx, &link, 30);
         assert_eq!(tx.borrow().len(), 1);
 
-        // Flapping again straight away must not produce another one.
+        // Flapping again straight away solicits again straight away.
         link.set(crate::driver::LinkState::Down);
         stack.poll(Instant::from_secs(32));
         link.set(crate::driver::LinkState::Up);
         stack.poll(Instant::from_secs(33));
-        assert_eq!(
-            tx.borrow().len(),
-            1,
-            "a flapping link must not outpace RTR_SOLICITATION_INTERVAL"
-        );
+        assert_eq!(tx.borrow().len(), 2, "each link-up sends a fresh solicitation");
 
-        // Once the interval has passed, the refilled budget is spent normally.
-        stack.poll(Instant::from_secs(36));
-        assert_eq!(
-            tx.borrow().len(),
-            2,
-            "the retry timer, not the edge, releases the next one"
-        );
+        // The remaining budget is spent on the retry timer as usual.
+        stack.poll(Instant::from_secs(37));
+        assert_eq!(tx.borrow().len(), 3, "retries after the edge keep to the interval");
     }
 
     /// Re-soliciting is not the same as tearing SLAAC down: what a router already told us
